@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}YOLOv8 Auto-Tuning Agent{% endblock %}</title>
+    <style>
+        :root {
+            --primary: #1E40AF;
+            --primary-hover: #1E3A8A;
+            --on-primary: #FFFFFF;
+            --secondary: #3B82F6;
+            --accent: #D97706;
+            --accent-bg: #FFFBEB;
+            --accent-border: #FDE68A;
+            --background: #F8FAFC;
+            --surface: #FFFFFF;
+            --foreground: #1E293B;
+            --muted: #E9EEF6;
+            --border: #DBEAFE;
+            --destructive: #DC2626;
+            --destructive-bg: #FEF2F2;
+            --success: #16A34A;
+            --success-bg: #F0FDF4;
+            --warning: #D97706;
+            --warning-bg: #FFFBEB;
+            --text-primary: #1E293B;
+            --text-secondary: #64748B;
+            --text-muted: #94A3B8;
+            --ring: #1E40AF;
+            --radius: 8px;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+            --shadow-md: 0 1px 6px rgba(0,0,0,0.08);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            background: var(--background);
+            color: var(--text-primary);
+            padding: 24px;
+        }
+        .app-header {
+            display: flex; align-items: center; gap: 12px; margin-bottom: 6px;
+        }
+        .app-logo {
+            width: 32px; height: 32px; background: var(--primary); border-radius: 6px;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .app-logo svg { width: 20px; height: 20px; stroke: white; stroke-width: 2; fill: none; }
+        h1 { font-size: 20px; font-weight: 600; color: var(--foreground); }
+        .subtitle { color: var(--text-secondary); font-size: 13px; }
+
+        /* Language toggle */
+        .lang-toggle {
+            margin-left: auto; display: flex; align-items: center; gap: 4px;
+        }
+        .lang-btn {
+            padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border);
+            font-size: 12px; font-weight: 500; cursor: pointer; background: var(--surface);
+            color: var(--text-secondary); font-family: inherit; text-decoration: none;
+            transition: all 0.15s;
+        }
+        .lang-btn:hover { background: var(--muted); color: var(--text-primary); }
+        .lang-btn.active { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+
+        /* Tabs */
+        .tabs { display: flex; gap: 2px; margin-top: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 10px 20px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 13px; font-weight: 500;
+            background: var(--muted); color: var(--text-secondary); border: none; font-family: inherit;
+            text-decoration: none; transition: all 0.15s;
+        }
+        .tab:hover { background: #E2E8F0; color: var(--text-primary); }
+        .tab.active { background: var(--surface); color: var(--primary); font-weight: 600; box-shadow: 0 -1px 3px rgba(0,0,0,0.06); }
+        .tab svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+        .page { background: var(--surface); border-radius: 0 var(--radius) var(--radius) var(--radius); box-shadow: var(--shadow-md); padding: 24px; }
+
+        .section-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--muted); color: var(--foreground); }
+
+        .row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+        .col { flex: 1; min-width: 200px; }
+
+        .card {
+            background: var(--surface); border-radius: var(--radius); padding: 16px;
+            border: 1px solid var(--muted); box-shadow: var(--shadow-sm);
+        }
+        .card-title { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+        .card-value { font-size: 24px; font-weight: 700; color: var(--foreground); font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; }
+        .card-value-sm { font-size: 16px; font-weight: 600; }
+        .card-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+        .card-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+        .card-icon svg { width: 20px; height: 20px; stroke-width: 2; fill: none; }
+
+        .bar-bg { background: var(--muted); border-radius: 4px; height: 18px; margin: 6px 0; overflow: hidden; }
+        .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--muted); }
+        th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        tr:hover td { background: #F8FAFC; }
+
+        .badge {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+        }
+        .badge-green { background: var(--success-bg); color: var(--success); }
+        .badge-yellow { background: var(--warning-bg); color: var(--warning); }
+        .badge-red { background: var(--destructive-bg); color: var(--destructive); }
+        .badge-blue { background: #EFF6FF; color: var(--primary); }
+        .badge-gray { background: var(--muted); color: var(--text-secondary); }
+
+        .btn {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 8px 20px; border-radius: 6px; border: 1px solid var(--muted);
+            font-size: 13px; font-weight: 500; cursor: pointer; background: var(--surface); color: var(--text-primary);
+            font-family: inherit; transition: all 0.15s;
+        }
+        .btn:hover { background: var(--muted); }
+        .btn-primary { background: var(--primary); color: var(--on-primary); border: none; }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-primary:disabled { background: #94A3B8; cursor: not-allowed; }
+        .btn-outline { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+        .btn-outline:hover { background: #EFF6FF; }
+        .btn-danger { background: var(--destructive); color: white; border: none; }
+        .btn-danger:hover { background: #B91C1C; }
+        .btn-sm { padding: 4px 12px; font-size: 12px; }
+        .btn svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+        .param-input { width: 80px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; text-align: center; font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+        .param-input:focus { outline: 2px solid var(--ring); outline-offset: -1px; }
+        .param-select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+
+        .suggestion-card { border: 2px solid var(--border); border-radius: 10px; padding: 20px; background: #FAFBFF; }
+        .suggestion-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+        .suggestion-header h3 { font-size: 15px; color: var(--primary); font-weight: 600; }
+
+        .callout { padding: 12px 16px; border-radius: 6px; font-size: 13px; line-height: 1.6; }
+        .callout-blue { background: #EFF6FF; border: 1px solid var(--border); color: var(--text-primary); }
+        .callout-yellow { background: var(--accent-bg); border: 1px solid var(--accent-border); color: #92400E; }
+        .callout-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+        .callout-label svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2; fill: none; vertical-align: middle; margin-right: 4px; }
+
+        .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); cursor: pointer; }
+        .checkbox-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); }
+
+        .console-log {
+            background: #0F172A; color: #CBD5E1; border-radius: 6px; padding: 12px 16px;
+            font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; font-size: 12px; max-height: 300px; overflow-y: auto; line-height: 1.7;
+        }
+        .console-log .info { color: var(--secondary); }
+        .console-log .success { color: var(--success); }
+        .console-log .warn { color: var(--warning); }
+        .console-log .error { color: var(--destructive); }
+        .console-log .dim { color: #475569; }
+
+        .progress-bar { background: var(--muted); border-radius: 8px; height: 8px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--secondary)); border-radius: 8px; transition: width 0.5s; }
+
+        .probe-result {
+            border-left: 4px solid var(--primary); padding: 16px 20px;
+            background: #F8FAFC; border-radius: 0 6px 6px 0; margin: 12px 0;
+        }
+
+        .chart-placeholder {
+            background: #FAFBFC; border: 1px solid var(--muted); border-radius: 6px;
+            height: 180px; display: flex; align-items: center; justify-content: center;
+            color: var(--text-muted); font-size: 13px; flex-direction: column; gap: 6px;
+        }
+        .chart-placeholder svg { width: 32px; height: 32px; stroke: var(--text-muted); stroke-width: 1.5; fill: none; }
+
+        .delta-up { color: var(--success); }
+        .delta-down { color: var(--destructive); }
+        .delta-none { color: var(--text-muted); }
+
+        .flex { display: flex; gap: 12px; align-items: center; }
+        .flex-wrap { flex-wrap: wrap; }
+        .text-muted { color: var(--text-secondary); font-size: 13px; }
+        .mt-2 { margin-top: 12px; }
+        .mb-2 { margin-bottom: 12px; }
+        .hidden { display: none; }
+
+        details.thresholds-panel summary {
+            cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-secondary);
+            padding: 8px 12px; background: var(--muted); border-radius: 6px; user-select: none;
+        }
+        details.thresholds-panel summary:hover { background: #E2E8F0; }
+
+        /* Upload zone */
+        .upload-zone {
+            border: 2px dashed var(--border); border-radius: 8px; padding: 30px;
+            text-align: center; cursor: pointer; transition: all 0.2s;
+            background: #FAFBFC;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: var(--primary); background: #EFF6FF;
+        }
+        .upload-zone svg { width: 36px; height: 36px; stroke: var(--text-muted); stroke-width: 1.5; fill: none; margin-bottom: 8px; }
+        .upload-zone .label { font-size: 14px; color: var(--text-secondary); margin-bottom: 4px; }
+        .upload-zone .hint { font-size: 12px; color: var(--text-muted); }
+
+        @media (max-width: 768px) {
+            body { padding: 12px; }
+            .tabs .tab { font-size: 12px; padding: 8px 12px; }
+            .page { padding: 16px; border-radius: var(--radius); }
+            .col { min-width: 100%; }
+        }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <div class="app-header">
+        <div class="app-logo">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+        </div>
+        <div style="flex:1;">
+            <h1>{{ _("YOLOv8 Auto-Tuning Agent") }}</h1>
+            <div class="subtitle">{{ _("Dataset Analysis / Training Diagnosis / Hyperparameter Optimization") }}</div>
+        </div>
+        <div class="lang-toggle">
+            <a href="/api/lang?lang=zh" class="lang-btn {% if current_lang == 'zh' %}active{% endif %}">{{ _("中文") }}</a>
+            <a href="/api/lang?lang=en" class="lang-btn {% if current_lang == 'en' %}active{% endif %}">{{ _("English") }}</a>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <a href="/" class="tab {% if active_page == 'dashboard' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            {{ _("Projects") }}
+        </a>
+        <a href="/dataset" class="tab {% if active_page == 'dataset' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+            {{ _("Dataset Report") }}
+        </a>
+        <a href="/agent_suggestion" class="tab {% if active_page == 'agent_suggestion' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            {{ _("Agent Suggestion") }}
+        </a>
+        <a href="/training_monitor" class="tab {% if active_page == 'training_monitor' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            {{ _("Training Monitor") }}
+        </a>
+        <a href="/history" class="tab {% if active_page == 'history' %}active{% endif %}">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            {{ _("History") }}
+        </a>
+    </div>
+
+    <div class="page">
+        {% block content %}{% endblock %}
+    </div>
+
+    <script>
+    // Language toggle: redirect back to previous page after switching language
+    document.querySelectorAll('.lang-btn').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            const url = new URL(btn.href);
+            url.searchParams.set('redirect', window.location.pathname);
+            window.location.href = url.toString();
+        });
+    });
+    </script>
+</body>
+</html>

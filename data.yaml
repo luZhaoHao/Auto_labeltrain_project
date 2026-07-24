@@ -1,0 +1,5 @@
+names:
+  0: ng
+# train: ./images/train
+# val: ./images/val
+nc: 1

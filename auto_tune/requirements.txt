@@ -1,0 +1,14 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+gradio==4.44.0
+pyyaml==6.0.2
+pydantic==2.9.0
+opencv-python==4.10.0
+scikit-learn==1.5.0
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics==8.2.0
+matplotlib==3.9.0
+seaborn==0.13.0
+pillow==10.4.0
+httpx==0.27.0

@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLOv8 Auto-Tuning Agent - UI Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --primary: #1E40AF;
+    --primary-hover: #1E3A8A;
+    --on-primary: #FFFFFF;
+    --secondary: #3B82F6;
+    --accent: #D97706;
+    --accent-bg: #FFFBEB;
+    --accent-border: #FDE68A;
+    --background: #F8FAFC;
+    --surface: #FFFFFF;
+    --foreground: #1E293B;
+    --muted: #E9EEF6;
+    --border: #DBEAFE;
+    --destructive: #DC2626;
+    --destructive-bg: #FEF2F2;
+    --success: #16A34A;
+    --success-bg: #F0FDF4;
+    --warning: #D97706;
+    --warning-bg: #FFFBEB;
+    --text-primary: #1E293B;
+    --text-secondary: #64748B;
+    --text-muted: #94A3B8;
+    --ring: #1E40AF;
+    --radius: 8px;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+    --shadow-md: 0 1px 6px rgba(0,0,0,0.08);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Fira Sans', -apple-system, sans-serif;
+    background: var(--background);
+    color: var(--text-primary);
+    padding: 24px;
+  }
+  .app-header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 6px;
+  }
+  .app-logo {
+    width: 32px; height: 32px; background: var(--primary); border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .app-logo svg { width: 20px; height: 20px; stroke: white; stroke-width: 2; fill: none; }
+  h1 { font-size: 20px; font-weight: 600; color: var(--foreground); }
+  .subtitle { color: var(--text-secondary); font-size: 13px; margin-bottom: 24px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 2px; margin-bottom: 20px; }
+  .tab {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 10px 20px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 13px; font-weight: 500;
+    background: var(--muted); color: var(--text-secondary); border: none; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .tab:hover { background: #E2E8F0; color: var(--text-primary); }
+  .tab.active { background: var(--surface); color: var(--primary); font-weight: 600; box-shadow: 0 -1px 3px rgba(0,0,0,0.06); }
+  .tab svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+  .page { display: none; background: var(--surface); border-radius: 0 var(--radius) var(--radius) var(--radius); box-shadow: var(--shadow-md); padding: 24px; }
+  .page.active { display: block; }
+
+  .section-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--muted); color: var(--foreground); }
+
+  /* Grid */
+  .row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 200px; }
+
+  /* Card */
+  .card {
+    background: var(--surface); border-radius: var(--radius); padding: 16px;
+    border: 1px solid var(--muted); box-shadow: var(--shadow-sm);
+  }
+  .card-title { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card-value { font-size: 24px; font-weight: 700; color: var(--foreground); font-family: 'Fira Code', monospace; }
+  .card-value-sm { font-size: 16px; font-weight: 600; }
+  .card-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .card-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+  .card-icon svg { width: 20px; height: 20px; stroke-width: 2; fill: none; }
+
+  /* Progress bar */
+  .bar-bg { background: var(--muted); border-radius: 4px; height: 18px; margin: 6px 0; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--muted); }
+  th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:hover td { background: #F8FAFC; }
+
+  /* Badge */
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; font-family: 'Fira Sans', sans-serif;
+  }
+  .badge-green { background: var(--success-bg); color: var(--success); }
+  .badge-yellow { background: var(--warning-bg); color: var(--warning); }
+  .badge-red { background: var(--destructive-bg); color: var(--destructive); }
+  .badge-blue { background: #EFF6FF; color: var(--primary); }
+  .badge-gray { background: var(--muted); color: var(--text-secondary); }
+
+  /* Button */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 20px; border-radius: 6px; border: 1px solid var(--muted);
+    font-size: 13px; font-weight: 500; cursor: pointer; background: var(--surface); color: var(--text-primary);
+    font-family: inherit; transition: all 0.15s;
+  }
+  .btn:hover { background: var(--muted); }
+  .btn-primary { background: var(--primary); color: var(--on-primary); border: none; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-outline { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+  .btn-outline:hover { background: #EFF6FF; }
+  .btn-danger { background: var(--destructive); color: white; border: none; }
+  .btn-danger:hover { background: #B91C1C; }
+  .btn-sm { padding: 4px 12px; font-size: 12px; }
+  .btn svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+  /* Input */
+  .param-input { width: 80px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; text-align: center; font-family: 'Fira Code', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+  .param-input:focus { outline: 2px solid var(--ring); outline-offset: -1px; }
+  .param-select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; font-family: 'Fira Code', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+
+  /* Suggestion card */
+  .suggestion-card { border: 2px solid var(--border); border-radius: 10px; padding: 20px; background: #FAFBFF; }
+  .suggestion-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .suggestion-header h3 { font-size: 15px; color: var(--primary); font-weight: 600; }
+
+  /* Param table */
+  .param-table td { padding: 7px 12px; }
+  .param-name { font-weight: 500; color: var(--text-primary); font-size: 13px; }
+  .param-old { color: var(--text-muted); font-family: 'Fira Code', monospace; font-size: 13px; }
+  .param-arrow { color: var(--border); text-align: center; font-size: 14px; }
+
+  /* Chart placeholder */
+  .chart-placeholder {
+    background: #FAFBFC; border: 1px solid var(--muted); border-radius: 6px;
+    height: 180px; display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted); font-size: 13px; flex-direction: column; gap: 6px;
+  }
+  .chart-placeholder svg { width: 32px; height: 32px; stroke: var(--text-muted); stroke-width: 1.5; fill: none; }
+
+  /* Progress bar inline */
+  .progress-bar { background: var(--muted); border-radius: 8px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--secondary)); border-radius: 8px; transition: width 0.5s; }
+
+  /* Console */
+  .console-log {
+    background: #0F172A; color: #CBD5E1; border-radius: 6px; padding: 12px 16px;
+    font-family: 'Fira Code', monospace; font-size: 12px; height: 130px; overflow-y: auto; line-height: 1.7;
+  }
+  .console-log .info { color: var(--secondary); }
+  .console-log .success { color: var(--success); }
+  .console-log .warn { color: var(--warning); }
+  .console-log .dim { color: #475569; }
+
+  /* Probe result */
+  .probe-result {
+    border-left: 4px solid var(--primary); padding: 16px 20px;
+    background: #F8FAFC; border-radius: 0 6px 6px 0; margin: 12px 0;
+  }
+
+  /* Health status */
+  .health-ring { width: 60px; height: 60px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 700; }
+
+  /* Thumbnail grid */
+  .thumbnail-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+  .thumbnail { width: 64px; height: 64px; background: var(--muted); border-radius: 4px; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--text-muted); }
+
+  /* Info callout */
+  .callout { padding: 12px 16px; border-radius: 6px; font-size: 13px; line-height: 1.6; }
+  .callout-blue { background: #EFF6FF; border: 1px solid var(--border); color: var(--text-primary); }
+  .callout-yellow { background: var(--accent-bg); border: 1px solid var(--accent-border); color: #92400E; }
+  .callout-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+
+  /* Checkbox row */
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); cursor: pointer; }
+  .checkbox-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); }
+
+  /* Metric delta */
+  .delta-up { color: var(--success); }
+  .delta-down { color: var(--destructive); }
+  .delta-none { color: var(--text-muted); }
+
+  /* Interactive note */
+  .interactive-note {
+    background: var(--accent-bg); border: 1px solid var(--accent-border);
+    border-radius: 6px; padding: 10px 14px; font-size: 12px; color: #92400E; margin-top: 16px; line-height: 1.6;
+  }
+  .interactive-note strong { font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <div class="app-logo">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </div>
+  <div>
+    <h1>YOLOv8 Auto-Tuning Agent</h1>
+    <div class="subtitle" style="margin-bottom:0;">Design Mockup · Click tabs to navigate · Interaction points annotated</div>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchPage(0)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    Projects
+  </button>
+  <button class="tab" onclick="switchPage(1)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+    Dataset Report
+  </button>
+  <button class="tab" onclick="switchPage(2)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+    Agent Suggestion
+  </button>
+  <button class="tab" onclick="switchPage(3)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    Training Monitor
+  </button>
+  <button class="tab" onclick="switchPage(4)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    History
+  </button>
+</div>
+
+<!-- ==================== PAGE 1: PROJECTS ==================== -->
+<div class="page active" id="page0">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">Projects</div>
+  </div>
+
+  <div class="row">
+    <!-- New Project Card -->
+    <div class="col" style="max-width: 240px;">
+      <div class="card" style="border: 2px dashed var(--border); text-align: center; padding: 40px 16px; cursor: pointer; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;" onclick="alert('New project flow: select dataset directory or upload')">
+        <svg viewBox="0 0 24 24" style="width: 32px; height: 32px; stroke: var(--primary); stroke-width: 2; fill: none; margin-bottom: 8px;" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        <div style="font-size: 14px; color: var(--primary); font-weight: 500;">New Project</div>
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Upload or select a dataset</div>
+      </div>
+    </div>
+
+    <!-- Existing Projects -->
+    <div class="col" style="flex:2;">
+      <div class="card" style="margin-bottom: 10px; padding: 14px 16px; cursor: pointer;" onclick="switchPage(1)">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div style="width:32px; height:32px; background: var(--warning-bg); border-radius:6px; display:flex; align-items:center; justify-content:center;">
+              <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke: var(--warning); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            </div>
+            <div>
+              <div style="font-weight:500; font-size:14px;">Surface Defect Inspection v3</div>
+              <div style="font-size:12px; color:var(--text-secondary);">2,147 images · 4 classes</div>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="text-align:right;">
+              <div style="font-size:11px; color:var(--text-muted);">Last: mAP50 0.835</div>
+              <div style="font-size:11px; color:var(--text-muted);">5 min ago</div>
+            </div>
+            <span class="badge badge-yellow">
+              <svg viewBox="0 0 24 24" style="width:12px; height:12px; stroke:currentColor; stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg>
+              Training
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 10px; padding: 14px 16px; cursor: pointer;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div style="width:32px; height:32px; background: var(--success-bg); border-radius:6px; display:flex; align-items:center; justify-content:center;">
+              <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke: var(--success); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+            <div>
+              <div style="font-weight:500; font-size:14px;">Weld Defect Detection</div>
+              <div style="font-size:12px; color:var(--text-secondary);">856 images · 3 classes</div>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="text-align:right;">
+              <div style="font-size:11px; color:var(--text-muted);">Best: mAP50 0.912</div>
+              <div style="font-size:11px; color:var(--text-muted);">2 hours ago</div>
+            </div>
+            <span class="badge badge-green">Completed</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="padding: 14px 16px; cursor: pointer;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <div style="width:32px; height:32px; background: var(--destructive-bg); border-radius:6px; display:flex; align-items:center; justify-content:center;">
+              <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke: var(--destructive); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+            </div>
+            <div>
+              <div style="font-weight:500; font-size:14px;">PCB Defect Detection v2</div>
+              <div style="font-size:12px; color:var(--text-secondary);">3,200 images · 6 classes</div>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="text-align:right;">
+              <div style="font-size:11px; color:var(--text-muted);">mAP50 0.45 · Below target</div>
+              <div style="font-size:11px; color:var(--text-muted);">Needs manual review</div>
+            </div>
+            <span class="badge badge-red">Failed</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="interactive-note">
+    <strong>Interaction 1:</strong> Click "New Project" to upload/select a dataset, triggers Module A analysis.<br>
+    <strong>Interaction 2:</strong> Project cards show status badges. Click enters project detail (first auto-runs dataset analysis).
+  </div>
+</div>
+
+<!-- ==================== PAGE 2: DATASET ANALYSIS REPORT ==================== -->
+<div class="page" id="page1">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">Dataset Analysis Report</div>
+    <span class="badge badge-yellow" style="font-size:13px; padding:4px 14px;">Health: B (Needs Attention)</span>
+  </div>
+
+  <!-- KPI Cards -->
+  <div class="row">
+    <div class="col">
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div class="card-icon" style="background: #EFF6FF;">
+          <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        </div>
+        <div class="card-title">Total Images</div>
+        <div class="card-value">2,147</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div class="card-icon" style="background: #EFF6FF;">
+          <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </div>
+        <div class="card-title">Classes</div>
+        <div class="card-value-sm" style="font-family:'Fira Sans', sans-serif; font-weight:600;">4</div>
+        <div class="card-desc">scratch / crack / dent / stain</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div class="card-icon" style="background: var(--warning-bg);">
+          <svg viewBox="0 0 24 24" stroke="var(--warning)" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </div>
+        <div class="card-title">Blur Ratio</div>
+        <div class="card-value" style="color: var(--warning);">5.2%</div>
+        <div class="card-desc">112 images below threshold</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div class="card-icon" style="background: var(--warning-bg);">
+          <svg viewBox="0 0 24 24" stroke="var(--warning)" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        </div>
+        <div class="card-title">Small Objects</div>
+        <div class="card-value" style="color: var(--warning);">28.3%</div>
+        <div class="card-desc">Below 16x16 px</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="display:flex; flex-direction:column;">
+        <div class="card-icon" style="background: var(--destructive-bg);">
+          <svg viewBox="0 0 24 24" stroke="var(--destructive)" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        </div>
+        <div class="card-title">DBSCAN Outliers</div>
+        <div class="card-value" style="color: var(--destructive);">15</div>
+        <div class="card-desc">Possible mislabels</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts & Distribution -->
+  <div class="row">
+    <div class="col" style="flex: 1.4;">
+      <div class="card" style="padding: 16px;">
+        <div class="card-title" style="margin-bottom: 10px;">Class Distribution</div>
+        <div><div class="bar-label"><span>scratch</span><span>1,200 (55.9%)</span></div><div class="bar-bg"><div class="bar-fill" style="width:56%; background:var(--secondary);"></div></div></div>
+        <div style="margin-top:6px;"><div class="bar-label"><span>crack</span><span>890 (41.5%)</span></div><div class="bar-bg"><div class="bar-fill" style="width:41%; background:var(--success);"></div></div></div>
+        <div style="margin-top:6px;"><div class="bar-label"><span style="color:var(--warning);">dent</span><span>45 (2.1%)</span></div><div class="bar-bg"><div class="bar-fill" style="width:2%; background:var(--warning);"></div></div></div>
+        <div style="margin-top:6px;"><div class="bar-label"><span style="color:var(--destructive);">stain</span><span>12 (0.6%)</span></div><div class="bar-bg"><div class="bar-fill" style="width:1%; background:var(--destructive);"></div></div></div>
+      </div>
+    </div>
+    <div class="col" style="flex: 1;">
+      <div class="card" style="padding: 16px;">
+        <div class="card-title" style="margin-bottom: 10px;">Bounding Box Heatmap</div>
+        <div style="background: linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%); border-radius:6px; height:140px; display:flex; align-items:center; justify-content:center; color:var(--text-muted); font-size:12px; flex-direction:column; gap:4px;">
+          <svg viewBox="0 0 24 24" style="width:24px; height:24px; stroke: var(--text-muted); stroke-width:1.5; fill:none;" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+          <div>Heatmap placeholder</div>
+          <div style="font-size:11px;">Boxes concentrated in center, sparse edges</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Outliers -->
+  <div class="row">
+    <div class="col">
+      <div class="card" style="padding: 16px;">
+        <div class="card-title" style="margin-bottom: 10px;">DBSCAN Outliers (15)</div>
+        <div class="thumbnail-grid">
+          <div class="thumbnail" style="background:#FEF2F2;">#1</div>
+          <div class="thumbnail" style="background:#FEF2F2;">#2</div>
+          <div class="thumbnail" style="background:#FEF2F2;">#3</div>
+          <div class="thumbnail" style="background:#FEF2F2;">#4</div>
+          <div class="thumbnail" style="background:#FEF2F2;">#5</div>
+          <div class="thumbnail" style="background:#F8FAFC; border:1px dashed var(--border); color:var(--text-muted);">+10</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Summary -->
+  <div class="callout callout-blue" style="margin-bottom: 12px;">
+    <div class="callout-label">
+      <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--primary); stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      AI Summary
+    </div>
+    <div>Dataset quality is acceptable (blur rate 5.2%), but severe class imbalance detected: stain only 12 images (0.6%), 100x gap to scratch (1,200). Small objects account for 28.3% — consider increasing imgsz. 15 DBSCAN outliers found, manual review recommended.</div>
+  </div>
+
+  <!-- Analysis Thresholds -->
+  <details style="margin-bottom: 12px;">
+    <summary style="cursor:pointer; font-size:13px; font-weight:500; color:var(--text-secondary); padding:8px 12px; background:var(--muted); border-radius:6px; user-select:none;">
+      <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Analysis Thresholds &amp; Parameters
+    </summary>
+    <div class="card" style="margin-top:6px; padding:16px;">
+      <table>
+        <tr>
+          <th style="width:160px;">Parameter</th>
+          <th style="width:80px;">Default</th>
+          <th style="width:100px;">Current</th>
+          <th>Description</th>
+        </tr>
+        <tr>
+          <td class="param-name">blur_threshold</td>
+          <td><code class="param-old">100.0</code></td>
+          <td><input class="param-input" type="text" value="100.0"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">Laplacian 方差阈值，低于此值判为模糊</td>
+        </tr>
+        <tr>
+          <td class="param-name">under_exposure_pixel</td>
+          <td><code class="param-old">50</code></td>
+          <td><input class="param-input" type="text" value="50"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">像素值低于此判为欠曝</td>
+        </tr>
+        <tr>
+          <td class="param-name">over_exposure_pixel</td>
+          <td><code class="param-old">200</code></td>
+          <td><input class="param-input" type="text" value="200"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">像素值高于此判为过曝</td>
+        </tr>
+        <tr>
+          <td class="param-name">under_exposure_ratio</td>
+          <td><code class="param-old">0.3</code></td>
+          <td><input class="param-input" type="text" value="0.3"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">欠曝像素占比超过此值标记为欠曝图</td>
+        </tr>
+        <tr>
+          <td class="param-name">over_exposure_ratio</td>
+          <td><code class="param-old">0.3</code></td>
+          <td><input class="param-input" type="text" value="0.3"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">过曝像素占比超过此值标记为过曝图</td>
+        </tr>
+        <tr>
+          <td class="param-name">snr_threshold</td>
+          <td><code class="param-old">10</code></td>
+          <td><input class="param-input" type="text" value="10"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">SNR 低于此值判为低信噪比</td>
+        </tr>
+        <tr>
+          <td class="param-name">quality_sample_size</td>
+          <td><code class="param-old">500</code></td>
+          <td><input class="param-input" type="text" value="500"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">质量分析采样图片数</td>
+        </tr>
+        <tr>
+          <td class="param-name">cluster_sample_size</td>
+          <td><code class="param-old">200</code></td>
+          <td><input class="param-input" type="text" value="200"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">特征聚类采样图片数</td>
+        </tr>
+        <tr>
+          <td class="param-name">bbox_tiny_threshold</td>
+          <td><code class="param-old">0.01</code></td>
+          <td><input class="param-input" type="text" value="0.01"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">相对面积 &lt; 此值 = tiny</td>
+        </tr>
+        <tr>
+          <td class="param-name">bbox_medium_threshold</td>
+          <td><code class="param-old">0.2</code></td>
+          <td><input class="param-input" type="text" value="0.2"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">相对面积 &lt; 此值 = medium</td>
+        </tr>
+        <tr>
+          <td class="param-name">high_iou_threshold</td>
+          <td><code class="param-old">0.7</code></td>
+          <td><input class="param-input" type="text" value="0.7"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">IoU 高于此值标记为高重叠</td>
+        </tr>
+        <tr>
+          <td class="param-name">long_tail_ratio</td>
+          <td><code class="param-old">0.3</code></td>
+          <td><input class="param-input" type="text" value="0.3"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">低于平均数量×此值 = 长尾类</td>
+        </tr>
+        <tr>
+          <td class="param-name">dbscan_eps</td>
+          <td><code class="param-old">0.3</code></td>
+          <td><input class="param-input" type="text" value="0.3"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">DBSCAN 聚类半径</td>
+        </tr>
+        <tr>
+          <td class="param-name">dbscan_min_samples</td>
+          <td><code class="param-old">5</code></td>
+          <td><input class="param-input" type="text" value="5"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">DBSCAN 最小样本数</td>
+        </tr>
+        <tr>
+          <td class="param-name">warn_blur_ratio</td>
+          <td><code class="param-old">0.1</code></td>
+          <td><input class="param-input" type="text" value="0.1"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">模糊率高于此值触发告警</td>
+        </tr>
+        <tr>
+          <td class="param-name">warn_label_rate</td>
+          <td><code class="param-old">0.5</code></td>
+          <td><input class="param-input" type="text" value="0.5"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">标签率低于此值触发告警</td>
+        </tr>
+        <tr>
+          <td class="param-name">warn_tiny_bbox_ratio</td>
+          <td><code class="param-old">0.2</code></td>
+          <td><input class="param-input" type="text" value="0.2"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">tiny 占比高于此值触发告警</td>
+        </tr>
+        <tr>
+          <td class="param-name">warn_center_concentration</td>
+          <td><code class="param-old">0.6</code></td>
+          <td><input class="param-input" type="text" value="0.6"></td>
+          <td style="font-size:12px; color:var(--text-secondary);">中心集中度高于此值触发告警</td>
+        </tr>
+      </table>
+      <div style="margin-top:12px; display:flex; gap:8px; justify-content:flex-end;">
+        <button class="btn btn-outline btn-sm">Reset to Defaults</button>
+        <button class="btn btn-primary btn-sm">Re-analyze with Custom Thresholds</button>
+      </div>
+    </div>
+  </details>
+
+  <div style="display:flex; gap:8px; justify-content:flex-end;">
+    <button class="btn btn-outline btn-sm">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Export JSON
+    </button>
+    <button class="btn btn-primary" onclick="switchPage(2)">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      Start Training
+    </button>
+  </div>
+
+  <div class="interactive-note">
+    <strong>Interaction 1:</strong> KPI card colors indicate severity (blue = info, amber = warning, red = critical).<br>
+    <strong>Interaction 2:</strong> Hover on dent/stain bars shows tooltip with recommendation.<br>
+    <strong>Interaction 3:</strong> Click outlier thumbnails to view full-size and confirm/delete.<br>
+    <strong>Interaction 4:</strong> "Start Training" navigates to Agent Suggestion page.
+  </div>
+</div>
+
+<!-- ==================== PAGE 3: AGENT SUGGESTION ==================== -->
+<div class="page" id="page2">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">Agent Suggestion</div>
+  </div>
+
+  <!-- Diagnosis Cards -->
+  <div class="row">
+    <div class="col">
+      <div class="callout callout-yellow" style="height:100%;">
+        <div class="callout-label">
+          <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--warning); stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          Diagnosis
+        </div>
+        <div>Model shows moderate overfitting from epoch 72. Dent (45 samples) and stain (12 samples) miss rates at 35% and 50% respectively — severe class imbalance is the root cause.</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="callout callout-blue" style="height:100%;">
+        <div class="callout-label">
+          <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--primary); stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          Rationale
+        </div>
+        <div>Increase cls loss weight to emphasize minority classes; enable copy_paste augmentation for rare samples; reduce lr with AdamW for stable convergence; lower epochs with early stopping to prevent overfitting.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hyperparameter Table -->
+  <div class="suggestion-card" style="margin-bottom: 16px;">
+    <div class="suggestion-header">
+      <h3>Hyperparameter Changes</h3>
+      <span class="badge badge-blue">Confidence: high</span>
+    </div>
+    <table class="param-table">
+      <tr>
+        <th style="width:110px;">Parameter</th>
+        <th style="width:90px;">Current</th>
+        <th style="width:32px;"></th>
+        <th style="width:110px;">Suggested</th>
+        <th>Reason</th>
+      </tr>
+      <tr>
+        <td class="param-name">lr0</td>
+        <td class="param-old">0.01</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="0.008"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Reduce for stable convergence on overfitting</td>
+      </tr>
+      <tr>
+        <td class="param-name">optimizer</td>
+        <td class="param-old">SGD</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><select class="param-select"><option>AdamW</option><option>SGD</option></select></td>
+        <td style="font-size:12px; color:var(--text-secondary);">AdamW converges faster on small datasets</td>
+      </tr>
+      <tr>
+        <td class="param-name">cls</td>
+        <td class="param-old">0.5</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="1.5"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Increases minority class focus</td>
+      </tr>
+      <tr>
+        <td class="param-name">box</td>
+        <td class="param-old">7.5</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="10.0"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Higher weight for small object localization</td>
+      </tr>
+      <tr>
+        <td class="param-name">copy_paste</td>
+        <td class="param-old">0.0</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="0.3"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Augment rare classes via copy-paste</td>
+      </tr>
+      <tr>
+        <td class="param-name">weight_decay</td>
+        <td class="param-old">0.0005</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="0.001"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Stronger regularization for overfitting</td>
+      </tr>
+      <tr>
+        <td class="param-name">epochs</td>
+        <td class="param-old">100</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="80"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Reduce + early stop to prevent overfitting</td>
+      </tr>
+      <tr>
+        <td class="param-name">patience</td>
+        <td class="param-old">50</td>
+        <td class="param-arrow">&rarr;</td>
+        <td><input class="param-input" type="text" value="20"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">Trigger early stop sooner</td>
+      </tr>
+    </table>
+
+    <!-- Options -->
+    <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--muted); display:flex; gap:16px; flex-wrap:wrap;">
+      <label class="checkbox-row">
+        <input type="checkbox" checked> Probe mode (10 epochs first, then decide)
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" checked> Auto-analyze after training (Module B)
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox"> Auto-loop (retrain with new params)
+      </label>
+    </div>
+  </div>
+
+  <div style="display:flex; gap:8px; justify-content:flex-end;">
+    <button class="btn btn-outline btn-sm">Reset to Current</button>
+    <button class="btn btn-outline">Cancel</button>
+    <button class="btn btn-primary" onclick="switchPage(3)">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Confirm & Start Training
+    </button>
+  </div>
+
+  <div class="interactive-note">
+    <strong>Interaction 1:</strong> Every suggested value is an editable input — users can tweak before confirming.<br>
+    <strong>Interaction 2:</strong> "Probe mode" runs 10 epochs first for quick validation.<br>
+    <strong>Interaction 3:</strong> "Auto-loop" enables fully autonomous retraining cycles.<br>
+    <strong>Interaction 4:</strong> Guardrails log should appear here as yellow warnings if any param is clamped/overridden.
+  </div>
+</div>
+
+<!-- ==================== PAGE 4: TRAINING MONITOR ==================== -->
+<div class="page" id="page3">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">Training Monitor</div>
+    <span class="badge badge-yellow">Epoch 47 / 80</span>
+  </div>
+
+  <!-- KPI Row -->
+  <div class="row">
+    <div class="col">
+      <div class="card" style="text-align:center;">
+        <div class="card-title">Progress</div>
+        <div class="card-value" style="font-size:22px;">47 <span style="font-size:14px; color:var(--text-muted);">/ 80</span></div>
+        <div class="progress-bar" style="margin-top:8px; max-width:200px; margin-left:auto; margin-right:auto;"><div class="progress-fill" style="width:59%;"></div></div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:6px;">ETA: 4m 32s</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="text-align:center;">
+        <div class="card-title">Current mAP50</div>
+        <div class="card-value" style="font-size:22px; color:var(--success);">0.792</div>
+        <div class="card-desc">Best: 0.812 (epoch 42)</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="text-align:center;">
+        <div class="card-title">Val/box Loss</div>
+        <div class="card-value" style="font-size:22px; color:var(--primary);">0.038</div>
+        <div class="card-desc">Trend:
+          <span class="delta-down">
+            <svg viewBox="0 0 24 24" style="width:12px; height:12px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            decreasing
+          </span>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="text-align:center;">
+        <div class="card-title">Learning Rate</div>
+        <div class="card-value" style="font-size:22px; color:var(--text-secondary);">0.0064</div>
+        <div class="card-desc">Cosine schedule</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="row">
+    <div class="col" style="flex:1;">
+      <div class="card" style="padding:16px;">
+        <div class="card-title" style="margin-bottom:8px;">Loss Curves</div>
+        <div class="chart-placeholder" style="height:200px;">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <div>Loss Chart</div>
+          <div style="font-size:11px;">Blue: train_loss · Red: val_loss · Dashed: epoch 47</div>
+        </div>
+      </div>
+    </div>
+    <div class="col" style="flex:1;">
+      <div class="card" style="padding:16px;">
+        <div class="card-title" style="margin-bottom:8px;">mAP Curves</div>
+        <div class="chart-placeholder" style="height:200px;">
+          <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <div>mAP Chart</div>
+          <div style="font-size:11px;">Green: mAP50 · Orange: mAP50-95</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Console -->
+  <div class="row">
+    <div class="col">
+      <div class="card" style="padding:16px;">
+        <div class="card-title" style="margin-bottom:8px;">Training Log</div>
+        <div class="console-log">
+          <div>[15:23:04] Epoch 46/80 &nbsp;box_loss=0.041 &nbsp;cls_loss=0.009 &nbsp;mAP50=0.785</div>
+          <div>[15:23:34] Epoch 47/80 &nbsp;box_loss=0.040 &nbsp;cls_loss=0.008 &nbsp;mAP50=0.792</div>
+          <div class="info">[15:23:44] Validating epoch 47...</div>
+          <div class="success">[15:23:52] Epoch 47 validation complete</div>
+          <div class="dim">[15:24:00] Saving checkpoint to weights/last.pt</div>
+          <div class="info">[15:24:05] Starting epoch 48/80</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Probe Result (hidden by default, shown when probe finishes) -->
+  <div class="probe-result" id="probeResult" style="display:none;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <div style="display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px;">
+          <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          Probe Complete (10 epochs)
+        </div>
+        <div style="font-size:13px; color:var(--text-secondary); margin-top:4px;">Loss is decreasing steadily, mAP50=0.65. No anomalies detected. Continue training?</div>
+      </div>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-outline btn-sm" onclick="alert('Tuning: go back to suggestion page with new params')">Retune</button>
+        <button class="btn btn-primary btn-sm">Continue Training</button>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
+    <button class="btn btn-danger btn-sm" onclick="alert('Training stopped. Saving checkpoint.')">
+      <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      Stop Training
+    </button>
+  </div>
+
+  <div class="interactive-note">
+    <strong>Interaction 1:</strong> Charts use Plotly — zoom, hover for exact values.<br>
+    <strong>Interaction 2:</strong> "Stop Training" kills subprocess immediately and saves checkpoint.<br>
+    <strong>Interaction 3:</strong> Probe result bar appears after 10 epochs (hidden by default). Choose Continue or Retune.<br>
+    <strong>Interaction 4:</strong> Training complete auto-navigates to History page.
+  </div>
+</div>
+
+<!-- ==================== PAGE 5: TRAINING HISTORY ==================== -->
+<div class="page" id="page4">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">Training History</div>
+  </div>
+
+  <table>
+    <tr>
+      <th style="width:40px;">#</th>
+      <th>Time</th>
+      <th>Epochs</th>
+      <th>mAP50</th>
+      <th>mAP50-95</th>
+      <th>Miss Rate</th>
+      <th>False Alarm</th>
+      <th>Status</th>
+      <th style="width:80px;"></th>
+    </tr>
+    <tr onclick="alert('Expand: show params used / loss curves / diagnosis / misclassification crops')" style="cursor:pointer;">
+      <td>3</td>
+      <td>12:34</td>
+      <td>80</td>
+      <td><strong style="color:var(--success);">0.835</strong></td>
+      <td>0.612</td>
+      <td style="color:var(--warning);">8.3%</td>
+      <td>5.1%</td>
+      <td><span class="badge badge-green">Completed</span></td>
+      <td><button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); alert('Compare mode')">Compare</button></td>
+    </tr>
+    <tr onclick="alert('Expand details')" style="cursor:pointer;">
+      <td>2</td>
+      <td>10:15</td>
+      <td>100</td>
+      <td>0.791</td>
+      <td>0.558</td>
+      <td>12.1%</td>
+      <td>6.8%</td>
+      <td><span class="badge badge-yellow">Overfit</span></td>
+      <td><button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); alert('Compare mode')">Compare</button></td>
+    </tr>
+    <tr onclick="alert('Expand details')" style="cursor:pointer;">
+      <td>1</td>
+      <td>08:00</td>
+      <td>10</td>
+      <td>0.421</td>
+      <td>0.298</td>
+      <td style="color:var(--destructive);">28.5%</td>
+      <td style="color:var(--destructive);">15.2%</td>
+      <td><span class="badge badge-red">Probe Stop</span></td>
+      <td><button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); alert('Compare mode')">Compare</button></td>
+    </tr>
+  </table>
+
+  <div style="margin-top:16px; display:flex; gap:8px;">
+    <button class="btn btn-outline btn-sm">
+      <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      Compare Selected
+    </button>
+    <button class="btn btn-outline btn-sm">
+      <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Export Report
+    </button>
+  </div>
+
+  <div class="interactive-note">
+    <strong>Interaction 1:</strong> Click any row to expand full details (hyperparameters, loss curves, diagnosis report, misclassification crops).<br>
+    <strong>Interaction 2:</strong> Select multiple rows and "Compare" for side-by-side view of metrics and curves.<br>
+    <strong>Interaction 3:</strong> Each training run records the full param set — traceable history of "what changed and what improved."
+  </div>
+</div>
+
+<script>
+function switchPage(idx) {
+  document.querySelectorAll('.page').forEach((el, i) => el.classList.toggle('active', i === idx));
+  document.querySelectorAll('.tab').forEach((el, i) => el.classList.toggle('active', i === idx));
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,77 @@
+project:
+  name: 项目名称（如：PCB缺陷检测）
+  description: 项目描述（如：PCB焊点缺陷检测）
+  detection_target: 检测目标类型（如：缺陷、物体、文字）
+  data_type: 数据类型（如：缺陷、分类、检测）
+  extra: {}
+  data_yaml: ''
+  model: yolov8n.pt
+llm:
+  provider: deepseek
+  api_key: YOUR_DEEPSEEK_API_KEY_HERE
+  model: deepseek-chat
+  endpoint: https://api.deepseek.com/v1/chat/completions
+  temperature: 0.3
+  max_tokens: 2000
+  enabled: true
+vision:
+  provider: qwen
+  api_key: YOUR_QWEN_VL_API_KEY_HERE
+  model: qwen-vl-plus
+  endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  temperature: 0.3
+  max_tokens: 500
+  enabled: true
+  error_crops_enabled: true
+guardrails:
+  mode: strict
+  custom_rules_dir: guardrails/rules/
+probe:
+  enabled: true
+  probe_epochs: 10
+  auto_continue_threshold_mAP50: 0.05
+  max_retries: 3
+dataset_analyzer:
+  blur_threshold: 30
+  under_exposure_pixel_threshold: 30
+  over_exposure_pixel_threshold: 220
+  under_exposure_ratio_threshold: 0.5
+  over_exposure_ratio_threshold: 0.3
+  snr_threshold: 1.5
+  quality_sample_size: 500
+  cluster_sample_size: 200
+  bbox_tiny_threshold: 0.005
+  bbox_small_threshold: 0.02
+  bbox_medium_threshold: 0.1
+  spatial_center_low: 0.25
+  spatial_center_high: 0.75
+  spatial_edge_low: 0.1
+  spatial_edge_high: 0.9
+  high_iou_threshold: 0.7
+  long_tail_ratio: 0.3
+  dbscan_eps: 0.3
+  dbscan_min_samples: 5
+  warn_label_rate: 0.3
+  warn_tiny_bbox_ratio: 0.3
+  warn_center_concentration: 0.6
+  warn_blur_ratio: 0.3
+  quality_blur_weight: 0.15
+  quality_under_weight: 0.15
+  quality_over_weight: 0.15
+  quality_imbalance_weight: 0.25
+train_analyzer:
+  plateau_epochs: 10
+  overfit_threshold: 0.15
+  val_loss_ma_window: 5
+  min_acceptable_map: 0.5
+  stale_threshold: 15
+  top_k_runs: 5
+  compare_metric: metrics/mAP50(B)
+training:
+  default_epochs: 100
+  patience: 20
+  imgsz: 640
+  batch: 16
+  workers: 4
+  data_yaml: ''
+  model: yolov8n.pt

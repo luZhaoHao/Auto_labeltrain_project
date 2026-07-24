@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+{% block title %}训练分析与调参 - Auto-Tune{% endblock %}
+{% block content %}
+<h1 style="font-size: 24px; margin-bottom: 24px;">🎯 训练分析与自动调参</h1>
+
+<div style="display: flex; gap: 24px; align-items: flex-start;">
+    <!-- Left: Training Analysis -->
+    <div style="flex: 1; min-width: 0;">
+        {% if training %}
+        {% set summary = training.summary %}
+        <div class="card">
+            <h3>📊 总体摘要</h3>
+            <table>
+                <tr><td>分析训练数</td><td>{{ summary.total_runs_analyzed }}</td></tr>
+                <tr><td>最佳训练</td><td>{{ summary.best_overall_run }}</td></tr>
+                <tr><td>最佳 mAP50</td><td>{{ summary.best_mAP50 }}</td></tr>
+                <tr><td>平均 mAP50</td><td>{{ summary.average_mAP50 }}</td></tr>
+                <tr><td>有问题的训练数</td><td>{{ summary.runs_with_issues }}</td></tr>
+            </table>
+            {% if summary.common_issues %}
+            <div class="mt-2">
+                <strong>常见问题：</strong>
+                {% for issue in summary.common_issues %}
+                <span class="badge badge-warn">{{ issue.type }} ({{ issue.count }}次)</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+
+        {% for rn, rd in training.runs.items() %}
+        {% set args = rd.args %}
+        {% set results = rd.results %}
+        {% set final = results.final_metrics %}
+        {% set issues = rd.issues %}
+        <div class="card">
+            <h3>{{ rn }}</h3>
+            <div class="grid" style="grid-template-columns: 1fr 1fr;">
+                <div>
+                    <h4 style="font-size: 14px; margin-bottom: 8px; color: #555;">训练配置</h4>
+                    <table>
+                        <tr><td>模型</td><td>{{ args.model }}</td></tr>
+                        <tr><td>Epochs</td><td>{{ args.epochs }}</td></tr>
+                        <tr><td>Batch</td><td>{{ args.batch }}</td></tr>
+                        <tr><td>imgsz</td><td>{{ args.imgsz }}</td></tr>
+                        <tr><td>优化器</td><td>{{ args.optimizer }}</td></tr>
+                        <tr><td>lr0</td><td>{{ args.lr0 }}</td></tr>
+                        <tr><td>box/cls/dfl</td><td>{{ args.box }} / {{ args.cls }} / {{ args.dfl }}</td></tr>
+                    </table>
+                </div>
+                <div>
+                    <h4 style="font-size: 14px; margin-bottom: 8px; color: #555;">最终指标</h4>
+                    <table>
+                        <tr><td>mAP50</td><td><strong>{{ "%.4f"|format(final.get("metrics/mAP50(B)", 0)) }}</strong></td></tr>
+                        <tr><td>mAP50-95</td><td>{{ "%.4f"|format(final.get("metrics/mAP50-95(B)", 0)) }}</td></tr>
+                        <tr><td>Precision</td><td>{{ "%.4f"|format(final.get("metrics/precision(B)", 0)) }}</td></tr>
+                        <tr><td>Recall</td><td>{{ "%.4f"|format(final.get("metrics/recall(B)", 0)) }}</td></tr>
+                    </table>
+                </div>
+            </div>
+            {% if issues %}
+            <div class="mt-2">
+                <h4 style="font-size: 14px; margin-bottom: 8px; color: #555;">检测问题</h4>
+                {% for issue in issues %}
+                <span class="badge badge-{{ 'err' if issue.severity == 'high' else 'warn' }}">
+                    [{{ issue.severity }}] {{ issue.type }}
+                </span>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+
+        <!-- LLM Diagnosis -->
+        {% if training.llm_analysis %}
+        {% for rn, diag in training.llm_analysis.items() %}
+        {% if diag.llm_diagnosis %}
+        <div class="card">
+            <h3>🧠 LLM 诊断 — {{ rn }}</h3>
+            <div style="font-size: 14px; line-height: 1.7;">{{ diag.llm_diagnosis|replace('\n', '<br>')|safe }}</div>
+        </div>
+        {% endif %}
+        {% endfor %}
+        {% endif %}
+
+        {% else %}
+        <div class="card">
+            <p class="text-muted">暂无训练分析结果。请先运行 test_modelb.py。</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Right: Tuning Panel -->
+    <div style="width: 380px; flex-shrink: 0; position: sticky; top: 32px;">
+        <div class="card">
+            <h3>🤖 自动调参</h3>
+            <p class="text-muted mb-2">基于数据集分析和训练诊断，自动生成超参数优化方案并启动训练。</p>
+
+            <form id="tuningForm">
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 13px; font-weight: 500; display: block; margin-bottom: 4px;">参考训练</label>
+                    <select name="reference_run" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px;">
+                        <option value="">自动检测</option>
+                        {% if training and training.runs %}
+                        {% for rn in training.runs.keys() %}
+                        <option value="{{ rn }}">{{ rn }}</option>
+                        {% endfor %}
+                        {% endif %}
+                    </select>
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 13px; font-weight: 500; display: block; margin-bottom: 4px;">最大重试次数</label>
+                    <input type="number" name="max_retries" value="3" min="1" max="10" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px;">
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 13px; font-weight: 500; display: block; margin-bottom: 4px;">模式</label>
+                    <select name="mode" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px;">
+                        <option value="dry_run">Dry-Run（仅生成方案，不训练）</option>
+                        <option value="full">完整训练</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;" id="startTuningBtn">
+                    🚀 开始自动调参
+                </button>
+            </form>
+        </div>
+
+        <!-- Tuning Progress -->
+        <div class="card hidden" id="tuningProgress">
+            <h3>⏳ 调参进度</h3>
+            <div id="tuningStatus" class="text-muted mb-2">初始化...</div>
+            <div class="log-box" id="tuningLog" style="max-height: 300px;">
+                <div class="info">等待开始...</div>
+            </div>
+        </div>
+
+        <!-- Tuning History -->
+        {% if tuning_history %}
+        <div class="card">
+            <h3>📋 调参历史</h3>
+            {% for attempt in tuning_history|reverse %}
+            <div style="padding: 8px 0; border-bottom: 1px solid #eee; font-size: 13px;">
+                <div class="flex">
+                    <span class="badge badge-info">#{{ attempt.iteration }}</span>
+                    {% if attempt.error %}
+                    <span class="badge badge-err">失败</span>
+                    {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+                    <span class="badge badge-ok">通过</span>
+                    {% else %}
+                    <span class="badge badge-warn">重试</span>
+                    {% endif %}
+                    <span class="text-muted">{{ attempt.timestamp[:10] }}</span>
+                </div>
+                {% if attempt.decision.diagnosis %}
+                <div style="margin-top: 4px; color: #555;">{{ attempt.decision.diagnosis[:60] }}{% if attempt.decision.diagnosis|length > 60 %}...{% endif %}</div>
+                {% endif %}
+                {% if attempt.decision.hyperparameter_changes %}
+                <div style="margin-top: 4px; font-size: 12px; color: #888;">
+                    修改: {% for k, v in attempt.decision.hyperparameter_changes.items() %}{{ k }}={{ v }} {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+const tuningForm = document.getElementById('tuningForm');
+const tuningProgress = document.getElementById('tuningProgress');
+const tuningStatus = document.getElementById('tuningStatus');
+const tuningLog = document.getElementById('tuningLog');
+const startBtn = document.getElementById('startTuningBtn');
+
+tuningForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(tuningForm);
+
+    startBtn.disabled = true;
+    startBtn.textContent = '⏳ 运行中...';
+    tuningProgress.classList.remove('hidden');
+    tuningLog.innerHTML = '';
+
+    try {
+        const response = await fetch('/tuning/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                reference_run: formData.get('reference_run') || null,
+                max_retries: parseInt(formData.get('max_retries')),
+                mode: formData.get('mode'),
+            }),
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const text = decoder.decode(value, { stream: true });
+            for (const line of text.split('\n')) {
+                if (line.startsWith('data: ')) {
+                    const data = JSON.parse(line.slice(6));
+                    appendLog(data.message, data.level || 'info');
+
+                    if (data.status === 'error') {
+                        tuningStatus.textContent = '❌ ' + data.message;
+                    } else if (data.status === 'done') {
+                        tuningStatus.textContent = '✅ 调参完成';
+                    } else if (data.status === 'running') {
+                        tuningStatus.textContent = '⏳ ' + data.message;
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        appendLog('连接错误: ' + err.message, 'error');
+    } finally {
+        startBtn.disabled = false;
+        startBtn.textContent = '🚀 开始自动调参';
+        // Do NOT reload — keep the tuning log visible
+    }
+
+    function appendLog(msg, level) {
+        const div = document.createElement('div');
+        div.className = level;
+        div.textContent = msg;
+        tuningLog.appendChild(div);
+        tuningLog.scrollTop = tuningLog.scrollHeight;
+    }
+});
+</script>
+{% endblock %}

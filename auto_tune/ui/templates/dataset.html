@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+{% block title %}{{ _("Dataset Report") }} - YOLOv8 Auto-Tuning{% endblock %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Dataset Analysis Report") }}</div>
+    {% if dataset %}
+    {% set qs = dataset.summary.dataset_quality_score %}
+    <span class="badge {% if qs >= 80 %}badge-green{% elif qs >= 50 %}badge-yellow{% else %}badge-red{% endif %}" style="font-size:13px; padding:4px 14px;">
+        {{ _("Quality Score") }}: {{ qs }}
+    </span>
+    {% endif %}
+</div>
+
+<!-- Upload Zone -->
+<div class="upload-zone" id="uploadZone" style="margin-bottom:16px;">
+    <form id="uploadForm" enctype="multipart/form-data">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        <div class="label">{{ _("Drop ZIP file here or click to upload") }}</div>
+        <div class="hint">{{ _("Upload a ZIP file containing your YOLO dataset (images + labels + data.yaml)") }}</div>
+        <input type="file" name="file" accept=".zip" style="display:none;" id="fileInput">
+        <div style="margin-top:12px;">
+            <button type="submit" class="btn btn-primary btn-sm" id="uploadBtn">{{ _("Upload & Analyze") }}</button>
+        </div>
+        <div id="uploadStatus" style="margin-top:8px; font-size:13px; color:var(--text-secondary); display:none;"></div>
+    </form>
+</div>
+
+{% if dataset %}
+{% set dc = dataset.label_coverage %}
+{% set iq = dataset.image_quality %}
+{% set ba = dataset.bbox_analysis %}
+{% set cb = dataset.class_balance %}
+{% set sp = dataset.spatial_bias %}
+
+<!-- KPI Cards -->
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-icon" style="background:#EFF6FF;">
+                <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            </div>
+            <div class="card-title">{{ _("Total Images") }}</div>
+            <div class="card-value">{{ dataset.total_images }}</div>
+            <div class="card-desc">{{ dataset.total_annotations }} {{ _("annotations") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-icon" style="background:#EFF6FF;">
+                <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            </div>
+            <div class="card-title">{{ _("Label Rate") }}</div>
+            <div class="card-value" style="color: {% if dc.label_rate >= 0.8 %}var(--success){% elif dc.label_rate >= 0.5 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(dc.label_rate * 100) }}%</div>
+            <div class="card-desc">{{ dc.with_labels if dc.total_images else "?" }} {{ _("labeled") }} / {{ dc.without_labels if dc.total_images else "?" }} {{ _("unlabeled") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-icon" style="background:{% if iq.blur_ratio < 0.05 %}var(--success-bg){% else %}var(--warning-bg){% endif %};">
+                <svg viewBox="0 0 24 24" stroke="{% if iq.blur_ratio < 0.05 %}var(--success){% else %}var(--warning){% endif %}" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            </div>
+            <div class="card-title">{{ _("Blur Ratio") }}</div>
+            <div class="card-value" style="color: {% if iq.blur_ratio < 0.05 %}var(--success){% elif iq.blur_ratio < 0.15 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(iq.blur_ratio * 100) }}%</div>
+            <div class="card-desc">{{ (iq.blur_ratio * dataset.total_images)|round|int if dataset.total_images else 0 }} {{ _("images below threshold") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-icon" style="background:{% if ba.tiny_bbox_ratio < 0.1 %}var(--success-bg){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning-bg){% else %}var(--destructive-bg){% endif %};">
+                <svg viewBox="0 0 24 24" stroke="{% if ba.tiny_bbox_ratio < 0.1 %}var(--success){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning){% else %}var(--destructive){% endif %}" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            </div>
+            <div class="card-title">{{ _("Small Objects") }}</div>
+            <div class="card-value" style="color: {% if ba.tiny_bbox_ratio < 0.1 %}var(--success){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%</div>
+            <div class="card-desc">{{ _("Tiny / Small bboxes") }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- Class Distribution + Quality Details -->
+<div class="row">
+    <div class="col" style="flex: 1.4;">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Class Distribution") }}</div>
+            {% if dataset.class_distribution %}
+                {% set items = dataset.class_distribution.items()|list %}
+                {% set max_count = items|map(attribute='1.count')|max %}
+                {% for cls, data in items %}
+                {% set pct = (data.count / max_count * 100)|round %}
+                <div{% if not loop.first %} style="margin-top:6px;"{% endif %}>
+                    <div class="bar-label">
+                        <span>{{ cls }}</span>
+                        <span>{{ data.count }} ({{ "%.1f"|format(data.count / dataset.total_annotations * 100) if dataset.total_annotations else 0 }}%)</span>
+                    </div>
+                    <div class="bar-bg">
+                        {% set colors = ["var(--secondary)", "var(--success)", "var(--warning)", "var(--destructive)", "#8B5CF6", "#EC4899"] %}
+                        <div class="bar-fill" style="width:{{ pct }}%; background:{{ colors[loop.index0 % colors|length] }};"></div>
+                    </div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div style="padding:20px; text-align:center; color:var(--text-muted);">{{ _("No class distribution data available") }}</div>
+            {% endif %}
+        </div>
+    </div>
+    <div class="col" style="flex: 1;">
+        <div class="card" style="height:100%;">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Image Quality") }}</div>
+            <table>
+                <tr><td>{{ _("Overexposure") }}</td><td>{{ "%.1f"|format(iq.overexposure_ratio * 100) }}%</td></tr>
+                <tr><td>{{ _("Underexposure") }}</td><td>{{ "%.1f"|format(iq.underexposure_ratio * 100) }}%</td></tr>
+                <tr><td>{{ _("Low SNR") }}</td><td>{{ "%.1f"|format(iq.low_snr_ratio * 100) }}%</td></tr>
+            </table>
+
+            <div class="card-title" style="margin-top:16px; margin-bottom:10px;">{{ _("BBox Size Distribution") }}</div>
+            <table>
+                <tr><td>{{ _("Tiny") }}</td><td>{{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%</td></tr>
+                <tr><td>{{ _("Small") }}</td><td>{{ "%.1f"|format(ba.small_bbox_ratio * 100) }}%</td></tr>
+                <tr><td>{{ _("Medium") }}</td><td>{{ "%.1f"|format(ba.medium_bbox_ratio * 100) }}%</td></tr>
+                <tr><td>{{ _("Large") }}</td><td>{{ "%.1f"|format(ba.large_bbox_ratio * 100) }}%</td></tr>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Spatial + Class Balance + Key Issues -->
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Spatial Distribution") }}</div>
+            <table>
+                <tr><td>{{ _("Center Concentration") }}</td><td>{{ "%.2f"|format(sp.center_concentration_score) }}</td></tr>
+                <tr><td>{{ _("Edge Ratio") }}</td><td>{{ "%.1f"|format(sp.edge_ratio * 100) }}%</td></tr>
+            </table>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Class Balance") }}</div>
+            <table>
+                <tr><td>{{ _("Balanced") }}</td>
+                    <td>{% if cb.is_balanced %}<span class="badge badge-green">{{ _("Yes") }}</span>{% else %}<span class="badge badge-yellow">{{ _("No") }}</span>{% endif %}</td></tr>
+                <tr><td>{{ _("Imbalance Ratio") }}</td><td>{{ "%.2f"|format(cb.imbalance_ratio) }}</td></tr>
+                {% if cb.long_tail_classes %}
+                <tr><td>{{ _("Long-tail Classes") }}</td><td>{{ cb.long_tail_classes|join(", ") }}</td></tr>
+                {% endif %}
+            </table>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Key Issues") }}</div>
+            {% set issues = dataset.summary.key_issues %}
+            {% if issues %}
+            <ul style="padding-left: 16px;">
+                {% for issue in issues %}
+                <li style="margin-bottom:4px; font-size:13px; color:var(--text-secondary);">{{ issue }}</li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="text-muted">{{ _("No key issues detected") }}</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- AI Summary -->
+<div class="callout callout-blue" style="margin-bottom:12px;">
+    <div class="callout-label">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        {{ _("AI Summary") }}
+    </div>
+    <div>{{ _("Dataset quality score") }}: <strong>{{ dataset.summary.dataset_quality_score }}</strong>.
+    {% if dataset.summary.key_issues %}
+    {{ _("Detected") }} {{ dataset.summary.key_issues|length }} {{ _("issue(s)") }}: {{ dataset.summary.key_issues|join("; ") }}.
+    {% else %}
+    {{ _("No critical issues detected.") }}
+    {% endif %}
+    {% if cb.long_tail_classes %}
+    {{ _("Pay attention to long-tail classes") }}: {{ cb.long_tail_classes|join(", ") }}.
+    {% endif %}
+    {% if ba.tiny_bbox_ratio > 0.15 %}
+    {{ _("Small object ratio is high") }} ({{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%) — {{ _("consider increasing imgsz or use P2/P3 model.") }}
+    {% endif %}
+    </div>
+</div>
+
+<!-- Analysis Thresholds -->
+<details class="thresholds-panel" style="margin-bottom:12px;">
+    <summary>
+        <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        {{ _("Analysis Thresholds & Parameters") }}
+    </summary>
+    <div class="card" style="margin-top:6px; padding:16px;">
+        <table>
+            <tr><th style="width:160px;">{{ _("Parameter") }}</th><th style="width:80px;">{{ _("Value") }}</th><th>{{ _("Description") }}</th></tr>
+            <tr><td>blur_threshold</td><td><code>100.0</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Laplacian variance threshold for blur detection") }}</td></tr>
+            <tr><td>under_exposure_pixel</td><td><code>50</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Pixel value below this = underexposed") }}</td></tr>
+            <tr><td>over_exposure_pixel</td><td><code>200</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Pixel value above this = overexposed") }}</td></tr>
+            <tr><td>bbox_tiny_threshold</td><td><code>0.01</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Relative area < this = tiny") }}</td></tr>
+            <tr><td>bbox_medium_threshold</td><td><code>0.2</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Relative area < this = medium") }}</td></tr>
+            <tr><td>high_iou_threshold</td><td><code>0.7</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("IoU above this = high overlap") }}</td></tr>
+            <tr><td>long_tail_ratio</td><td><code>0.3</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("Below avg_count x this = long-tail") }}</td></tr>
+            <tr><td>dbscan_eps</td><td><code>0.3</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("DBSCAN clustering radius") }}</td></tr>
+            <tr><td>dbscan_min_samples</td><td><code>5</code></td><td style="font-size:12px; color:var(--text-secondary);">{{ _("DBSCAN min samples") }}</td></tr>
+        </table>
+    </div>
+</details>
+
+{% else %}
+<div class="card">
+    <div style="text-align:center; padding:40px 20px;">
+        <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Dataset Analysis Available") }}</div>
+        <div style="font-size:13px; color:var(--text-muted);">{{ _("Upload a dataset ZIP above to start analysis.") }}</div>
+    </div>
+</div>
+{% endif %}
+
+<script>
+// Upload zone interaction
+const zone = document.getElementById('uploadZone');
+const fileInput = document.getElementById('fileInput');
+const uploadForm = document.getElementById('uploadForm');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadStatus = document.getElementById('uploadStatus');
+
+zone.addEventListener('click', function(e) {
+    if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT') {
+        fileInput.click();
+    }
+});
+fileInput.addEventListener('change', function() {
+    if (this.files.length > 0) {
+        uploadStatus.style.display = 'block';
+        uploadStatus.textContent = '{{ _("Selected") }}: ' + this.files[0].name;
+    }
+});
+
+// Drag & drop
+zone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    zone.classList.add('dragover');
+});
+zone.addEventListener('dragleave', function(e) {
+    e.preventDefault();
+    zone.classList.remove('dragover');
+});
+zone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    zone.classList.remove('dragover');
+    if (e.dataTransfer.files.length > 0) {
+        fileInput.files = e.dataTransfer.files;
+        uploadStatus.style.display = 'block';
+        uploadStatus.textContent = '{{ _("Selected") }}: ' + fileInput.files[0].name;
+    }
+});
+
+// Upload
+uploadForm.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    if (!fileInput.files.length) return;
+
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = '{{ _("Analyzing...") }}';
+    uploadStatus.textContent = '{{ _("Uploading and analyzing...") }}';
+
+    try {
+        const resp = await fetch('/api/dataset/upload', {
+            method: 'POST',
+            body: formData,
+        });
+        const result = await resp.json();
+        if (result.status === 'success') {
+            uploadStatus.textContent = '{{ _("Analysis complete!") }}';
+            setTimeout(function() { location.reload(); }, 1500);
+        } else {
+            uploadStatus.textContent = '{{ _("Error") }}: ' + (result.error || 'Unknown');
+        }
+    } catch (err) {
+        uploadStatus.textContent = '{{ _("Error") }}: ' + err.message;
+    } finally {
+        uploadBtn.disabled = false;
+        uploadBtn.innerHTML = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> {{ _("Upload & Analyze") }}';
+    }
+});
+</script>
+{% endblock %}

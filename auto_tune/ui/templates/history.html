@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}{{ _("History") }} - YOLOv8 Auto-Tuning{% endblock %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training History") }}</div>
+</div>
+
+{% if tuning_history and tuning_history|length > 0 %}
+<div class="card" style="padding:0; overflow-x:auto;">
+    <table>
+        <tr>
+            <th style="width:40px;">{{ _("#") }}</th>
+            <th>{{ _("Time") }}</th>
+            <th>{{ _("Diagnosis") }}</th>
+            <th>{{ _("Changes") }}</th>
+            <th>{{ _("Status") }}</th>
+            <th style="width:60px;">{{ _("View") }}</th>
+        </tr>
+        {% for attempt in tuning_history|reverse %}
+        <tr style="cursor:pointer;">
+            <td><span class="badge badge-blue">#{{ attempt.iteration }}</span></td>
+            <td style="font-size:12px; color:var(--text-secondary);">{{ attempt.timestamp[:16] }}</td>
+            <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px;">
+                {{ attempt.decision.diagnosis[:60] if attempt.decision and attempt.decision.diagnosis else "—" }}
+            </td>
+            <td style="font-size:12px; color:var(--text-muted); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                {% if attempt.decision and attempt.decision.hyperparameter_changes %}
+                    {% for k, v in attempt.decision.hyperparameter_changes.items() %}
+                        {{ k }}={{ v }}{% if not loop.last %} {% endif %}
+                    {% endfor %}
+                {% else %}—{% endif %}
+            </td>
+            <td>
+                {% if attempt.error %}
+                <span class="badge badge-red">{{ _("Failed") }}</span>
+                {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+                <span class="badge badge-green">{{ _("Passed") }}</span>
+                {% else %}
+                <span class="badge badge-yellow">{{ _("Retry") }}</span>
+                {% endif %}
+            </td>
+            <td>
+                <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); toggleDetails('details_{{ loop.index0 }}')">{{ _("Details") }}</button>
+            </td>
+        </tr>
+        <tr id="details_{{ loop.index0 }}" style="display:none;">
+            <td colspan="6" style="padding:16px 24px; background:#F8FAFC;">
+                <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                    <div style="flex:1; min-width:200px;">
+                        <div class="card-title" style="margin-bottom:4px;">{{ _("Full Diagnosis") }}</div>
+                        <div style="font-size:13px; color:var(--text-secondary); line-height:1.6;">
+                            {{ attempt.decision.diagnosis if attempt.decision and attempt.decision.diagnosis else "—" }}
+                        </div>
+                    </div>
+                    <div style="flex:1; min-width:200px;">
+                        <div class="card-title" style="margin-bottom:4px;">{{ _("Hyperparameter Changes") }}</div>
+                        {% if attempt.decision and attempt.decision.hyperparameter_changes %}
+                        <table style="font-size:12px;">
+                            <tr><th>{{ _("Parameter") }}</th><th>{{ _("Value") }}</th></tr>
+                            {% for k, v in attempt.decision.hyperparameter_changes.items() %}
+                            <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+                            {% endfor %}
+                        </table>
+                        {% else %}
+                        <span class="text-muted">{{ _("No hyperparameter changes") }}</span>
+                        {% endif %}
+                    </div>
+                    <div style="flex:1; min-width:150px;">
+                        <div class="card-title" style="margin-bottom:4px;">{{ _("Guardrails") }}</div>
+                        {% if attempt.guard_results %}
+                            {% if attempt.guard_results.warnings %}
+                            <div style="font-size:12px; color:var(--warning);">{{ _("Warnings:") }} {{ attempt.guard_results.warnings|length }}</div>
+                            {% endif %}
+                            {% if attempt.guard_results.errors %}
+                            <div style="font-size:12px; color:var(--destructive);">{{ _("Errors:") }} {{ attempt.guard_results.errors|length }}</div>
+                            {% endif %}
+                            {% if not attempt.guard_results.warnings and not attempt.guard_results.errors %}
+                            <span class="text-muted" style="font-size:12px;">{{ _("All checks passed") }}</span>
+                            {% endif %}
+                        {% else %}
+                            <span class="text-muted" style="font-size:12px;">{{ _("No guardrails data") }}</span>
+                        {% endif %}
+                    </div>
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+{% else %}
+<div class="card">
+    <div style="text-align:center; padding:40px 20px;">
+        <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Tuning History") }}</div>
+        <div style="font-size:13px; color:var(--text-muted);">{{ _("Start auto-tuning to see history here.") }}</div>
+        <div class="mt-2"><a href="/agent_suggestion" class="btn btn-primary btn-sm">{{ _("Start Tuning") }}</a></div>
+    </div>
+</div>
+{% endif %}
+
+<div style="margin-top:16px; display:flex; gap:8px;">
+    <button class="btn btn-outline btn-sm" onclick="location.reload()">
+        <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        {{ _("Refresh") }}
+    </button>
+    <a href="/api/tuning/history" target="_blank" class="btn btn-outline btn-sm">
+        <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        {{ _("Export JSON") }}
+    </a>
+</div>
+
+<script>
+function toggleDetails(id) {
+    const row = document.getElementById(id);
+    if (row) {
+        row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+    }
+}
+</script>
+{% endblock %}

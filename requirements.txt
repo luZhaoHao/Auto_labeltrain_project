@@ -1,0 +1,28 @@
+# ============================================================
+# YOLOv8 Auto-Tuning Agent — Python Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# Or with conda: conda create -n auto_tune python=3.11
+#                pip install -r requirements.txt
+# ============================================================
+
+# ── Web UI ──
+fastapi>=0.100.0
+uvicorn>=0.20.0
+jinja2>=3.0.0
+python-multipart>=0.0.6
+
+# ── Config ──
+pyyaml>=6.0
+
+# ── Data Processing ──
+numpy>=1.24.0
+opencv-python>=4.8.0
+scikit-learn>=1.3.0
+requests>=2.31.0
+
+# ── YOLOv8 (pulls torch, torchvision, matplotlib, pandas, pillow, tqdm automatically) ──
+ultralytics>=8.0.0
+
+# ── Testing ──
+pytest>=7.0.0

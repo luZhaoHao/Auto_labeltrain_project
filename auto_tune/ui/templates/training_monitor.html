@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}{{ _("Training Monitor") }} - YOLOv8 Auto-Tuning{% endblock %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training Monitor") }}</div>
+    <span class="badge badge-green" id="statusBadge" style="font-size:13px; padding:4px 14px;">{{ _("Idle") }}</span>
+</div>
+
+{% set latest_run = None %}
+{% set latest_metrics = None %}
+{% set latest_args = None %}
+{% if training and training.runs %}
+    {% for rn, rd in training.runs.items() %}
+        {% set latest_run = rn %}
+        {% set latest_args = rd.args %}
+        {% set latest_metrics = rd.results.final_metrics %}
+    {% endfor %}
+{% endif %}
+
+<!-- KPI Row -->
+<div class="row">
+    <div class="col">
+        <div class="card" style="text-align:center;">
+            <div class="card-title">{{ _("Epochs") }}</div>
+            <div class="card-value" style="font-size:22px;">
+                {% if latest_args %}{{ latest_args.epochs }}{% else %}—{% endif %}
+            </div>
+            <div class="card-desc">{{ _("Configured") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card" style="text-align:center;">
+            <div class="card-title">{{ _("Best mAP50 (metric)") }}</div>
+            <div class="card-value" style="font-size:22px; {% if latest_metrics %}color:var(--success){% endif %};">
+                {% if latest_metrics %}
+                {{ "%.4f"|format(latest_metrics.get("metrics/mAP50(B)", 0)) }}
+                {% else %}—{% endif %}
+            </div>
+            <div class="card-desc">{{ _("Final metric") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card" style="text-align:center;">
+            <div class="card-title">{{ _("mAP50-95") }}</div>
+            <div class="card-value" style="font-size:22px;">
+                {% if latest_metrics %}
+                {{ "%.4f"|format(latest_metrics.get("metrics/mAP50-95(B)", 0)) }}
+                {% else %}—{% endif %}
+            </div>
+            <div class="card-desc">{{ _("COCO-style metric") }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card" style="text-align:center;">
+            <div class="card-title">{{ _("Box Loss") }}</div>
+            <div class="card-value" style="font-size:22px; color:var(--text-secondary);">
+                {% if latest_metrics %}
+                {{ "%.4f"|format(latest_metrics.get("metrics/box_loss", 0)) }}
+                {% else %}—{% endif %}
+            </div>
+            <div class="card-desc">{{ _("Validation box loss") }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts -->
+<div class="row">
+    <div class="col" style="flex:1;">
+        <div class="card" style="padding:16px;">
+            <div class="card-title" style="margin-bottom:8px;">{{ _("Loss Curves") }}</div>
+            <div class="chart-placeholder" style="height:200px;">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <div>{{ _("Loss Chart") }}</div>
+                <div style="font-size:11px;">{{ _("Blue: train_loss  Red: val_loss") }}</div>
+            </div>
+        </div>
+    </div>
+    <div class="col" style="flex:1;">
+        <div class="card" style="padding:16px;">
+            <div class="card-title" style="margin-bottom:8px;">{{ _("mAP Curves") }}</div>
+            <div class="chart-placeholder" style="height:200px;">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <div>{{ _("mAP Chart") }}</div>
+                <div style="font-size:11px;">{{ _("Green: mAP50  Orange: mAP50-95") }}</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Training Log + Probe Result -->
+<div class="row">
+    <div class="col">
+        <div class="card" style="padding:16px;">
+            <div class="card-title" style="margin-bottom:8px;">{{ _("Training Log") }}</div>
+            <div class="console-log" id="monitorLog">
+                {% if latest_run %}
+                <div class="success">[System] {{ _("Latest run:") }} {{ latest_run }}</div>
+                {% if latest_metrics %}
+                <div class="info">[Results] mAP50 = {{ "%.4f"|format(latest_metrics.get("metrics/mAP50(B)", 0)) }}</div>
+                <div class="info">[Results] mAP50-95 = {{ "%.4f"|format(latest_metrics.get("metrics/mAP50-95(B)", 0)) }}</div>
+                <div class="info">[Results] Precision = {{ "%.4f"|format(latest_metrics.get("metrics/precision(B)", 0)) }}</div>
+                <div class="info">[Results] Recall = {{ "%.4f"|format(latest_metrics.get("metrics/recall(B)", 0)) }}</div>
+                {% endif %}
+                <div class="dim">[System] {{ _("training completed") }}</div>
+                {% else %}
+                <div class="dim">{{ _("No training runs recorded yet.") }}</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Probe Result (hidden by default) -->
+<div class="probe-result" id="probeResult" style="display:none;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+            <div style="display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px;">
+                <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                {{ _("Probe Complete") }} (10 {{ _("epochs") }})
+            </div>
+            <div style="font-size:13px; color:var(--text-secondary); margin-top:4px;">{{ _("Loss is decreasing steadily. No anomalies detected. Continue training?") }}</div>
+        </div>
+        <div style="display:flex; gap:8px;">
+            <button class="btn btn-outline btn-sm" onclick="alert('{{ _("Retune") }}: {{ _("go to Agent Suggestion page") }}')">{{ _("Retune") }}</button>
+            <button class="btn btn-primary btn-sm">{{ _("Continue Training") }}</button>
+        </div>
+    </div>
+</div>
+
+<div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
+    <a href="/agent_suggestion" class="btn btn-primary btn-sm">
+        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        {{ _("Start New Training") }}
+    </a>
+</div>
+{% endblock %}

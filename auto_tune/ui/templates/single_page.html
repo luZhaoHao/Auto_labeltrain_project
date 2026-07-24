@@ -1,0 +1,2225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLOv8 Auto-Tuning Agent</title>
+<style>
+  :root {
+    --primary: #1E40AF;
+    --primary-hover: #1E3A8A;
+    --on-primary: #FFFFFF;
+    --secondary: #3B82F6;
+    --accent: #D97706;
+    --accent-bg: #FFFBEB;
+    --accent-border: #FDE68A;
+    --background: #F8FAFC;
+    --surface: #FFFFFF;
+    --foreground: #1E293B;
+    --muted: #E9EEF6;
+    --border: #DBEAFE;
+    --destructive: #DC2626;
+    --destructive-bg: #FEF2F2;
+    --success: #16A34A;
+    --success-bg: #F0FDF4;
+    --warning: #D97706;
+    --warning-bg: #FFFBEB;
+    --text-primary: #1E293B;
+    --text-secondary: #64748B;
+    --text-muted: #94A3B8;
+    --ring: #1E40AF;
+    --radius: 8px;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+    --shadow-md: 0 1px 6px rgba(0,0,0,0.08);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--background);
+    color: var(--text-primary);
+    padding: 24px;
+  }
+  .app-header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 6px;
+  }
+  .app-logo {
+    width: 32px; height: 32px; background: var(--primary); border-radius: 6px;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .app-logo svg { width: 20px; height: 20px; stroke: white; stroke-width: 2; fill: none; }
+  h1 { font-size: 20px; font-weight: 600; color: var(--foreground); }
+  .subtitle { color: var(--text-secondary); font-size: 13px; }
+
+  .lang-toggle {
+    margin-left: auto; display: flex; align-items: center; gap: 4px;
+  }
+  .lang-btn {
+    padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border);
+    font-size: 12px; font-weight: 500; cursor: pointer; background: var(--surface);
+    color: var(--text-secondary); font-family: inherit; text-decoration: none;
+    transition: all 0.15s;
+  }
+  .lang-btn:hover { background: var(--muted); color: var(--text-primary); }
+  .lang-btn.active { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+
+  .tabs { display: flex; gap: 2px; margin-top: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .tab {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 10px 20px; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 13px; font-weight: 500;
+    background: var(--muted); color: var(--text-secondary); border: none; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .tab:hover { background: #E2E8F0; color: var(--text-primary); }
+  .tab.active { background: var(--surface); color: var(--primary); font-weight: 600; box-shadow: 0 -1px 3px rgba(0,0,0,0.06); }
+  .tab svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+  .page { display: none; background: var(--surface); border-radius: 0 var(--radius) var(--radius) var(--radius); box-shadow: var(--shadow-md); padding: 24px; }
+  .page.active { display: block; }
+
+  .section-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--muted); color: var(--foreground); }
+
+  .row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 200px; }
+
+  .card {
+    background: var(--surface); border-radius: var(--radius); padding: 16px;
+    border: 1px solid var(--muted); box-shadow: var(--shadow-sm);
+  }
+  .card-title { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card-value { font-size: 24px; font-weight: 700; color: var(--foreground); font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; }
+  .card-value-sm { font-size: 16px; font-weight: 600; }
+  .card-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .card-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+  .card-icon svg { width: 20px; height: 20px; stroke-width: 2; fill: none; }
+
+  .bar-bg { background: var(--muted); border-radius: 4px; height: 18px; margin: 6px 0; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+  .bar-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--muted); }
+  th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:hover td { background: #F8FAFC; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .badge-green { background: var(--success-bg); color: var(--success); }
+  .badge-yellow { background: var(--warning-bg); color: var(--warning); }
+  .badge-red { background: var(--destructive-bg); color: var(--destructive); }
+  .badge-blue { background: #EFF6FF; color: var(--primary); }
+  .badge-gray { background: var(--muted); color: var(--text-secondary); }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 20px; border-radius: 6px; border: 1px solid var(--muted);
+    font-size: 13px; font-weight: 500; cursor: pointer; background: var(--surface); color: var(--text-primary);
+    font-family: inherit; transition: all 0.15s;
+  }
+  .btn:hover { background: var(--muted); }
+  .btn-primary { background: var(--primary); color: var(--on-primary); border: none; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-primary:disabled { background: #94A3B8; cursor: not-allowed; }
+  .btn-outline { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+  .btn-outline:hover { background: #EFF6FF; }
+  .btn-danger { background: var(--destructive); color: white; border: none; }
+  .btn-danger:hover { background: #B91C1C; }
+  .btn-sm { padding: 4px 12px; font-size: 12px; }
+  .btn svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 2; fill: none; }
+
+  .param-input { width: 80px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; text-align: center; font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+  .param-input:focus { outline: 2px solid var(--ring); outline-offset: -1px; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex;
+    align-items: center; justify-content: center; z-index: 1000;
+  }
+  .modal-overlay > div {
+    background: var(--surface); border-radius: var(--radius); padding: 24px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.15); max-width: 480px; width: 90%;
+  }
+  .param-select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; color: var(--primary); font-weight: 600; background: #F8FAFC; }
+
+  .suggestion-card { border: 2px solid var(--border); border-radius: 10px; padding: 20px; background: #FAFBFF; }
+  .suggestion-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .suggestion-header h3 { font-size: 15px; color: var(--primary); font-weight: 600; }
+
+  .callout { padding: 12px 16px; border-radius: 6px; font-size: 13px; line-height: 1.6; }
+  .callout-blue { background: #EFF6FF; border: 1px solid var(--border); color: var(--text-primary); }
+  .callout-yellow { background: var(--accent-bg); border: 1px solid var(--accent-border); color: #92400E; }
+  .callout-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .callout-label svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2; fill: none; vertical-align: middle; margin-right: 4px; }
+
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); cursor: pointer; }
+  .checkbox-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); }
+
+  .pipeline { display: flex; align-items: center; gap: 0; margin: 12px 0; font-size: 12px; flex-wrap: wrap; }
+  .pipeline-step {
+    display: flex; align-items: center; gap: 4px; padding: 4px 8px;
+    border-radius: 12px; background: var(--muted); color: var(--text-muted);
+    white-space: nowrap; transition: all 0.3s;
+  }
+  .pipeline-step.active { background: #EFF6FF; color: var(--primary); font-weight: 600; box-shadow: 0 0 0 2px var(--border); }
+  .pipeline-step.done { background: var(--success-bg); color: var(--success); }
+  .pipeline-step.failed { background: var(--destructive-bg); color: var(--destructive); }
+  .pipeline-arrow { color: var(--text-muted); margin: 0 2px; font-size: 10px; }
+  .param-changes { margin: 8px 0; padding: 8px 12px; background: #FFFBEB; border: 1px solid #FDE68A; border-radius: 6px; font-size: 12px; }
+  .param-changes table { width: 100%; }
+  .param-changes td { padding: 2px 8px; border: none; font-size: 12px; }
+  .param-changes .param-name { color: var(--primary); font-weight: 600; font-family: Consolas, 'Cascadia Code', monospace; }
+  .param-changes .param-arrow { color: var(--text-muted); padding: 0 4px; }
+  .param-changes .param-new { color: var(--accent); font-weight: 600; }
+
+  .console-log {
+    background: #0F172A; color: #CBD5E1; border-radius: 6px; padding: 12px 16px;
+    font-family: Consolas, 'Cascadia Code', 'JetBrains Mono', monospace; font-size: 12px; max-height: 300px; overflow-y: auto; line-height: 1.7;
+  }
+  .console-log .info { color: var(--secondary); }
+  .console-log .success { color: var(--success); }
+  .console-log .warn { color: var(--warning); }
+  .console-log .error { color: var(--destructive); }
+  .console-log .dim { color: #475569; }
+
+  .progress-bar { background: var(--muted); border-radius: 8px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--primary), var(--secondary)); border-radius: 8px; transition: width 0.5s; }
+
+  .probe-result {
+    border-left: 4px solid var(--primary); padding: 16px 20px;
+    background: #F8FAFC; border-radius: 0 6px 6px 0; margin: 12px 0;
+  }
+  .probe-result.passed {
+    border-left-color: var(--success);
+    background: var(--success-bg);
+  }
+  .probe-result.passed svg { stroke: var(--success); }
+  .probe-result.passed .probe-title { color: var(--success); }
+
+  .chart-placeholder {
+    background: #FAFBFC; border: 1px solid var(--muted); border-radius: 6px;
+    height: 180px; display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted); font-size: 13px; flex-direction: column; gap: 6px;
+  }
+  .chart-placeholder svg { width: 32px; height: 32px; stroke: var(--text-muted); stroke-width: 1.5; fill: none; }
+
+  .delta-up { color: var(--success); }
+  .delta-down { color: var(--destructive); }
+  .delta-none { color: var(--text-muted); }
+
+  .flex { display: flex; gap: 12px; align-items: center; }
+  .flex-wrap { flex-wrap: wrap; }
+  .text-muted { color: var(--text-secondary); font-size: 13px; }
+  .mt-2 { margin-top: 12px; }
+  .mb-2 { margin-bottom: 12px; }
+  .hidden { display: none; }
+
+  details.thresholds-panel summary {
+    cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-secondary);
+    padding: 8px 12px; background: var(--muted); border-radius: 6px; user-select: none;
+  }
+  details.thresholds-panel summary:hover { background: #E2E8F0; }
+
+  .upload-zone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 30px;
+    text-align: center; cursor: pointer; transition: all 0.2s;
+    background: #FAFBFC;
+  }
+  .upload-zone:hover, .upload-zone.dragover {
+    border-color: var(--primary); background: #EFF6FF;
+  }
+  .upload-zone svg { width: 36px; height: 36px; stroke: var(--text-muted); stroke-width: 1.5; fill: none; margin-bottom: 8px; }
+  .upload-zone .label { font-size: 14px; color: var(--text-secondary); margin-bottom: 4px; }
+  .upload-zone .hint { font-size: 12px; color: var(--text-muted); }
+
+  /* ── Browse Modal ── */
+  .modal-overlay {
+    display: none; position: fixed; z-index: 1000; left: 0; top: 0;
+    width: 100%; height: 100%; background: rgba(15,23,42,0.45);
+    backdrop-filter: blur(2px); align-items: center; justify-content: center;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-dialog {
+    background: var(--surface); border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+    width: 560px; max-width: 90vw; max-height: 80vh; display: flex; flex-direction: column;
+    overflow: hidden; animation: modalIn 0.15s ease-out;
+  }
+  @keyframes modalIn { from { opacity: 0; transform: scale(0.96) translateY(8px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+  .modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--muted); flex-shrink: 0;
+  }
+  .modal-header h3 { font-size: 15px; font-weight: 600; color: var(--foreground); }
+  .modal-close {
+    width: 28px; height: 28px; border: none; background: none; cursor: pointer;
+    border-radius: 6px; display: flex; align-items: center; justify-content: center;
+    font-size: 18px; color: var(--text-muted); transition: all 0.1s;
+  }
+  .modal-close:hover { background: var(--muted); color: var(--text-primary); }
+  .modal-path {
+    padding: 10px 18px; font-size: 12px; color: var(--text-secondary);
+    background: #F8FAFC; border-bottom: 1px solid var(--muted);
+    font-family: Consolas, 'Cascadia Code', monospace; word-break: break-all;
+  }
+  .modal-body {
+    flex: 1; overflow-y: auto; padding: 4px 0; min-height: 160px;
+  }
+  .modal-footer {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    padding: 12px 18px; border-top: 1px solid var(--muted); flex-shrink: 0;
+  }
+  .browse-item {
+    padding: 10px 18px; cursor: pointer; font-size: 13px; color: var(--text-primary);
+    border-bottom: 1px solid var(--muted); transition: background 0.08s;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .browse-item:last-child { border-bottom: none; }
+  .browse-item:hover { background: #EFF6FF; }
+  .browse-item.browse-parent { color: var(--text-secondary); }
+  .browse-item .icon { flex-shrink: 0; font-size: 16px; }
+  .browse-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .browse-loading { display: flex; align-items: center; justify-content: center; height: 120px; color: var(--text-muted); font-size: 13px; gap: 8px; }
+  .browse-empty { padding: 32px 18px; text-align: center; color: var(--text-muted); font-size: 13px; }
+  .browse-error { padding: 18px; text-align: center; color: var(--destructive); font-size: 13px; }
+  .browse-current-dir {
+    padding: 10px 18px; cursor: pointer; font-size: 13px; color: var(--primary);
+    border-bottom: 1px solid var(--muted); transition: background 0.08s;
+    display: flex; align-items: center; gap: 8px; font-weight: 500;
+  }
+  .browse-current-dir:hover { background: #EFF6FF; }
+
+  @media (max-width: 768px) {
+    body { padding: 12px; }
+    .tabs .tab { font-size: 12px; padding: 8px 12px; }
+    .page { padding: 16px; border-radius: var(--radius); }
+    .col { min-width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <div class="app-logo">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </div>
+  <div style="flex:1;">
+    <h1>{{ _("YOLOv8 Auto-Tuning Agent") }}</h1>
+    <div class="subtitle">{{ _("Dataset Analysis / Training Diagnosis / Hyperparameter Optimization") }}</div>
+  </div>
+  <div class="lang-toggle">
+    <a href="/api/lang?lang=zh" class="lang-btn {% if current_lang == 'zh' %}active{% endif %}">{{ _("中文") }}</a>
+    <a href="/api/lang?lang=en" class="lang-btn {% if current_lang == 'en' %}active{% endif %}">{{ _("English") }}</a>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab {% if active_page == 'dashboard' %}active{% endif %}" onclick="switchPage(0)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    {{ _("Projects") }}
+  </button>
+  <button class="tab {% if active_page == 'dataset' %}active{% endif %}" onclick="switchPage(1)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+    {{ _("Dataset Report") }}
+  </button>
+  <button class="tab {% if active_page == 'agent_suggestion' %}active{% endif %}" onclick="switchPage(2)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+    {{ _("Intelligent Analysis") }}
+  </button>
+  <button class="tab {% if active_page == 'training_monitor' %}active{% endif %}" onclick="switchPage(3)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    {{ _("Training Monitor") }}
+  </button>
+  <button class="tab {% if active_page == 'history' %}active{% endif %}" onclick="switchPage(4)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    {{ _("History") }}
+  </button>
+</div>
+
+{# ─── Page 0: Dashboard ─── #}
+<div class="page {% if active_page == 'dashboard' %}active{% endif %}" id="page0">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Projects") }}</div>
+</div>
+
+<div class="row">
+  <div class="col" style="flex: 1;">
+    <div class="card" style="height: 100%;">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+        <div style="width:32px; height:32px; background:#EFF6FF; border-radius:6px; display:flex; align-items:center; justify-content:center;">
+          <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        </div>
+        <div style="flex:1;">
+          <div id="projNameDisplay" style="font-weight:600; font-size:14px;">{{ project.get("name", _("Current Project")) if project else _("Current Project") }}</div>
+          <div id="projDescDisplay" style="font-size:12px; color:var(--text-secondary);">{{ project.get("description", "YOLOv8 detection project") if project else "YOLOv8 " + _("detection project") }}</div>
+          <div id="projNameEdit" style="display:none;">
+            <input id="projNameInput" value="{{ project.get("name", "") if project else "" }}" placeholder="{{ _("Project Name") }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:14px; margin-bottom:4px;">
+            <input id="projDescInput" value="{{ project.get("description", "") if project else "" }}" placeholder="{{ _("Description") }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:12px;">
+          </div>
+        </div>
+        <button id="editProjBtn" class="btn btn-sm btn-outline" onclick="toggleProjectEdit()">{{ _("Edit") }}</button>
+        <button id="saveProjBtn" class="btn btn-sm btn-primary" style="display:none;" onclick="saveProject()">{{ _("Save") }}</button>
+        <button id="cancelProjBtn" class="btn btn-sm btn-outline" style="display:none;" onclick="toggleProjectEdit()">{{ _("Cancel") }}</button>
+      </div>
+      {% if project %}
+      <div id="projDisplayTable">
+      <table>
+        {% for key, label in [("detection_target", _("Detection Target")), ("data_type", _("Data Type"))] %}
+        {% if project.get(key) %}
+        <tr><td style="width:120px;">{{ label }}</td><td>{{ project[key] }}</td></tr>
+        {% endif %}
+        {% endfor %}
+        {% if project.get("description") %}
+        <tr><td style="width:120px;">{{ _("Description") }}</td><td>{{ project["description"] }}</td></tr>
+        {% endif %}
+      </table>
+      </div>
+      {% else %}
+      <p id="projDisplayTable" class="text-muted">{{ _("No project configuration found.") }}</p>
+      {% endif %}
+      <div id="projEditTable" style="display:none;">
+        <table>
+          <tr><td style="width:120px;">{{ _("Detection Target") }}</td><td><input id="projTargetInput" value="{{ project.get("detection_target", "") if project else "" }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;"></td></tr>
+          <tr><td>{{ _("Data Type") }}</td><td><input id="projDataTypeInput" value="{{ project.get("data_type", "") if project else "" }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;"></td></tr>
+          <tr><td>{{ _("Description") }}</td><td><textarea id="projDescTableInput" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; min-height:50px; font-family:inherit; font-size:13px;">{{ project.get("description", "") if project else "" }}</textarea></td></tr>
+          <tr><td>data.yaml {{ _("(dataset path)") }}</td><td><input id="projDataYamlInput" value="{{ project.get("data_yaml", training_config.get("data_yaml", "")) if project else training_config.get("data_yaml", "") }}" placeholder="D:\path\to\data.yaml" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;"></td></tr>
+          <tr><td>{{ _("Model") }}</td><td><input id="projModelInput" value="{{ project.get("model", training_config.get("model", "yolov8n.pt")) if project else training_config.get("model", "yolov8n.pt") }}" placeholder="yolov8n.pt" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px;"></td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:#EFF6FF;">
+        <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </div>
+      <div class="card-title">{{ _("Dataset Analysis") }}</div>
+      {% if dataset and dataset.label_coverage %}
+      <div class="card-value">{{ dataset.total_images }}</div>
+      <div class="card-desc">{{ dataset.total_annotations }} {{ _("annotations") }}</div>
+      <table style="margin-top:8px;">
+        <tr><td>{{ _("Label Rate") }}</td><td>{{ "%.1f"|format(dataset.label_coverage.get("label_rate", 0) * 100) }}%</td></tr>
+        <tr><td>{{ _("Quality Score") }}</td><td>{{ dataset.summary.get("dataset_quality_score", "-") }}</td></tr>
+        <tr><td>{{ _("Key Issues") }}</td>
+          <td>{% for issue in dataset.summary.get("key_issues", []) %}
+            <span class="badge badge-yellow">{{ issue }}</span>
+            {% else %}
+            <span class="badge badge-green">{{ _("None") }}</span>
+            {% endfor %}
+          </td></tr>
+      </table>
+      {% else %}
+      <div class="card-value-sm" style="color:var(--text-muted); margin-top:8px;">{{ _("No data") }}</div>
+      <div class="card-desc">{{ _("Run dataset analysis first") }}</div>
+      {% endif %}
+      <div class="mt-2"><button class="btn btn-outline btn-sm" onclick="switchPage(1)">{{ _("View Details") }}</button></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:#EFF6FF;">
+        <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </div>
+      <div class="card-title">{{ _("Training Analysis") }}</div>
+      {% if training %}
+      {% set s = training.summary %}
+      <div class="card-value">{{ s.best_mAP50 }}</div>
+      <div class="card-desc">{{ _("Best mAP50") }} ({{ s.best_overall_run }})</div>
+      <table style="margin-top:8px;">
+        <tr><td>{{ _("Runs Analyzed") }}</td><td>{{ s.total_runs_analyzed }}</td></tr>
+        <tr><td>{{ _("Avg mAP50") }}</td><td>{{ s.average_mAP50 }}</td></tr>
+        <tr><td>{{ _("Runs with Issues") }}</td><td>{{ s.runs_with_issues }}</td></tr>
+      </table>
+      {% else %}
+      <div class="card-value-sm" style="color:var(--text-muted); margin-top:8px;">{{ _("No data") }}</div>
+      <div class="card-desc">{{ _("Run training analysis first") }}</div>
+      {% endif %}
+      <div class="mt-2"><button class="btn btn-outline btn-sm" onclick="switchPage(2)">{{ _("View Details") }}</button></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:#EFF6FF;">
+        <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </div>
+      <div class="card-title">{{ _("Auto-Tuning") }}</div>
+      {% if tuning_history %}
+      <div class="card-value">{{ tuning_history|length }}</div>
+      <div class="card-desc">{{ _("total iterations") }}</div>
+      <table style="margin-top:8px;">
+        {% for attempt in tuning_history[-3:]|reverse %}
+        <tr>
+          <td style="width:60px;"><span class="badge badge-blue">#{{ attempt.iteration }}</span></td>
+          <td>
+            {% if attempt.error %}
+            <span class="badge badge-red">{{ _("Failed") }}</span>
+            {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+            <span class="badge badge-green">{{ _("Passed") }}</span>
+            {% else %}
+            <span class="badge badge-yellow">{{ _("Retry") }}</span>
+            {% endif %}
+          </td>
+          <td style="font-size:12px; color:var(--text-secondary);">{{ attempt.timestamp[:10] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="card-value-sm" style="color:var(--text-muted); margin-top:8px;">{{ _("No tuning yet") }}</div>
+      <div class="card-desc">{{ _("Start auto-tuning from Intelligent Analysis") }}</div>
+      {% endif %}
+      <div class="mt-2"><button class="btn btn-primary btn-sm" onclick="switchPage(2)">{{ _("Start Tuning") }}</button></div>
+    </div>
+  </div>
+</div>
+</div>
+
+{# ─── Page 1: Dataset Report ─── #}
+<div class="page {% if active_page == 'dataset' %}active{% endif %}" id="page1">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Dataset Analysis Report") }}</div>
+  {% if dataset %}
+  {% set qs = dataset.summary.dataset_quality_score %}
+  <span class="badge {% if qs >= 80 %}badge-green{% elif qs >= 50 %}badge-yellow{% else %}badge-red{% endif %}" style="font-size:13px; padding:4px 14px;">
+    {{ _("Quality Score") }}: {{ qs }}
+  </span>
+  {% endif %}
+</div>
+
+<div class="upload-zone" id="uploadZone" style="margin-bottom:16px; padding:16px; text-align:left;">
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <svg viewBox="0 0 24 24" style="width:24px; height:24px; stroke:var(--text-muted); stroke-width:1.5; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+    <input type="text" id="datasetPathInput" placeholder="{{ _('Enter dataset folder path...') }}" style="flex:1; min-width:200px; padding:10px 14px; border:1px solid var(--border); border-radius:var(--radius); font-size:14px; font-family:inherit;">
+    <button type="button" onclick="browseFolder('datasetPathInput')" style="padding:10px 16px; background:var(--secondary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Browse...") }}</button>
+    <button type="button" id="datasetAnalyzeBtn" onclick="analyzeDatasetFolder()" style="padding:10px 20px; background:var(--primary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Analyze") }}</button>
+  </div>
+  {# Browse panels replaced by shared modal dialog #}
+  <div style="font-size:13px; color:var(--text-secondary); margin-top:8px;">{{ _("Enter the full path to your dataset folder (must contain images/ and labels/ or data.yaml)") }}</div>
+  <div id="uploadStatus" style="margin-top:8px; font-size:13px; color:var(--text-secondary); display:none;"></div>
+</div>
+
+{% if dataset %}
+{% set dc = dataset.label_coverage %}
+{% set iq = dataset.image_quality %}
+{% set ba = dataset.bbox_analysis %}
+{% set cb = dataset.class_balance %}
+{% set sp = dataset.spatial_bias %}
+
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:#EFF6FF;">
+        <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </div>
+      <div class="card-title">{{ _("Total Images") }}</div>
+      <div class="card-value">{{ dataset.total_images }}</div>
+      <div class="card-desc">{{ dataset.total_annotations }} {{ _("annotations") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:#EFF6FF;">
+        <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </div>
+      <div class="card-title">{{ _("Label Rate") }}</div>
+      <div class="card-value" style="color: {% if dc.label_rate >= 0.8 %}var(--success){% elif dc.label_rate >= 0.5 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(dc.label_rate * 100) }}%</div>
+      <div class="card-desc">{{ dc.with_labels if dc.total_images else "?" }} {{ _("labeled") }} / {{ dc.without_labels if dc.total_images else "?" }} {{ _("unlabeled") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:{% if iq.blur_ratio < 0.05 %}var(--success-bg){% else %}var(--warning-bg){% endif %};">
+        <svg viewBox="0 0 24 24" stroke="{% if iq.blur_ratio < 0.05 %}var(--success){% else %}var(--warning){% endif %}" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      </div>
+      <div class="card-title">{{ _("Blur Ratio") }}</div>
+      <div class="card-value" style="color: {% if iq.blur_ratio < 0.05 %}var(--success){% elif iq.blur_ratio < 0.15 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(iq.blur_ratio * 100) }}%</div>
+      <div class="card-desc">{{ (iq.blur_ratio * dataset.total_images)|round|int if dataset.total_images else 0 }} {{ _("images below threshold") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="card-icon" style="background:{% if ba.tiny_bbox_ratio < 0.1 %}var(--success-bg){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning-bg){% else %}var(--destructive-bg){% endif %};">
+        <svg viewBox="0 0 24 24" stroke="{% if ba.tiny_bbox_ratio < 0.1 %}var(--success){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning){% else %}var(--destructive){% endif %}" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+      </div>
+      <div class="card-title">{{ _("Small Objects") }}</div>
+      <div class="card-value" style="color: {% if ba.tiny_bbox_ratio < 0.1 %}var(--success){% elif ba.tiny_bbox_ratio < 0.25 %}var(--warning){% else %}var(--destructive){% endif %};">{{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%</div>
+      <div class="card-desc">{{ _("Tiny / Small bboxes") }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col" style="flex: 1.4;">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Class Distribution") }}</div>
+      {% if dataset.class_distribution %}
+        {% set items = dataset.class_distribution.items()|list %}
+        {% set max_count = items|map(attribute='1.count')|max %}
+        {% for cls, data in items %}
+        {% set pct = (data.count / max_count * 100)|round %}
+        <div{% if not loop.first %} style="margin-top:6px;"{% endif %}>
+          <div class="bar-label">
+            <span>{{ cls }}</span>
+            <span>{{ data.count }} ({{ "%.1f"|format(data.count / dataset.total_annotations * 100) if dataset.total_annotations else 0 }}%)</span>
+          </div>
+          <div class="bar-bg">
+            {% set colors = ["var(--secondary)", "var(--success)", "var(--warning)", "var(--destructive)", "#8B5CF6", "#EC4899"] %}
+            <div class="bar-fill" style="width:{{ pct }}%; background:{{ colors[loop.index0 % colors|length] }};"></div>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div style="padding:20px; text-align:center; color:var(--text-muted);">{{ _("No class distribution data available") }}</div>
+      {% endif %}
+    </div>
+  </div>
+  <div class="col" style="flex: 1;">
+    <div class="card" style="height:100%;">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Image Quality") }}</div>
+      <table>
+        <tr><td>{{ _("Overexposure") }}</td><td>{{ "%.1f"|format(iq.overexposure_ratio * 100) }}%</td></tr>
+        <tr><td>{{ _("Underexposure") }}</td><td>{{ "%.1f"|format(iq.underexposure_ratio * 100) }}%</td></tr>
+        <tr><td>{{ _("Low SNR") }}</td><td>{{ "%.1f"|format(iq.low_snr_ratio * 100) }}%</td></tr>
+      </table>
+
+      <div class="card-title" style="margin-top:16px; margin-bottom:10px;">{{ _("BBox Size Distribution") }}</div>
+      <table>
+        <tr><td>{{ _("Tiny") }}</td><td>{{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%</td></tr>
+        <tr><td>{{ _("Small") }}</td><td>{{ "%.1f"|format(ba.small_bbox_ratio * 100) }}%</td></tr>
+        <tr><td>{{ _("Medium") }}</td><td>{{ "%.1f"|format(ba.medium_bbox_ratio * 100) }}%</td></tr>
+        <tr><td>{{ _("Large") }}</td><td>{{ "%.1f"|format(ba.large_bbox_ratio * 100) }}%</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Spatial Distribution") }}</div>
+      <table>
+        <tr><td>{{ _("Center Concentration") }}</td><td>{{ "%.2f"|format(sp.center_concentration_score|default(0)) }}</td></tr>
+        <tr><td>{{ _("Edge Ratio") }}</td><td>{{ "%.1f"|format((sp.edge_ratio|default(0)) * 100) }}%</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Class Balance") }}</div>
+      <table>
+        <tr><td>{{ _("Balanced") }}</td>
+          <td>{% if cb.is_balanced %}<span class="badge badge-green">{{ _("Yes") }}</span>{% else %}<span class="badge badge-yellow">{{ _("No") }}</span>{% endif %}</td></tr>
+        <tr><td>{{ _("Imbalance Ratio") }}</td><td>{{ "%.2f"|format(cb.imbalance_ratio) }}</td></tr>
+        {% if cb.long_tail_classes %}
+        <tr><td>{{ _("Long-tail Classes") }}</td><td>{{ cb.long_tail_classes|join(", ") }}</td></tr>
+        {% endif %}
+      </table>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Key Issues") }}</div>
+      {% set issues = dataset.summary.key_issues %}
+      {% if issues %}
+      <ul style="padding-left: 16px;">
+        {% for issue in issues %}
+        <li style="margin-bottom:4px; font-size:13px; color:var(--text-secondary);">{{ issue }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-muted">{{ _("No key issues detected") }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="callout callout-blue" style="margin-bottom:12px;">
+  <div class="callout-label">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+    {{ _("AI Summary") }}
+  </div>
+  <div>{{ _("Dataset quality score") }}: <strong>{{ dataset.summary.dataset_quality_score }}</strong>.
+  {% if dataset.summary.key_issues %}
+  {{ _("Detected") }} {{ dataset.summary.key_issues|length }} {{ _("issue(s)") }}: {{ dataset.summary.key_issues|join("; ") }}.
+  {% else %}
+  {{ _("No critical issues detected.") }}
+  {% endif %}
+  {% if cb.long_tail_classes %}
+  {{ _("Pay attention to long-tail classes") }}: {{ cb.long_tail_classes|join(", ") }}.
+  {% endif %}
+  {% if ba.tiny_bbox_ratio > 0.15 %}
+  {{ _("Small object ratio is high") }} ({{ "%.1f"|format(ba.tiny_bbox_ratio * 100) }}%) — {{ _("consider increasing imgsz or use P2/P3 model.") }}
+  {% endif %}
+  </div>
+</div>
+
+<details class="thresholds-panel" style="margin-bottom:12px;">
+  <summary>
+    <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    {{ _("Analysis Thresholds & Parameters") }}
+  </summary>
+  {% set dac = dataset_analyzer_config %}
+  <div class="card" style="margin-top:6px; padding:16px;">
+    <table>
+      <tr><th style="width:160px;">{{ _("Parameter") }}</th><th style="width:100px;">{{ _("Value") }}</th><th>{{ _("Description") }}</th></tr>
+      {% set _params = [
+        ("blur_threshold", dac.get("blur_threshold", 20.0), _("Laplacian variance threshold for blur detection")),
+        ("under_exposure_pixel_threshold", dac.get("under_exposure_pixel_threshold", 30), _("Pixel value below this = underexposed")),
+        ("over_exposure_pixel_threshold", dac.get("over_exposure_pixel_threshold", 220), _("Pixel value above this = overexposed")),
+        ("bbox_tiny_threshold", dac.get("bbox_tiny_threshold", 0.005), _("Relative area < this = tiny")),
+        ("bbox_medium_threshold", dac.get("bbox_medium_threshold", 0.1), _("Relative area < this = medium")),
+        ("high_iou_threshold", dac.get("high_iou_threshold", 0.7), _("IoU above this = high overlap")),
+        ("long_tail_ratio", dac.get("long_tail_ratio", 0.3), _("Below avg_count x this = long-tail")),
+        ("dbscan_eps", dac.get("dbscan_eps", 0.3), _("DBSCAN clustering radius")),
+        ("dbscan_min_samples", dac.get("dbscan_min_samples", 5), _("DBSCAN min samples")),
+      ] %}
+      {% for key, val, desc in _params %}
+      <tr>
+        <td><code>{{ key }}</code></td>
+        <td><input class="param-input ds-param" data-key="{{ key }}" type="text" value="{{ val }}" style="width:80px;"></td>
+        <td style="font-size:12px; color:var(--text-secondary);">{{ desc }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <div style="margin-top:12px; display:flex; gap:8px; align-items:center;">
+      <button class="btn btn-primary btn-sm" onclick="saveDatasetConfig()">{{ _("Save Config") }}</button>
+      <span id="dsConfigStatus" style="font-size:12px; display:none;"></span>
+    </div>
+  </div>
+</details>
+
+{# ─── Dataset Split Section ─── #}
+{% if latest_dataset %}
+<div class="card" style="margin-top:12px;">
+  <div class="card-title" style="margin-bottom:8px;">
+    <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+    数据集划分
+  </div>
+  <div style="font-size:13px; color:var(--text-secondary); margin-bottom:10px;">
+    数据集路径: <code style="background:var(--accent-bg); padding:2px 6px; border-radius:3px;">{{ latest_dataset.dataset_path }}</code>
+  </div>
+  {% if latest_dataset.split %}
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <span class="badge badge-green">已划分</span>
+      <span style="font-size:13px; color:var(--text-secondary);">
+        训练: <strong>{{ latest_dataset.train_count }}</strong> 张 |
+        验证: <strong>{{ latest_dataset.val_count }}</strong> 张
+      </span>
+      <span style="font-size:12px; color:var(--text-muted);">
+        data.yaml: <code>{{ latest_dataset.data_yaml_path }}</code>
+      </span>
+    </div>
+  {% else %}
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <span class="badge badge-yellow">未划分</span>
+      <span style="font-size:13px; color:var(--text-secondary);">需要将数据集划分为训练集和验证集才能用于训练</span>
+    </div>
+    <div style="margin-top:10px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <label style="font-size:13px; display:flex; align-items:center; gap:4px;">
+        验证集比例:
+        <input id="splitRatio" type="number" min="0.05" max="0.5" step="0.05" value="0.2" style="width:60px; padding:4px 6px; border:1px solid var(--border); border-radius:4px; font-size:13px; text-align:center;">
+      </label>
+      <button class="btn btn-primary btn-sm" onclick="splitDataset()">
+        <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        开始划分
+      </button>
+      <span id="splitStatus" style="font-size:13px; display:none;"></span>
+    </div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="card">
+  <div style="text-align:center; padding:40px 20px;">
+    <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Dataset Analysis Available") }}</div>
+    <div style="font-size:13px; color:var(--text-muted);">{{ _("Upload a dataset ZIP above to start analysis.") }}</div>
+  </div>
+</div>
+{% endif %}
+</div>
+
+{# ─── Page 2: Intelligent Analysis ─── #}
+<div class="page {% if active_page == 'agent_suggestion' %}active{% endif %}" id="page2">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Intelligent Analysis") }}</div>
+</div>
+
+{# Training analysis folder input #}
+<div class="card" style="margin-bottom:16px;">
+  <div class="card-title" style="margin-bottom:8px;">{{ _("Training Analysis") }}</div>
+  <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">{{ _("Enter the path to a YOLO train directory (must contain results.csv and args.yaml)") }}</div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <svg viewBox="0 0 24 24" style="width:24px; height:24px; stroke:var(--text-muted); stroke-width:1.5; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+    <input type="text" id="trainingPathInput" placeholder="{{ _('Enter train directory path...') }}" style="flex:1; min-width:200px; padding:10px 14px; border:1px solid var(--border); border-radius:var(--radius); font-size:14px; font-family:inherit;">
+    <button type="button" onclick="browseFolder('trainingPathInput')" style="padding:10px 16px; background:var(--secondary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Browse...") }}</button>
+    <button type="button" id="trainingAnalyzeBtn" onclick="analyzeTrainingFolder()" style="padding:10px 20px; background:var(--primary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Analyze") }}</button>
+  </div>
+  {# Browse panels replaced by shared modal dialog #}
+  <div id="trainingUploadStatus" style="display:none; margin-top:8px; font-size:13px;"></div>
+  <div id="trainingAnalysisResult" style="display:none; margin-top:12px; padding:12px; background:var(--success-bg); border:1px solid var(--success); border-radius:var(--radius);">
+    <div style="font-weight:600; font-size:13px; color:var(--success); margin-bottom:4px;">{{ _("Analysis result") }}</div>
+    <div id="trainingAnalysisContent" style="font-size:13px;"></div>
+  </div>
+</div>
+
+{% if training %}
+<div class="row">
+  <div class="col" style="flex: 1;">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px;">{{ _("Training Summary") }}</div>
+      {% set s = training.summary %}
+      <table>
+        <tr><td>{{ _("Runs Analyzed") }}</td><td>{{ s.total_runs_analyzed }}</td></tr>
+        <tr><td>{{ _("Best mAP50") }}</td><td><strong>{{ s.best_mAP50 }}</strong> ({{ s.best_overall_run }})</td></tr>
+        <tr><td>{{ _("Avg mAP50") }}</td><td>{{ s.average_mAP50 }}</td></tr>
+        <tr><td>{{ _("Runs with Issues") }}</td><td>{{ s.runs_with_issues }}</td></tr>
+      </table>
+      {% if s.common_issues %}
+      <div style="margin-top:8px; display:flex; gap:4px; flex-wrap:wrap;">
+        {% for issue in s.common_issues %}
+        <span class="badge badge-yellow">{{ issue.type }} ({{ issue.count }})</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if llm_analysis %}
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span class="card-title" style="border:none; margin:0; padding:0;">{{ _("LLM Analysis Report") }}</span>
+        {% if training and training.get("suggestion") and training.suggestion.get("hyperparameter_changes") %}
+        <span class="badge badge-blue">{{ _("Agent suggests") }} {{ training.suggestion.hyperparameter_changes|length }} {{ _("change(s)") }}</span>
+        {% endif %}
+      </div>
+      {% for run_name, diag in llm_analysis.items() %}
+        {% if diag is mapping and diag.get("llm_diagnosis") %}
+        <div class="callout callout-blue" style="margin-bottom:8px;">
+          <div class="callout-label" style="margin-bottom:6px;">
+            <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            {{ run_name }}
+            {% if diag.get("model_used") %}
+            <span style="font-weight:400; font-size:11px; color:var(--text-muted);">({{ diag.model_used }})</span>
+            {% endif %}
+          </div>
+          <div style="font-size:13px; line-height:1.8; white-space:pre-wrap;">{{ diag.llm_diagnosis }}</div>
+        </div>
+        {% elif diag is mapping and diag.get("error") %}
+        <div class="callout" style="background:var(--destructive-bg); border:1px solid #FECACA;">
+          <div class="callout-label" style="color:var(--destructive);">{{ _("Error") }}</div>
+          <div style="font-size:13px;">{{ diag.error }}</div>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if vision_analysis %}
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        <span class="card-title" style="border:none; margin:0; padding:0;">{{ _("Vision Analysis") }}</span>
+      </div>
+      {% for run_name, va in vision_analysis.items() %}
+        {% if va is mapping %}
+        <div style="margin-top:8px;">
+          {% set cm = va.get("confusion_matrix_analysis", {}) %}
+          {% set ec = va.get("error_crop_analysis", {}) %}
+          {% set has_cm_analysis = cm is mapping and cm.get("analysis") %}
+          {% set has_ec_analysis = ec is mapping and ec.get("analysis") %}
+          {% set has_cm_error = cm is mapping and cm.get("error") %}
+          {% set has_ec_error = ec is mapping and ec.get("error") %}
+
+          {% if not has_cm_analysis and not has_ec_analysis %}
+          <div class="callout" style="background:var(--warning-bg); border:1px solid var(--accent-border); margin-bottom:12px;">
+            <div style="font-size:13px; color:var(--text-secondary); line-height:1.6;">
+              {{ _("Vision analysis requires confusion_matrix_normalized.png and val_batch*.jpg from the training output directory.") }}<br>
+              {{ _("Upload a complete YOLO train directory ZIP, or ensure local detect/ directory has training results.") }}
+            </div>
+          </div>
+          {% endif %}
+
+          {% if has_cm_analysis %}
+          <div class="callout callout-blue" style="margin-bottom:8px;">
+            <div class="callout-label">{{ _("Confusion Matrix") }}</div>
+            <div style="font-size:13px; line-height:1.7; white-space:pre-wrap;">{{ cm.analysis }}</div>
+          </div>
+          {% elif has_cm_error %}
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">{{ _("Confusion Matrix") }}: {{ cm.error }}</div>
+          {% endif %}
+
+          {% if has_ec_analysis %}
+          <div class="callout callout-blue">
+            <div class="callout-label">{{ _("Error Crop Analysis") }}</div>
+            <div style="font-size:13px; line-height:1.7; white-space:pre-wrap;">{{ ec.analysis }}</div>
+          </div>
+          {% elif has_ec_error %}
+          <div style="font-size:12px; color:var(--text-muted);">{{ _("Error Crop Analysis") }}: {{ ec.error }}</div>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="callout" style="background:var(--destructive-bg); border:1px solid #FECACA;">
+          <div class="callout-label" style="color:var(--destructive);">{{ _("Error") }}</div>
+          <div style="font-size:13px;">{{ va }}</div>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if latest_suggestion %}
+<div class="row">
+  <div class="col">
+    <div class="callout callout-yellow" style="height:100%;">
+      <div class="callout-label">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        {{ _("Diagnosis") }}
+      </div>
+      <div>{{ latest_suggestion.diagnosis }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="callout callout-blue" style="height:100%;">
+      <div class="callout-label">
+        <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        {{ _("Rationale") }}
+      </div>
+      <div>{{ latest_suggestion.rationale }}</div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% set has_changes = latest_suggestion and latest_suggestion.hyperparameter_changes and latest_suggestion.hyperparameter_changes|length > 0 %}
+
+<div class="suggestion-card" style="margin-bottom:16px;">
+  <div class="suggestion-header">
+    <h3>{{ _("Hyperparameter Changes") }}</h3>
+    {% if has_changes %}
+    <span class="badge badge-blue">{{ _("Agent suggests") }} {{ latest_suggestion.hyperparameter_changes|length }} {{ _("change(s)") }}</span>
+    {% endif %}
+  </div>
+
+  {% if has_changes %}
+  <table class="param-table">
+    <tr>
+      <th style="width:110px;">{{ _("Parameter") }}</th>
+      <th style="width:90px;">{{ _("Current") }}</th>
+      <th style="width:32px;"></th>
+      <th style="width:110px;">{{ _("Suggested") }}</th>
+      <th>{{ _("Reason") }}</th>
+    </tr>
+    {% for key, value in latest_suggestion.hyperparameter_changes.items() %}
+    {% if key not in ('diagnosis', 'action') %}
+    <tr>
+      <td class="param-name">{{ key }}</td>
+      <td class="param-old">{{ current_args.get(key, "—") if current_args else "—" }}</td>
+      <td class="param-arrow">&rarr;</td>
+      <td>
+        {% if value is string and value in ['SGD', 'AdamW', 'Adam', 'Adamax', 'NAdam', 'RAdam'] %}
+        <select class="param-select" name="{{ key }}">
+          {% for opt in ['SGD', 'AdamW', 'Adam', 'Adamax', 'NAdam', 'RAdam'] %}
+          <option value="{{ opt }}" {% if value == opt %}selected{% endif %}>{{ opt }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <input class="param-input" type="text" value="{{ value }}" name="{{ key }}">
+        {% endif %}
+      </td>
+      <td style="font-size:12px; color:var(--text-secondary);">
+        {% if loop.index == 1 %}{{ _("Suggested by tuning agent") }}{% else %}—{% endif %}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  {% else %}
+  <div style="padding:20px; text-align:center; color:var(--text-muted); font-size:13px;">
+    {{ _("No hyperparameter changes suggested yet.") }} {{ _("Start tuning to get recommendations.") }}
+  </div>
+  {% endif %}
+
+  <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--muted); display:flex; gap:16px; flex-wrap:wrap;">
+    <label class="checkbox-row">
+      <input type="checkbox" id="probeMode" name="probe_mode" checked> {{ _("Probe mode (10 epochs first, then decide)") }}
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" id="autoAnalyze" name="auto_analyze" checked> {{ _("Auto-analyze after training (Module B)") }}
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" id="autoLoop" name="auto_loop"> {{ _("Auto-loop (retrain with new params)") }}
+    </label>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col" style="flex: 1;">
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span style="font-weight:600; font-size:14px;">{{ _("Auto-Tuning Controls") }}</span>
+      </div>
+      <form id="tuningForm">
+        <div style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Reference Run") }}</label>
+          <select name="reference_run" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+            <option value="">{{ _("Auto-detect") }}</option>
+            {% for rn in training.runs.keys() %}
+            <option value="{{ rn }}">{{ rn }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Max Retries") }}</label>
+          <input type="number" name="max_retries" value="3" min="1" max="10" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Evaluation Mode") }}</label>
+          <div style="display:flex; gap:12px;">
+            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+              <input type="radio" name="eval_mode" value="comprehensive" checked> {{ _("Comprehensive (+Precision+Recall)") }}
+            </label>
+            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+              <input type="radio" name="eval_mode" value="quick"> {{ _("Quick (mAP50+mAP50-95)") }}
+            </label>
+          </div>
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Mode") }}</label>
+          <select name="mode" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+            <option value="dry_run">{{ _("干运行（仅生成计划）") }}</option>
+            <option value="full">{{ _("完整训练（含参数优化）") }}</option>
+            <option value="keep_params">{{ _("完整训练（保持原有参数）") }}</option>
+          </select>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button type="submit" class="btn btn-primary" style="flex:1;" id="startTuningBtn">
+            <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            {{ _("Confirm & Start Training") }}
+          </button>
+          <button type="button" class="btn btn-danger btn-sm" style="display:none;" id="stopTuningBtn" onclick="stopTuning()">
+            <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+            {{ _("停止") }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="col" style="flex: 1;">
+    <div class="card hidden" id="tuningProgress">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span style="font-weight:600; font-size:14px;">{{ _("Tuning Progress") }}</span>
+      </div>
+      <div id="tuningStatus" class="text-muted mb-2">{{ _("Initializing...") }}</div>
+      <div class="pipeline" id="pipelineIndicator">
+        <span class="pipeline-step" data-step="perception">1. {{ _("感知") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="decision">2. {{ _("决策") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="guardrails">3. {{ _("护栏") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="execute">4. {{ _("执行") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="probe">5. {{ _("探针") }}</span>
+      </div>
+      <div class="param-changes hidden" id="paramChanges">
+        <div style="font-weight:600; margin-bottom:4px; color:var(--accent);">{{ _("参数变更") }}:</div>
+        <div id="paramChangesContent"></div>
+      </div>
+      <div class="console-log" id="tuningLog">
+        <div class="dim">{{ _("Waiting to start...") }}</div>
+      </div>
+      <div id="bestResult" class="hidden" style="margin-top:12px; padding:12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px;">
+        <div style="font-weight:700; font-size:14px; margin-bottom:8px;">⭐ {{ _("Best Iteration") }}</div>
+        <div id="bestResultContent"></div>
+      </div>
+    </div>
+
+    {% if tuning_history %}
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Tuning History") }}</div>
+      {% for attempt in tuning_history|reverse %}
+      <div style="padding:8px 0; border-bottom:1px solid var(--muted); font-size:13px;">
+        <div class="flex">
+          <span class="badge badge-blue">#{{ attempt.iteration }}</span>
+          {% if attempt.error %}
+          <span class="badge badge-red">{{ _("Failed") }}</span>
+          {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+          <span class="badge badge-green">{{ _("Passed") }}</span>
+          {% else %}
+          <span class="badge badge-yellow">{{ _("Retry") }}</span>
+          {% endif %}
+          <span class="text-muted" style="font-size:12px;">{{ attempt.timestamp[:10] }}</span>
+        </div>
+        {% if attempt.decision.diagnosis %}
+        <div style="margin-top:4px; color:var(--text-secondary);">{{ attempt.decision.diagnosis[:80] }}{% if attempt.decision.diagnosis|length > 80 %}...{% endif %}</div>
+        {% endif %}
+        {% if attempt.decision.hyperparameter_changes %}
+        <div style="margin-top:4px; font-size:12px; color:var(--text-muted);">
+          {{ _("参数") }}: {% for k, v in attempt.decision.hyperparameter_changes.items() %}{{ k }}={{ v }} {% endfor %}
+        </div>
+        {% endif %}
+        {% set _mAP50 = attempt.get('result_mAP50') %}
+        {% set _mAP50_95 = attempt.get('result_mAP50_95') %}
+        {% set _precision = attempt.get('result_precision') %}
+        {% set _recall = attempt.get('result_recall') %}
+        {% if _mAP50 is not none %}
+        <div style="margin-top:4px; font-size:12px; display:flex; gap:10px; flex-wrap:wrap;">
+          <span>mAP50: <strong>{{ "%.4f"|format(_mAP50) }}</strong></span>
+          {% if _mAP50_95 is not none %}<span>mAP50-95: <strong>{{ "%.4f"|format(_mAP50_95) }}</strong></span>{% endif %}
+          {% if _precision is not none %}<span>Precision: <strong>{{ "%.4f"|format(_precision) }}</strong></span>{% endif %}
+          {% if _recall is not none %}<span>Recall: <strong>{{ "%.4f"|format(_recall) }}</strong></span>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+{% else %}
+<div class="card">
+  <div style="text-align:center; padding:40px 20px;">
+    <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+    <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Training Data Available") }}</div>
+    <div style="font-size:13px; color:var(--text-muted);">{{ _("Please run training analysis (Module B) first.") }}</div>
+  </div>
+</div>
+{% endif %}
+</div>
+
+{# ─── Page 3: Training Monitor ─── #}
+<div class="page {% if active_page == 'training_monitor' %}active{% endif %}" id="page3">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training Monitor") }}</div>
+  <span class="badge badge-green" id="statusBadge" style="font-size:13px; padding:4px 14px;">{{ _("Idle") }}</span>
+</div>
+
+{% set latest_run = None %}
+{% set latest_metrics = None %}
+{% set latest_args = None %}
+{% if training and training.runs %}
+  {% for rn, rd in training.runs.items() %}
+    {% set latest_run = rn %}
+    {% set latest_args = rd.args %}
+    {% set latest_metrics = (rd.results|default({})).final_metrics|default({}) %}
+  {% endfor %}
+{% endif %}
+
+<div class="row">
+  <div class="col">
+    <div class="card" style="text-align:center;">
+      <div class="card-title">{{ _("Epochs") }}</div>
+      <div class="card-value" style="font-size:22px;">
+        {% if latest_args %}{{ latest_args.epochs }}{% else %}—{% endif %}
+      </div>
+      <div class="card-desc">{{ _("Configured") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card" style="text-align:center;">
+      <div class="card-title">{{ _("Best mAP50") }}</div>
+      <div class="card-value" style="font-size:22px; {% if latest_metrics %}color:var(--success){% endif %};">
+        {% if latest_metrics %}
+        {{ "%.4f"|format(latest_metrics.get("metrics/mAP50(B)", 0)) }}
+        {% else %}—{% endif %}
+      </div>
+      <div class="card-desc">{{ _("Final metric") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card" style="text-align:center;">
+      <div class="card-title">{{ _("mAP50-95") }}</div>
+      <div class="card-value" style="font-size:22px;">
+        {% if latest_metrics %}
+        {{ "%.4f"|format(latest_metrics.get("metrics/mAP50-95(B)", 0)) }}
+        {% else %}—{% endif %}
+      </div>
+      <div class="card-desc">{{ _("COCO-style metric") }}</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card" style="text-align:center;">
+      <div class="card-title">{{ _("Precision / Recall") }}</div>
+      <div class="card-value" style="font-size:18px; color:var(--text-secondary);">
+        {% if latest_metrics %}
+        {{ "%.3f"|format(latest_metrics.get("metrics/precision(B)", 0)) }} / {{ "%.3f"|format(latest_metrics.get("metrics/recall(B)", 0)) }}
+        {% else %}—{% endif %}
+      </div>
+      <div class="card-desc">{{ _("Precision / Recall") }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="card" style="padding:16px;">
+      <div class="card-title" style="margin-bottom:8px; display:flex; align-items:center; gap:8px;">
+        <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        {{ _("Training Status") }}
+      </div>
+      <div class="console-log" id="monitorLog" style="max-height:200px;">
+        {% if latest_run %}
+        <div class="success">[System] {{ _("Latest run:") }} {{ latest_run }}</div>
+        {% if latest_metrics %}
+        <div class="info">[Results] mAP50={{ "%.4f"|format(latest_metrics.get("metrics/mAP50(B)", 0)) }}  mAP50-95={{ "%.4f"|format(latest_metrics.get("metrics/mAP50-95(B)", 0)) }}  P={{ "%.4f"|format(latest_metrics.get("metrics/precision(B)", 0)) }}  R={{ "%.4f"|format(latest_metrics.get("metrics/recall(B)", 0)) }}</div>
+        {% endif %}
+        <div class="dim">[System] {{ _("training completed") }}</div>
+        {% else %}
+        <div class="dim">{{ _("No training runs recorded yet.") }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="probe-result" id="probeResult" style="display:none;">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div>
+      <div style="display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span class="probe-title">{{ _("Probe Complete") }} (10 {{ _("epochs") }})</span>
+      </div>
+      <div style="font-size:13px; color:var(--text-secondary); margin-top:4px;">{{ _("Loss is decreasing steadily. No anomalies detected. Continue training?") }}</div>
+    </div>
+    <div style="display:flex; gap:8px;">
+      <button class="btn btn-outline btn-sm" onclick="switchPage(2)">{{ _("Retune") }}</button>
+      <button class="btn btn-primary btn-sm">{{ _("Continue Training") }}</button>
+    </div>
+  </div>
+</div>
+
+<div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
+  <button class="btn btn-danger btn-sm" style="display:none;" id="stopTrainingBtn" onclick="stopFirstTraining()">
+    <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+    {{ _("停止训练") }}
+  </button>
+  <button class="btn btn-primary btn-sm" id="startNewTrainingBtn" onclick="showTrainModal()">
+    <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    {{ _("Start New Training") }}
+  </button>
+</div>
+</div>
+
+{# ─── Training Start Modal ─── #}
+<div id="trainModal" class="modal-overlay" style="display:none;">
+  <div class="modal-content" style="max-width:520px;">
+    <div style="font-weight:600; font-size:15px; margin-bottom:14px;">{{ _("Start New Training") }}</div>
+    {% if latest_dataset and latest_dataset.split %}
+    <div style="font-size:12px; background:var(--success-bg); border:1px solid var(--success); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+      <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--success); stroke-width:2; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      <span>数据集已就绪: <strong>{{ latest_dataset.train_count }}</strong> 训练 / <strong>{{ latest_dataset.val_count }}</strong> 验证</span>
+    </div>
+    {% elif latest_dataset and not latest_dataset.split %}
+    <div style="font-size:12px; background:var(--warning-bg); border:1px solid var(--accent-border); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+      <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--warning); stroke-width:2; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span>数据集已上传但<strong>未划分</strong>，请先到数据集报告页划分数据集</span>
+    </div>
+    {% endif %}
+    <div style="font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
+      {{ _("Launch a new YOLOv8 training from scratch. Configure the dataset path and training parameters below.") }}
+    </div>
+    <table>
+      <tr>
+        <td style="width:130px;">data.yaml *</td>
+        <td><input id="trainDataYaml" value="{% if latest_dataset and latest_dataset.split %}{{ latest_dataset.data_yaml_path }}{% else %}{{ project.get("data_yaml", training_config.get("data_yaml", "")) }}{% endif %}" placeholder="D:\path\to\data.yaml" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+      </tr>
+      <tr>
+        <td>{{ _("Model") }}</td>
+        <td><input id="trainModel" value="{{ project.get("model", training_config.get("model", "yolov8n.pt")) }}" placeholder="yolov8n.pt" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+      </tr>
+      <tr>
+        <td>{{ _("Epochs") }}</td>
+        <td><input id="trainEpochs" value="{{ training_config.get("default_epochs", 100) }}" type="number" min="1" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+      </tr>
+      <tr>
+        <td>imgsz</td>
+        <td><input id="trainImgsz" value="{{ training_config.get("imgsz", 640) }}" type="number" min="32" step="32" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+      </tr>
+      <tr>
+        <td>batch</td>
+        <td><input id="trainBatch" value="{{ training_config.get("batch", 16) }}" type="number" min="1" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+      </tr>
+    </table>
+    <div style="margin-top:14px; display:flex; gap:8px; justify-content:flex-end;">
+      <button class="btn btn-sm btn-outline" onclick="hideTrainModal()">{{ _("Cancel") }}</button>
+      <button class="btn btn-primary btn-sm" onclick="startTraining()">
+        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        {{ _("Start Training") }}
+      </button>
+    </div>
+  </div>
+</div>
+
+{# ─── Page 4: History ─── #}
+<div class="page {% if active_page == 'history' %}active{% endif %}" id="page4">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training History") }}</div>
+</div>
+
+{% if tuning_history and tuning_history|length > 0 %}
+<div class="card" style="padding:0; overflow-x:auto;">
+  <table>
+    <tr>
+      <th style="width:40px;">{{ _("#") }}</th>
+      <th>{{ _("Time") }}</th>
+      <th>{{ _("Diagnosis") }}</th>
+      <th>{{ _("Changes") }}</th>
+      <th>{{ _("Status") }}</th>
+      <th style="width:60px;">{{ _("View") }}</th>
+    </tr>
+    {% for attempt in tuning_history|reverse %}
+    <tr style="cursor:pointer;">
+      <td><span class="badge badge-blue">#{{ attempt.iteration }}</span></td>
+      <td style="font-size:12px; color:var(--text-secondary);">{{ attempt.timestamp[:16] }}</td>
+      <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px;">
+        {{ attempt.decision.diagnosis[:60] if attempt.decision and attempt.decision.diagnosis else "—" }}
+      </td>
+      <td style="font-size:12px; color:var(--text-muted); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+        {% if attempt.decision and attempt.decision.hyperparameter_changes %}
+          {% for k, v in attempt.decision.hyperparameter_changes.items() %}
+            {{ k }}={{ v }}{% if not loop.last %} {% endif %}
+          {% endfor %}
+        {% else %}—{% endif %}
+      </td>
+      <td>
+        {% if attempt.error %}
+        <span class="badge badge-red">{{ _("Failed") }}</span>
+        {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+        <span class="badge badge-green">{{ _("Passed") }}</span>
+        {% else %}
+        <span class="badge badge-yellow">{{ _("Retry") }}</span>
+        {% endif %}
+      </td>
+      <td>
+        <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); toggleDetails('details_{{ loop.index0 }}')">{{ _("Details") }}</button>
+      </td>
+    </tr>
+    <tr id="details_{{ loop.index0 }}" style="display:none;">
+      <td colspan="6" style="padding:16px 24px; background:#F8FAFC;">
+        <div style="display:flex; gap:16px; flex-wrap:wrap;">
+          <div style="flex:1; min-width:200px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Full Diagnosis") }}</div>
+            <div style="font-size:13px; color:var(--text-secondary); line-height:1.6;">
+              {{ attempt.decision.diagnosis if attempt.decision and attempt.decision.diagnosis else "—" }}
+            </div>
+          </div>
+          <div style="flex:1; min-width:200px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Hyperparameter Changes") }}</div>
+            {% if attempt.decision and attempt.decision.hyperparameter_changes %}
+            <table style="font-size:12px;">
+              <tr><th>{{ _("Parameter") }}</th><th>{{ _("Value") }}</th></tr>
+              {% for k, v in attempt.decision.hyperparameter_changes.items() %}
+              <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              {% endfor %}
+            </table>
+            {% else %}
+            <span class="text-muted">{{ _("No hyperparameter changes") }}</span>
+            {% endif %}
+          </div>
+          <div style="flex:1; min-width:150px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Guardrails") }}</div>
+            {% if attempt.guard_results %}
+              {% if attempt.guard_results.warnings %}
+              <div style="font-size:12px; color:var(--warning);">{{ _("Warnings:") }} {{ attempt.guard_results.warnings|length }}</div>
+              {% endif %}
+              {% if attempt.guard_results.errors %}
+              <div style="font-size:12px; color:var(--destructive);">{{ _("Errors:") }} {{ attempt.guard_results.errors|length }}</div>
+              {% endif %}
+              {% if not attempt.guard_results.warnings and not attempt.guard_results.errors %}
+              <span class="text-muted" style="font-size:12px;">{{ _("All checks passed") }}</span>
+              {% endif %}
+            {% else %}
+              <span class="text-muted" style="font-size:12px;">{{ _("No guardrails data") }}</span>
+            {% endif %}
+          </div>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% else %}
+<div class="card">
+  <div style="text-align:center; padding:40px 20px;">
+    <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+    <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Tuning History") }}</div>
+    <div style="font-size:13px; color:var(--text-muted);">{{ _("Start auto-tuning to see history here.") }}</div>
+    <div class="mt-2"><button class="btn btn-primary btn-sm" onclick="switchPage(2)">{{ _("Start Tuning") }}</button></div>
+  </div>
+</div>
+{% endif %}
+
+<div style="margin-top:16px; display:flex; gap:8px;">
+  <button class="btn btn-outline btn-sm" onclick="location.reload()">
+    <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+    {{ _("Refresh") }}
+  </button>
+  <a href="/api/tuning/history" target="_blank" class="btn btn-outline btn-sm">
+    <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    {{ _("Export JSON") }}
+  </a>
+</div>
+</div>
+
+<!-- ── Browse Modal ── -->
+<div id="browseModal" class="modal-overlay" onclick="closeBrowseModal(event)">
+  <div class="modal-dialog" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3>{{ _("Browse...") }}</h3>
+      <button type="button" class="modal-close" onclick="closeBrowseModal()">&times;</button>
+    </div>
+    <div class="modal-path" id="browseModalPath"></div>
+    <div class="modal-body" id="browseModalBody">
+      <div class="browse-loading">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:currentColor; stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" stroke-dasharray="30 70" stroke-dashoffset="0"><animate attributeName="stroke-dashoffset" values="0;100" dur="1s" repeatCount="indefinite"/></circle></svg>
+        加载中...
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" onclick="closeBrowseModal()" style="padding:8px 16px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); cursor:pointer; font-size:13px; font-family:inherit;">{{ _("Cancel") }}</button>
+      <button type="button" id="browseSelectBtn" onclick="selectBrowseFolder()" style="padding:8px 20px; background:var(--primary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; font-weight:500;">{{ _("Select this folder") }}</button>
+    </div>
+  </div>
+</div>
+
+{# ─── Best Report Modal ─── #}
+<div id="bestReportModal" class="modal-overlay" onclick="_closeBestReport(event)" style="display:none;">
+  <div class="modal-content" style="max-width:640px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+      <div style="font-weight:600; font-size:15px;">⭐ {{ _("Best Iteration Full Analysis") }}</div>
+      <button type="button" class="modal-close" onclick="_closeBestReport()">&times;</button>
+    </div>
+    <div id="bestReportModalBody" style="max-height:60vh; overflow-y:auto; font-size:13px;">
+      <div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+    </div>
+    <div style="margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
+      <button type="button" id="saveReportBtn" data-train-name="" onclick="saveBestReport(this.dataset.trainName)" style="padding:8px 16px; border:1px solid var(--accent); border-radius:var(--radius); background:var(--accent-bg); cursor:pointer; font-size:13px; font-family:inherit; color:var(--accent);">💾 {{ _("Save Report") }}</button>
+      <button type="button" onclick="_closeBestReport()" style="padding:8px 16px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); cursor:pointer; font-size:13px; font-family:inherit;">{{ _("Close") }}</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Tab switching ──
+function switchPage(idx) {
+  var pages = document.querySelectorAll('.page');
+  var tabs = document.querySelectorAll('.tab');
+  for (var i = 0; i < pages.length; i++) {
+    pages[i].classList.toggle('active', i === idx);
+    tabs[i].classList.toggle('active', i === idx);
+  }
+  // When switching to training monitor (page 3), check if any training is running
+  if (idx === 3) {
+    var stopBtn = document.getElementById('stopTrainingBtn');
+    if (stopBtn && stopBtn.style.display !== 'inline-flex') {
+      // Check auto-tuning status
+      fetch('/api/tuning/status')
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+          if (data && data.status === 'running') {
+            stopBtn.style.display = 'inline-flex';
+          }
+        })
+        .catch(function(){});
+      // Also check first-time training status
+      fetch('/api/training/running')
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+          if (data && data.running === true) {
+            stopBtn.style.display = 'inline-flex';
+          }
+        })
+        .catch(function(){});
+    }
+  }
+}
+
+// ── Project editing ──
+function toggleProjectEdit() {
+  var editMode = document.getElementById('projNameEdit').style.display !== 'none';
+  ['projNameDisplay','projDescDisplay','projDisplayTable'].forEach(function(id){
+    var el = document.getElementById(id);
+    if(el) el.style.display = editMode ? 'block' : 'none';
+  });
+  ['projNameEdit','projEditTable'].forEach(function(id){
+    var el = document.getElementById(id);
+    if(el) el.style.display = editMode ? 'none' : 'block';
+  });
+  document.getElementById('editProjBtn').style.display = editMode ? 'inline-flex' : 'none';
+  document.getElementById('saveProjBtn').style.display = editMode ? 'none' : 'inline-flex';
+  document.getElementById('cancelProjBtn').style.display = editMode ? 'none' : 'inline-flex';
+}
+function saveProject() {
+  var btn = document.getElementById('saveProjBtn');
+  btn.disabled = true; btn.textContent = '{{ _("Editing...") }}';
+  fetch('/api/project', {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      name: document.getElementById('projNameInput').value,
+      description: document.getElementById('projDescTableInput').value,
+      detection_target: document.getElementById('projTargetInput').value,
+      data_type: document.getElementById('projDataTypeInput').value,
+      data_yaml: document.getElementById('projDataYamlInput').value,
+      model: document.getElementById('projModelInput').value,
+    })
+  }).then(function(r){return r.json()})
+    .then(function(resp){
+      if(resp.status==='success'){ location.reload(); }
+      else { alert('{{ _("Save failed") }}: '+(resp.error||'')); btn.disabled=false; btn.textContent='{{ _("Save") }}'; }
+    })
+    .catch(function(){ alert('{{ _("Save failed") }}'); btn.disabled=false; btn.textContent='{{ _("Save") }}'; });
+}
+
+// ── History details toggle ──
+function toggleDetails(id) {
+  var row = document.getElementById(id);
+  if (row) {
+    row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+  }
+}
+
+// ── Language toggle: redirect back ──
+document.querySelectorAll('.lang-btn').forEach(function(btn) {
+  btn.addEventListener('click', function(e) {
+    e.preventDefault();
+    var url = new URL(btn.href);
+    url.searchParams.set('redirect', window.location.pathname);
+    window.location.href = url.toString();
+  });
+});
+
+// ── Folder Browse (shared) ──
+// ── Browse Modal ──
+var _browseInputId = null;
+
+function browseFolder(inputId) {
+  _browseInputId = inputId;
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  var path = input.value.trim() || '';
+  var modal = document.getElementById('browseModal');
+  modal.classList.add('show');
+  _loadBrowsePath(path);
+}
+
+function closeBrowseModal(ev) {
+  if (ev && ev.target !== ev.currentTarget) return;
+  document.getElementById('browseModal').classList.remove('show');
+  _browseInputId = null;
+}
+
+function selectBrowseFolder() {
+  if (!_browseInputId) return;
+  var input = document.getElementById(_browseInputId);
+  var selected = document.getElementById('browseModal').dataset.selectedPath;
+  if (selected) {
+    input.value = selected;
+  }
+  closeBrowseModal();
+}
+
+function _loadBrowsePath(path) {
+  var body = document.getElementById('browseModalBody');
+  var pathEl = document.getElementById('browseModalPath');
+  var selectBtn = document.getElementById('browseSelectBtn');
+  pathEl.textContent = path || '(根目录)';
+  body.innerHTML = '<div class="browse-loading"><svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;stroke-width:2;fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" stroke-dasharray="30 70" stroke-dashoffset="0"><animate attributeName="stroke-dashoffset" values="0;100" dur="1s" repeatCount="indefinite"/></circle></svg> 加载中...</div>';
+  selectBtn.disabled = true;
+
+  fetch('/api/browse-folder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path }),
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var html = '';
+      if (data.parent !== null && data.parent !== undefined) {
+        var parentPath = data.parent || '';
+        var parentEsc = _escapePath(parentPath);
+        var parentLabel = parentPath ? '.. (上级目录)' : '.. (返回盘符列表)';
+        html += '<div class="browse-item browse-parent" onclick="_loadBrowsePath(\'' + parentEsc + '\')"><span class="icon">📂</span><span class="name">' + parentLabel + '</span></div>';
+      }
+      if (data.entries) {
+        var hasFolder = false;
+        for (var i = 0; i < data.entries.length; i++) {
+          var e = data.entries[i];
+          if (!e.is_dir) continue;
+          hasFolder = true;
+          var ep = _escapePath(e.path);
+          html += '<div class="browse-item" onclick="_loadBrowsePath(\'' + ep + '\')"><span class="icon">📁</span><span class="name">' + _escapeHtml(e.name) + '</span></div>';
+        }
+        if (!hasFolder) html += '<div class="browse-empty">(空目录)</div>';
+      }
+      if (!html) html = '<div class="browse-empty">(空目录)</div>';
+      body.innerHTML = html;
+
+      document.getElementById('browseModal').dataset.selectedPath = path || data.path || '';
+      selectBtn.disabled = false;
+    })
+    .catch(function(err) {
+      body.innerHTML = '<div class="browse-error">错误: ' + _escapeHtml(err.message) + '</div>';
+      selectBtn.disabled = true;
+    });
+}
+
+function _escapePath(p) {
+  return p.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function _escapeHtml(s) {
+  var d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Dataset folder analyze ──
+function analyzeDatasetFolder() {
+  var input = document.getElementById('datasetPathInput');
+  var statusEl = document.getElementById('uploadStatus');
+  var btn = document.getElementById('datasetAnalyzeBtn');
+  var path = input.value.trim();
+  if (!path) { alert('请输入数据集文件夹路径'); return; }
+  statusEl.style.display = 'block';
+  statusEl.textContent = '{{ _("Analyzing dataset...") }}';
+  statusEl.style.color = 'var(--text-secondary)';
+  btn.disabled = true;
+  btn.textContent = '{{ _("Analyzing...") }}';
+  fetch('/api/dataset/analyze-folder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path }),
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(result) {
+      btn.disabled = false;
+      btn.textContent = '{{ _("Analyze") }}';
+      if (result.status === 'success') {
+        statusEl.textContent = '{{ _("Analysis complete!") }}';
+        statusEl.style.color = 'var(--success)';
+        setTimeout(function() { location.reload(); }, 1500);
+      } else {
+        statusEl.textContent = '{{ _("Error") }}: ' + (result.error || 'Unknown');
+        statusEl.style.color = 'var(--destructive)';
+      }
+    })
+    .catch(function(err) {
+      btn.disabled = false;
+      btn.textContent = '{{ _("Analyze") }}';
+      statusEl.textContent = '{{ _("Error") }}: ' + err.message;
+      statusEl.style.color = 'var(--destructive)';
+    });
+}
+
+// ── Dataset Split ──
+function splitDataset() {
+  var ratio = document.getElementById('splitRatio').value;
+  var statusEl = document.getElementById('splitStatus');
+  if (!statusEl) return;
+  statusEl.style.display = 'inline';
+  statusEl.textContent = '划分中...';
+  statusEl.style.color = 'var(--text-secondary)';
+  fetch('/api/dataset/split', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ val_ratio: parseFloat(ratio) || 0.2 }),
+  }).then(function(r) { return r.json(); }).then(function(result) {
+    if (result.status === 'success') {
+      statusEl.textContent = '划分完成！训练: ' + result.train_count + ' 张, 验证: ' + result.val_count + ' 张';
+      statusEl.style.color = 'var(--success)';
+      setTimeout(function() { location.reload(); }, 2000);
+    } else {
+      statusEl.textContent = '划分失败: ' + (result.error || 'Unknown');
+      statusEl.style.color = 'var(--destructive)';
+    }
+  }).catch(function(err) {
+    statusEl.textContent = '请求失败: ' + err.message;
+    statusEl.style.color = 'var(--destructive)';
+  });
+}
+
+// ── Tuning SSE ──
+var tuningAbortController = null;
+
+function stopTuning() {
+  // Abort the SSE connection on the client side
+  if (tuningAbortController) {
+    tuningAbortController.abort();
+    tuningAbortController = null;
+  }
+  // Tell the server to cancel
+  fetch('/tuning/stop', { method: 'POST' }).catch(function(){});
+}
+
+function _closeBestReport(ev) {
+  if (ev && ev.target !== ev.currentTarget) return;
+  document.getElementById('bestReportModal').style.display = 'none';
+}
+
+function loadBestReport(trainName) {
+  if (!trainName) return;
+  var modal = document.getElementById('bestReportModal');
+  var body = document.getElementById('bestReportModalBody');
+  if (!modal || !body) return;
+  body.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Analyzing...") }}</div>';
+  modal.style.display = 'flex';
+
+  // Set train name on save button
+  var saveBtn = document.getElementById('saveReportBtn');
+  if (saveBtn) saveBtn.dataset.trainName = trainName;
+
+  function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  fetch('/api/training/report-by-name?name=' + encodeURIComponent(trainName))
+    .then(function(r) {
+      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      return r.json();
+    })
+    .then(function(report) {
+      if (report.error) {
+        body.innerHTML = '<div style="text-align:center; padding:20px; color:var(--danger);">{{ _("Error") }}: ' + esc(report.error) + '</div>';
+        return;
+      }
+      var html = '<div style="margin-bottom:12px;">';
+      html += '<div style="font-weight:600; font-size:14px; margin-bottom:4px;">' + esc(trainName) + '</div>';
+      var summary = report.summary || {};
+      if (summary.overall_assessment) {
+        html += '<div style="margin-bottom:8px; padding:8px; background:var(--accent-bg); border-radius:6px; font-size:13px; white-space:pre-wrap;">' + esc(summary.overall_assessment) + '</div>';
+      }
+      var issues = report.issues || [];
+      if (issues.length > 0) {
+        html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("Key Issues") }}</div>';
+        html += '<ul style="margin:0 0 8px 0; padding-left:16px; font-size:13px;">';
+        for (var i = 0; i < issues.length; i++) {
+          html += '<li>' + esc(issues[i].issue || issues[i]) + '</li>';
+        }
+        html += '</ul>';
+      }
+      var llm = report.llm_analysis || {};
+      if (llm.error) {
+        html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("LLM Analysis Report") }}</div>';
+        html += '<div style="font-size:13px; white-space:pre-wrap; background:var(--muted); padding:8px; border-radius:6px; margin-bottom:8px; color:var(--danger);">{{ _("Error") }}: ' + esc(llm.error) + '</div>';
+      } else if (llm.diagnosis) {
+        html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("LLM Analysis Report") }}</div>';
+        html += '<div style="font-size:13px; white-space:pre-wrap; background:var(--muted); padding:8px; border-radius:6px; margin-bottom:8px;">' + esc(llm.diagnosis) + '</div>';
+      }
+      var vision = report.vision_analysis || {};
+      if (vision.error) {
+        html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("Vision Analysis") }}</div>';
+        html += '<div style="font-size:13px; white-space:pre-wrap; background:var(--muted); padding:8px; border-radius:6px; margin-bottom:8px; color:var(--danger);">{{ _("Error") }}: ' + esc(vision.error) + '</div>';
+      } else {
+        if (vision.confusion_matrix_analysis && vision.confusion_matrix_analysis.analysis) {
+          html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("Confusion Matrix") }}</div>';
+          html += '<div style="font-size:13px; white-space:pre-wrap; background:var(--muted); padding:8px; border-radius:6px; margin-bottom:8px;">' + esc(vision.confusion_matrix_analysis.analysis) + '</div>';
+        }
+        if (vision.error_crop_analysis && vision.error_crop_analysis.analysis) {
+          html += '<div style="font-weight:600; margin-bottom:4px;">{{ _("Error Crop Analysis") }}</div>';
+          html += '<div style="font-size:13px; white-space:pre-wrap; background:var(--muted); padding:8px; border-radius:6px;">' + esc(vision.error_crop_analysis.analysis) + '</div>';
+        }
+      }
+      if (!summary.overall_assessment && issues.length === 0 && !llm.diagnosis && !llm.error && !vision.confusion_matrix_analysis && !vision.error_crop_analysis) {
+        html += '<div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("No analysis data available for this training run.") }}</div>';
+      }
+      html += '</div>';
+      body.innerHTML = html;
+    })
+    .catch(function(err) {
+      body.innerHTML = '<div style="text-align:center; padding:20px; color:var(--danger);">{{ _("Error") }}: ' + esc(err.message) + '<br><br><button class="btn btn-outline btn-sm" onclick="loadBestReport(\'' + encodeURIComponent(trainName) + '\')">{{ _("Retry") }}</button></div>';
+    });
+}
+
+function saveBestReport(trainName) {
+  if (!trainName) return;
+  var btn = document.getElementById('saveReportBtn');
+  if (btn) btn.textContent = '⏳ {{ _("Saving...") }}';
+  fetch('/api/training/save-report-text', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ train_name: trainName }),
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.success) {
+      if (btn) btn.textContent = '✅ {{ _("Saved") }}';
+      setTimeout(function() {
+        if (btn) btn.textContent = '💾 {{ _("Save Report") }}';
+      }, 2000);
+    } else {
+      if (btn) btn.textContent = '💾 {{ _("Save Report") }}';
+      alert('{{ _("Save failed") }}: ' + (data.error || 'unknown error'));
+    }
+  })
+  .catch(function(err) {
+    if (btn) btn.textContent = '💾 {{ _("Save Report") }}';
+    alert('{{ _("Save failed") }}: ' + err.message);
+  });
+}
+
+(function() {
+  var tuningForm = document.getElementById('tuningForm');
+  if (!tuningForm) return;
+
+  var tuningProgress = document.getElementById('tuningProgress');
+  var tuningStatus = document.getElementById('tuningStatus');
+  var tuningLog = document.getElementById('tuningLog');
+  var startBtn = document.getElementById('startTuningBtn');
+  var stopBtn = document.getElementById('stopTuningBtn');
+
+  tuningForm.addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var formData = new FormData(tuningForm);
+
+    startBtn.style.display = 'none';
+    stopBtn.style.display = 'inline-flex';
+    tuningProgress.classList.remove('hidden');
+    // Append instead of replacing — keep previous tuning output visible (issue #1/#2)
+    tuningLog.innerHTML += '<div class="dim">--- {{ _("Starting tuning...") }} ---</div>';
+    tuningStatus.textContent = '{{ _("Connecting...") }}';
+
+    var pipelineSteps = {};  // track completed steps per iteration
+
+    function appendLog(msg, level) {
+      var div = document.createElement('div');
+      div.className = level;
+      div.textContent = msg;
+      tuningLog.appendChild(div);
+      tuningLog.scrollTop = tuningLog.scrollHeight;
+    }
+
+    function updatePipeline(step, iteration) {
+      var steps = ['perception', 'decision', 'guardrails', 'execute', 'probe'];
+      var pipeline = document.getElementById('pipelineIndicator');
+      if (!pipeline) return;
+      var stepEls = pipeline.querySelectorAll('.pipeline-step');
+
+      // Step "complete" marks all steps as done (green)
+      if (step === 'complete') {
+        for (var i = 0; i < stepEls.length; i++) {
+          stepEls[i].className = 'pipeline-step done';
+        }
+        // Update probe-result panel on page 3 to green
+        var probeResult = document.getElementById('probeResult');
+        if (probeResult) {
+          probeResult.classList.add('passed');
+          probeResult.style.display = 'flex';
+        }
+        return;
+      }
+
+      var stepIdx = steps.indexOf(step);
+      if (stepIdx < 0) return;
+      // Mark all previous steps as done, current as active, later as pending
+      for (var i = 0; i < stepEls.length; i++) {
+        var el = stepEls[i];
+        var s = el.getAttribute('data-step');
+        var si = steps.indexOf(s);
+        if (si < stepIdx) {
+          el.className = 'pipeline-step done';
+        } else if (si === stepIdx) {
+          el.className = 'pipeline-step active';
+        } else {
+          el.className = 'pipeline-step';
+        }
+      }
+    }
+
+    function showParamChanges(params) {
+      var container = document.getElementById('paramChanges');
+      var content = document.getElementById('paramChangesContent');
+      if (!container || !content) return;
+      if (!params || Object.keys(params).length === 0) {
+        container.classList.add('hidden');
+        return;
+      }
+      container.classList.remove('hidden');
+
+      // Handle keep_params flag — show yellow info card
+      if (params['_keep_params']) {
+        var reason = params['reason'] || 'AI 判断无需调整超参数，使用原有参数继续训练';
+        content.innerHTML = '<div style="padding:8px 12px; background:var(--warning-bg); border:1px solid var(--accent-border); border-radius:6px; font-size:13px; color:#92400E;">⚠️ ' + reason + '</div>';
+        container.style.background = 'transparent';
+        container.style.border = 'none';
+        return;
+      }
+      container.style.background = '#FFFBEB';
+      container.style.border = '1px solid #FDE68A';
+
+      var html = '<table>';
+      // Separate regular params from _overrides
+      var overrides = params['_overrides'] || null;
+      for (var k in params) {
+        if (k === 'diagnosis' || k === 'action' || k === '_overrides') continue;
+        html += '<tr><td class="param-name">' + k + '</td><td class="param-arrow">=</td><td class="param-new">' + params[k] + '</td></tr>';
+      }
+      html += '</table>';
+      if (overrides) {
+        html += '<div style="margin-top:6px; font-weight:600; font-size:11px; color:var(--text-secondary);">训练配置变更:</div>';
+        html += '<table>';
+        for (var ok in overrides) {
+          html += '<tr><td class="param-name">' + ok + '</td><td class="param-arrow">=</td><td class="param-new">' + overrides[ok] + '</td></tr>';
+        }
+        html += '</table>';
+      }
+      content.innerHTML = html;
+    }
+
+    tuningAbortController = new AbortController();
+    try {
+      var response = await fetch('/tuning/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reference_run: formData.get('reference_run') || null,
+          max_retries: parseInt(formData.get('max_retries')),
+          mode: formData.get('mode'),
+          probe_mode: document.getElementById('probeMode').checked,
+          auto_analyze: document.getElementById('autoAnalyze').checked,
+          auto_loop: document.getElementById('autoLoop').checked,
+          eval_mode: document.querySelector('input[name="eval_mode"]:checked')?.value || 'comprehensive',
+        }),
+        signal: tuningAbortController.signal,
+      });
+
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+
+      while (true) {
+        var r = await reader.read();
+        if (r.done) break;
+        var text = decoder.decode(r.value, { stream: true });
+        var lines = text.split('\n');
+        for (var j = 0; j < lines.length; j++) {
+          var line = lines[j];
+          if (line.startsWith('data: ')) {
+            var data = JSON.parse(line.slice(6));
+            appendLog(data.message, data.level || 'info');
+            // Update pipeline visualization
+            if (data.step) {
+              updatePipeline(data.step, data.iteration);
+              if (data.step === 'iteration_start') {
+                document.getElementById('paramChanges').classList.add('hidden');
+              }
+            }
+            if (data.params) {
+              showParamChanges(data.params);
+            }
+            if (data.status === 'cancelled') {
+              tuningStatus.innerHTML = '[{{ _("已取消") }}] {{ _("Training stopped") }}';
+            } else if (data.status === 'error') {
+              tuningStatus.textContent = '[{{ _("失败") }}] ' + data.message;
+            } else if (data.status === 'done') {
+              tuningStatus.innerHTML = '[{{ _("完成") }}] {{ _("Tuning complete") }}';
+              // Render best result card
+              var result = data.result || {};
+              if (result.best_iteration != null) {
+                var bestDiv = document.getElementById('bestResult');
+                var bestContent = document.getElementById('bestResultContent');
+                var metrics = result.best_metrics || {};
+                var evalLabel = result.eval_mode === 'quick' ? '{{ _("综合评分（快速）") }}' : '{{ _("综合评分（全面）") }}';
+                var cs = 0;
+                if (result.eval_mode === 'quick') {
+                  cs = (metrics.mAP50 || 0) * 0.6 + (metrics.mAP50_95 || 0) * 0.4;
+                } else {
+                  cs = (metrics.mAP50 || 0) * 0.35 + (metrics.mAP50_95 || 0) * 0.25 + (metrics.precision || 0) * 0.20 + (metrics.recall || 0) * 0.20;
+                }
+                bestContent.innerHTML =
+                  '<div style="margin-bottom:6px;">' +
+                    '<span style="font-weight:600;">{{ _("Iteration") }} #' + result.best_iteration + '</span>' +
+                    '<span class="text-muted" style="margin-left:8px;">(' + result.best_train_name + ')</span>' +
+                  '</div>' +
+                  '<div style="margin-bottom:6px;">' +
+                    '<span style="font-weight:600;">' + evalLabel + ':</span> ' + cs.toFixed(4) +
+                  '</div>' +
+                  '<div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; margin-bottom:8px; font-size:13px;">' +
+                    '<div><span class="text-muted">mAP50:</span> <strong>' + (metrics.mAP50 != null ? metrics.mAP50.toFixed(4) : '-') + '</strong></div>' +
+                    '<div><span class="text-muted">mAP50-95:</span> <strong>' + (metrics.mAP50_95 != null ? metrics.mAP50_95.toFixed(4) : '-') + '</strong></div>' +
+                    '<div><span class="text-muted">Precision:</span> <strong>' + (metrics.precision != null ? metrics.precision.toFixed(4) : '-') + '</strong></div>' +
+                    '<div><span class="text-muted">Recall:</span> <strong>' + (metrics.recall != null ? metrics.recall.toFixed(4) : '-') + '</strong></div>' +
+                  '</div>' +
+                  '<button class="btn btn-outline btn-sm" data-train-name="' + encodeURIComponent(result.best_train_name || '') + '" onclick="loadBestReport(decodeURIComponent(this.dataset.trainName))">{{ _("View full analysis") }}</button>';
+                var saveBtn = document.getElementById('saveReportBtn');
+                if (saveBtn) saveBtn.setAttribute('data-train-name', result.best_train_name || '');
+                bestDiv.classList.remove('hidden');
+              }
+            } else if (data.status === 'running') {
+              tuningStatus.textContent = '[{{ _("运行中") }}] ' + data.message;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        appendLog('{{ _("Training stopped by user") }}', 'warn');
+        tuningStatus.innerHTML = '[{{ _("已取消") }}] {{ _("Training stopped — ") }} <button class="btn btn-outline btn-sm" onclick="location.reload()" style="margin-left:8px;">{{ _("Refresh") }}</button>';
+      } else {
+        appendLog('{{ _("Connection error") }}: ' + err.message, 'error');
+      }
+    } finally {
+      startBtn.style.display = 'inline-flex';
+      stopBtn.style.display = 'none';
+      tuningAbortController = null;
+      // Do NOT reload — keep the tuning log visible for the user (issue #1/#2)
+    }
+  });
+})();
+
+// ── Dataset config save ──
+function saveDatasetConfig() {
+  var data = {};
+  document.querySelectorAll('.ds-param').forEach(function(inp) {
+    var v = inp.value.trim();
+    data[inp.getAttribute('data-key')] = isNaN(Number(v)) ? v : Number(v);
+  });
+  var statusEl = document.getElementById('dsConfigStatus');
+  statusEl.style.display = 'inline';
+  statusEl.textContent = '{{ _("Editing...") }}';
+  statusEl.style.color = 'var(--text-secondary)';
+  fetch('/api/dataset/config', { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data) })
+    .then(function(r){ return r.json(); })
+    .then(function(resp){
+      if (resp.status === 'success') {
+        statusEl.textContent = '{{ _("Config saved") }}';
+        statusEl.style.color = 'var(--success)';
+        setTimeout(function(){ statusEl.style.display = 'none'; }, 3000);
+      } else {
+        statusEl.textContent = '{{ _("Config save failed") }}: ' + (resp.error || '');
+        statusEl.style.color = 'var(--destructive)';
+      }
+    })
+    .catch(function(err){
+      statusEl.textContent = '{{ _("Config save failed") }}: ' + err.message;
+      statusEl.style.color = 'var(--destructive)';
+    });
+}
+
+// ── Training folder analyze ──
+function analyzeTrainingFolder() {
+  var input = document.getElementById('trainingPathInput');
+  var statusEl = document.getElementById('trainingUploadStatus');
+  var resultEl = document.getElementById('trainingAnalysisResult');
+  var contentEl = document.getElementById('trainingAnalysisContent');
+  var btn = document.getElementById('trainingAnalyzeBtn');
+  var path = input.value.trim();
+  if (!path) { alert('请输入训练目录路径'); return; }
+  statusEl.style.display = 'block';
+  statusEl.textContent = '{{ _("Analyzing training results...") }}';
+  statusEl.style.color = 'var(--text-secondary)';
+  resultEl.style.display = 'none';
+  btn.disabled = true;
+  btn.textContent = '{{ _("Analyzing...") }}';
+  fetch('/api/training/analyze-folder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path }),
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(resp){
+      btn.disabled = false;
+      btn.textContent = '{{ _("Analyze") }}';
+      if (resp.status === 'success') {
+        var s = resp.summary;
+        var html =
+          '<table style="margin-top:4px;">' +
+          '<tr><td style="width:120px;">{{ _("Runs Analyzed") }}</td><td><strong>' + s.total_runs + '</strong></td></tr>';
+        if (s.run_name) {
+          html += '<tr><td>{{ _("Run Name") }}</td><td>' + s.run_name + '</td></tr>';
+        }
+        if (s.epochs) {
+          html += '<tr><td>{{ _("Epochs") }}</td><td>' + s.epochs + ' (<span style="color:var(--success);">' + (s.best_epoch || '—') + ' {{ _("best epoch") }}</span>)</td></tr>';
+        }
+        html +=
+          '<tr><td>{{ _("Best mAP50") }}</td><td>' + (s.best_mAP50 || '-') + '</td></tr>' +
+          '<tr><td>{{ _("Avg mAP50") }}</td><td>' + (s.avg_mAP50 || '-') + '</td></tr>' +
+          '<tr><td>{{ _("Runs with Issues") }}</td><td>' + (s.runs_with_issues || '0') + '</td></tr>' +
+          '</table>';
+        if (s.common_issues && s.common_issues.length > 0) {
+          html += '<div style="margin-top:6px; display:flex; gap:4px; flex-wrap:wrap;">';
+          for (var i = 0; i < s.common_issues.length; i++) {
+            html += '<span class="badge badge-yellow">' + s.common_issues[i].type + ' (' + s.common_issues[i].count + ')</span>';
+          }
+          html += '</div>';
+        }
+        contentEl.innerHTML = html;
+        resultEl.style.display = 'block';
+        statusEl.textContent = '{{ _("Analysis complete!") }}';
+        statusEl.style.color = 'var(--success)';
+        setTimeout(function(){ location.reload(); }, 1500);
+      } else {
+        statusEl.textContent = '{{ _("Error") }}: ' + (resp.error || '');
+        statusEl.style.color = 'var(--destructive)';
+      }
+    })
+    .catch(function(err){
+      btn.disabled = false;
+      btn.textContent = '{{ _("Analyze") }}';
+      statusEl.textContent = '{{ _("Connection error") }}: ' + err.message;
+      statusEl.style.color = 'var(--destructive)';
+    });
+}
+
+// ── Training start modal ──
+function showTrainModal() {
+  var modal = document.getElementById('trainModal');
+  if (modal) modal.style.display = 'flex';
+}
+function hideTrainModal() {
+  var modal = document.getElementById('trainModal');
+  if (modal) modal.style.display = 'none';
+}
+document.addEventListener('click', function(e) {
+  if (e.target.id === 'trainModal') hideTrainModal();
+});
+
+var trainingAbortController = null;
+
+function stopFirstTraining() {
+  if (trainingAbortController) {
+    trainingAbortController.abort();
+    trainingAbortController = null;
+  }
+  fetch('/api/training/stop', { method: 'POST' }).catch(function(){});
+  fetch('/tuning/stop', { method: 'POST' }).catch(function(){});
+  // Hide the button after clicking
+  var btn = document.getElementById('stopTrainingBtn');
+  if (btn) btn.style.display = 'none';
+}
+
+function startTraining() {
+  var dataYaml = document.getElementById('trainDataYaml').value.trim();
+  if (!dataYaml) { alert('data.yaml path is required'); return; }
+  var body = JSON.stringify({
+    data_yaml: dataYaml,
+    model: document.getElementById('trainModel').value.trim() || 'yolov8n.pt',
+    epochs: parseInt(document.getElementById('trainEpochs').value) || 100,
+    imgsz: parseInt(document.getElementById('trainImgsz').value) || 640,
+    batch: parseInt(document.getElementById('trainBatch').value) || 16,
+  });
+  hideTrainModal();
+  switchPage(3);
+  var log = document.getElementById('monitorLog');
+  var badge = document.getElementById('statusBadge');
+  var startBtn = document.getElementById('startNewTrainingBtn');
+  var stopBtn = document.getElementById('stopTrainingBtn');
+  var currentEpoch = '';
+  // Append separator instead of clearing (issue #2)
+  if (log) log.innerHTML += '<div class="dim">--- {{ _("Starting training...") }} ---</div>';
+  if (badge) { badge.textContent = 'Running'; badge.className = 'badge badge-yellow'; }
+  if (startBtn) startBtn.style.display = 'none';
+  if (stopBtn) stopBtn.style.display = 'inline-flex';
+  trainingAbortController = new AbortController();
+  fetch('/api/training/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body,
+    signal: trainingAbortController.signal,
+  }).then(function(response) {
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    function readStream() {
+      return reader.read().then(function(result) {
+        if (result.done) return;
+        var text = decoder.decode(result.value, { stream: true });
+        var lines = text.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.startsWith('data: ')) {
+            try {
+              var data = JSON.parse(line.slice(6));
+              if (log) {
+                if (data.status === 'error') {
+                  log.innerHTML += '<div class="destructive">[ERROR] ' + data.message + '</div>';
+                  if (badge) { badge.textContent = 'Failed'; badge.className = 'badge badge-red'; }
+                } else if (data.status === 'done') {
+                  log.innerHTML += '<div class="success">[DONE] ' + data.message + '</div>';
+                  if (badge) { badge.textContent = 'Completed'; badge.className = 'badge badge-green'; }
+                } else if (data.status === 'running') {
+                  // Filter YOLO output: only show epoch metrics and key status
+                  var msg = data.message;
+                  // Strip ANSI escape codes (tqdm uses \x1b[K to clear lines)
+                  msg = msg.replace(/\x1b\[[\d;?]*[a-zA-Z]/g, '');
+                  // YOLO epoch header line: "     1/100      1.2G      1.234 ..."
+                  // YOLO validation metrics: "          all         10        50      0.123 ..."
+                  // tqdm progress updates: "     1/100  ...  50%|████| 5/10 [00:01<00:01,  4.57it/s]"
+                  if (/^\s+\d+\/\d+\s+/.test(msg)) {
+                    // Epoch training loss line — show only once per epoch (dedup tqdm spam)
+                    var parts = msg.trim().split(/\s+/);
+                    if (parts.length >= 4) {
+                      var epochParts = parts[0].split('/');
+                      var newEpoch = epochParts[0];
+                      if (newEpoch !== currentEpoch) {
+                        currentEpoch = newEpoch;
+                        var totalEpochs = epochParts[1] || '';
+                        log.innerHTML += '<div class="info">epoch ' + currentEpoch + '/' + totalEpochs + ': box_loss=' + parts[2] + ' cls_loss=' + parts[3] + (parts[4] ? ' dfl_loss=' + parts[4] : '') + '</div>';
+                      }
+                    } else {
+                      log.innerHTML += '<div class="info">' + msg + '</div>';
+                    }
+                  } else if (/^\s+all\s+\d+/.test(msg)) {
+                    // Validation metrics line
+                    var vparts = msg.trim().split(/\s+/);
+                    if (vparts.length >= 7) {
+                      log.innerHTML += '<div class="success">epoch ' + currentEpoch + ' val: R=' + vparts[4] + ' mAP50=' + vparts[5] + ' mAP50-95=' + vparts[6] + '</div>';
+                    } else {
+                      log.innerHTML += '<div class="success">' + msg + '</div>';
+                    }
+                  } else if (msg.trim() === '') {
+                    // Skip empty lines
+                  } else if (/Class\s+Images\s+Instances/.test(msg)) {
+                    // Skip YOLO validation progress bars ("Class Images Instances Box(P R mAP50 mAP50-95): 50% ...")
+                  } else {
+                    // Show all other YOLO output (model init, warnings, saving, etc.)
+                    log.innerHTML += '<div class="info">' + msg + '</div>';
+                  }
+                }
+                log.scrollTop = log.scrollHeight;
+              }
+            } catch(e) {}
+          }
+        }
+        return readStream();
+      }).catch(function(err) {
+        if (log) log.innerHTML += '<div class="destructive">Stream error: ' + err.message + '</div>';
+        if (badge) { badge.textContent = 'Error'; badge.className = 'badge badge-red'; }
+      });
+    }
+    return readStream();
+  }).catch(function(err) {
+    if (err.name === 'AbortError') {
+      if (log) log.innerHTML += '<div class="warn">[{{ _("已停止") }}] {{ _("Training stopped by user") }}</div>';
+      if (badge) { badge.textContent = '{{ _("已停止") }}'; badge.className = 'badge badge-yellow'; }
+    } else {
+      if (log) log.innerHTML += '<div class="destructive">Connection error: ' + err.message + '</div>';
+      if (badge) { badge.textContent = 'Error'; badge.className = 'badge badge-red'; }
+    }
+  }).finally(function() {
+    if (startBtn) startBtn.style.display = 'inline-flex';
+    if (stopBtn) stopBtn.style.display = 'none';
+    trainingAbortController = null;
+  });
+}
+</script>
+</body>
+</html>

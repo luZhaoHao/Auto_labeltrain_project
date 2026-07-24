@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project: large data / output dirs (keep these out of version control)
+dataset_*/
+train_*/
+new_test_*/
+detect/
+log/uploads/
+log/*.json
+log/*.csv
+log/*.txt
+log/*.md
+
+# Packaging output
+build_output/
+*.tar.gz
+*.zip
+
+# Config with secrets
+auto_tune/config.yaml
+!auto_tune/config.template.yaml
+
+# Ad-hoc test scripts (contain local paths and API key placeholders / history)
+_test_*.py
+test_module_a.py
+
+# Generated test outputs
+_llm_diagnosis.txt
+_vision_output.txt
+
+# Model weights (download on demand via YOLO)
+*.pt
+
+# Claude AI personal config
+.claude/
+
+# Environment
+env/
+*.egg

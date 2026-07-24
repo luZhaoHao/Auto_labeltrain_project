@@ -1,0 +1,283 @@
+{% extends "base.html" %}
+{% block title %}{{ _("Agent Suggestion") }} - YOLOv8 Auto-Tuning{% endblock %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+    <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Agent Suggestion") }}</div>
+</div>
+
+{% if training %}
+<div class="row">
+    <!-- Training Summary -->
+    <div class="col" style="flex: 1;">
+        <div class="card">
+            <div class="card-title" style="margin-bottom:8px;">{{ _("Training Summary") }}</div>
+            {% set s = training.summary %}
+            <table>
+                <tr><td>{{ _("Runs Analyzed") }}</td><td>{{ s.total_runs_analyzed }}</td></tr>
+                <tr><td>{{ _("Best mAP50") }}</td><td><strong>{{ s.best_mAP50 }}</strong> ({{ s.best_overall_run }})</td></tr>
+                <tr><td>{{ _("Avg mAP50") }}</td><td>{{ s.average_mAP50 }}</td></tr>
+                <tr><td>{{ _("Runs with Issues") }}</td><td>{{ s.runs_with_issues }}</td></tr>
+            </table>
+            {% if s.common_issues %}
+            <div style="margin-top:8px; display:flex; gap:4px; flex-wrap:wrap;">
+                {% for issue in s.common_issues %}
+                <span class="badge badge-yellow">{{ issue.type }} ({{ issue.count }})</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Diagnosis & Rationale -->
+{% if latest_suggestion %}
+<div class="row">
+    <div class="col">
+        <div class="callout callout-yellow" style="height:100%;">
+            <div class="callout-label">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                {{ _("Diagnosis") }}
+            </div>
+            <div>{{ latest_suggestion.diagnosis }}</div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="callout callout-blue" style="height:100%;">
+            <div class="callout-label">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                {{ _("Rationale") }}
+            </div>
+            <div>{{ latest_suggestion.rationale }}</div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% set has_changes = latest_suggestion and latest_suggestion.hyperparameter_changes and latest_suggestion.hyperparameter_changes|length > 0 %}
+
+<!-- Hyperparameter Changes -->
+<div class="suggestion-card" style="margin-bottom:16px;">
+    <div class="suggestion-header">
+        <h3>{{ _("Hyperparameter Changes") }}</h3>
+        {% if has_changes %}
+        <span class="badge badge-blue">{{ _("Agent suggests") }} {{ latest_suggestion.hyperparameter_changes|length }} {{ _("change(s)") }}</span>
+        {% endif %}
+    </div>
+
+    {% if has_changes %}
+    <table class="param-table">
+        <tr>
+            <th style="width:110px;">{{ _("Parameter") }}</th>
+            <th style="width:90px;">{{ _("Current") }}</th>
+            <th style="width:32px;"></th>
+            <th style="width:110px;">{{ _("Suggested") }}</th>
+            <th>{{ _("Reason") }}</th>
+        </tr>
+        {% for key, value in latest_suggestion.hyperparameter_changes.items() %}
+        {% if key not in ('diagnosis', 'action') %}
+        <tr>
+            <td class="param-name">{{ key }}</td>
+            <td class="param-old">{{ current_args.get(key, "—") if current_args else "—" }}</td>
+            <td class="param-arrow">&rarr;</td>
+            <td>
+                {% if value is string and value in ['SGD', 'AdamW', 'Adam', 'Adamax', 'NAdam', 'RAdam'] %}
+                <select class="param-select" name="{{ key }}">
+                    {% for opt in ['SGD', 'AdamW', 'Adam', 'Adamax', 'NAdam', 'RAdam'] %}
+                    <option value="{{ opt }}" {% if value == opt %}selected{% endif %}>{{ opt }}</option>
+                    {% endfor %}
+                </select>
+                {% else %}
+                <input class="param-input" type="text" value="{{ value }}" name="{{ key }}">
+                {% endif %}
+            </td>
+            <td style="font-size:12px; color:var(--text-secondary);">
+                {% if loop.index == 1 %}{{ _("Suggested by tuning agent") }}{% else %}—{% endif %}
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+    </table>
+    {% else %}
+    <div style="padding:20px; text-align:center; color:var(--text-muted); font-size:13px;">
+        {{ _("No hyperparameter changes suggested yet.") }} {{ _("Start tuning to get recommendations.") }}
+    </div>
+    {% endif %}
+
+    <!-- Options -->
+    <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--muted); display:flex; gap:16px; flex-wrap:wrap;">
+        <label class="checkbox-row">
+            <input type="checkbox" id="probeMode" name="probe_mode" checked> {{ _("Probe mode (10 epochs first, then decide)") }}
+        </label>
+        <label class="checkbox-row">
+            <input type="checkbox" id="autoAnalyze" name="auto_analyze" checked> {{ _("Auto-analyze after training (Module B)") }}
+        </label>
+        <label class="checkbox-row">
+            <input type="checkbox" id="autoLoop" name="auto_loop"> {{ _("Auto-loop (retrain with new params)") }}
+        </label>
+    </div>
+</div>
+
+<!-- Tuning Form -->
+<div class="row">
+    <div class="col" style="flex: 1;">
+        <div class="card">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+                <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <span style="font-weight:600; font-size:14px;">{{ _("Auto-Tuning Controls") }}</span>
+            </div>
+            <form id="tuningForm">
+                <div style="margin-bottom:12px;">
+                    <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Reference Run") }}</label>
+                    <select name="reference_run" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+                        <option value="">{{ _("Auto-detect") }}</option>
+                        {% for rn in training.runs.keys() %}
+                        <option value="{{ rn }}">{{ rn }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div style="margin-bottom:12px;">
+                    <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Max Retries") }}</label>
+                    <input type="number" name="max_retries" value="3" min="1" max="10" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+                </div>
+                <div style="margin-bottom:12px;">
+                    <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Mode") }}</label>
+                    <select name="mode" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+                        <option value="dry_run">{{ _("Dry-Run (generate plan only)") }}</option>
+                        <option value="full">{{ _("Full Training") }}</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width:100%;" id="startTuningBtn">
+                    <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    {{ _("Confirm & Start Training") }}
+                </button>
+            </form>
+        </div>
+    </div>
+    <div class="col" style="flex: 1;">
+        <!-- Tuning Progress -->
+        <div class="card hidden" id="tuningProgress">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span style="font-weight:600; font-size:14px;">{{ _("Tuning Progress") }}</span>
+            </div>
+            <div id="tuningStatus" class="text-muted mb-2">{{ _("Initializing...") }}</div>
+            <div class="console-log" id="tuningLog">
+                <div class="dim">{{ _("Waiting to start...") }}</div>
+            </div>
+        </div>
+
+        <!-- Tuning History -->
+        {% if tuning_history %}
+        <div class="card">
+            <div class="card-title" style="margin-bottom:10px;">{{ _("Tuning History") }}</div>
+            {% for attempt in tuning_history|reverse %}
+            <div style="padding:8px 0; border-bottom:1px solid var(--muted); font-size:13px;">
+                <div class="flex">
+                    <span class="badge badge-blue">#{{ attempt.iteration }}</span>
+                    {% if attempt.error %}
+                    <span class="badge badge-red">{{ _("Failed") }}</span>
+                    {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+                    <span class="badge badge-green">{{ _("Passed") }}</span>
+                    {% else %}
+                    <span class="badge badge-yellow">{{ _("Retry") }}</span>
+                    {% endif %}
+                    <span class="text-muted" style="font-size:12px;">{{ attempt.timestamp[:10] }}</span>
+                </div>
+                {% if attempt.decision.diagnosis %}
+                <div style="margin-top:4px; color:var(--text-secondary);">{{ attempt.decision.diagnosis[:80] }}{% if attempt.decision.diagnosis|length > 80 %}...{% endif %}</div>
+                {% endif %}
+                {% if attempt.decision.hyperparameter_changes %}
+                <div style="margin-top:4px; font-size:12px; color:var(--text-muted);">
+                    {{ _("Params:") }} {% for k, v in attempt.decision.hyperparameter_changes.items() %}{{ k }}={{ v }} {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+{% else %}
+<div class="card">
+    <div style="text-align:center; padding:40px 20px;">
+        <svg viewBox="0 0 24 24" style="width:48px; height:48px; stroke:var(--text-muted); stroke-width:1.5; fill:none; margin-bottom:12px;" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Training Data Available") }}</div>
+        <div style="font-size:13px; color:var(--text-muted);">{{ _("Please run training analysis (Module B) first.") }}</div>
+    </div>
+</div>
+{% endif %}
+
+<script>
+const tuningForm = document.getElementById('tuningForm');
+const tuningProgress = document.getElementById('tuningProgress');
+const tuningStatus = document.getElementById('tuningStatus');
+const tuningLog = document.getElementById('tuningLog');
+const startBtn = document.getElementById('startTuningBtn');
+
+if (tuningForm) {
+    tuningForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const formData = new FormData(tuningForm);
+
+        startBtn.disabled = true;
+        startBtn.innerHTML = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> {{ _("Running...") }}';
+        tuningProgress.classList.remove('hidden');
+        tuningLog.innerHTML += '<div class="dim">--- {{ _("Starting tuning...") }} ---</div>';
+
+        try {
+            const response = await fetch('/tuning/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    reference_run: formData.get('reference_run') || null,
+                    max_retries: parseInt(formData.get('max_retries')),
+                    mode: formData.get('mode'),
+                    probe_mode: document.getElementById('probeMode').checked,
+                    auto_analyze: document.getElementById('autoAnalyze').checked,
+                    auto_loop: document.getElementById('autoLoop').checked,
+                }),
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const text = decoder.decode(value, { stream: true });
+                for (const line of text.split('\n')) {
+                    if (line.startsWith('data: ')) {
+                        const data = JSON.parse(line.slice(6));
+                        appendLog(data.message, data.level || 'info');
+
+                        if (data.status === 'error') {
+                            tuningStatus.textContent = '[FAILED] ' + data.message;
+                        } else if (data.status === 'done') {
+                            tuningStatus.textContent = '[DONE] {{ _("Tuning complete") }}';
+                        } else if (data.status === 'running') {
+                            tuningStatus.textContent = '[RUNNING] ' + data.message;
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            appendLog('{{ _("Connection error") }}: ' + err.message, 'error');
+        } finally {
+            startBtn.disabled = false;
+            startBtn.innerHTML = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> {{ _("Confirm & Start Training") }}';
+            // Do NOT reload — keep the tuning log visible
+        }
+
+        function appendLog(msg, level) {
+            const div = document.createElement('div');
+            div.className = level;
+            div.textContent = msg;
+            tuningLog.appendChild(div);
+            tuningLog.scrollTop = tuningLog.scrollHeight;
+        }
+    });
+}
+</script>
+{% endblock %}
