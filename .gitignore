@@ -12,10 +12,11 @@ build/
 *.swo
 
 # Project: large data / output dirs (keep these out of version control)
-dataset_*/
-train_*/
-new_test_*/
-detect/
+# Anchored to repo root so nested source dirs (auto_tune/modules/dataset_analyzer, train_analyzer) are NOT ignored
+/dataset_*/
+/train_*/
+/new_test_*/
+/detect/
 log/uploads/
 log/*.json
 log/*.csv
