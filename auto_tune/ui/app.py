@@ -14,6 +14,7 @@ import threading
 import zipfile
 import tempfile
 import shutil
+import datetime
 from pathlib import Path
 from functools import lru_cache
 from fastapi import FastAPI, Request, Query, Cookie, UploadFile, File, Form
@@ -21,9 +22,82 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import yaml
 
+
+def _safe_extract_zip(zf: zipfile.ZipFile, destination: str | Path) -> None:
+    """Extract an archive only when every member stays inside destination."""
+    target = Path(destination).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    for member in zf.infolist():
+        member_path = (target / member.filename).resolve()
+        try:
+            member_path.relative_to(target)
+        except ValueError as exc:
+            raise ValueError(f"unsafe ZIP member path: {member.filename}") from exc
+    zf.extractall(target)
+
+
+from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
+
+
+def _finalize_and_build_event(
+    returncode: int,
+    train_dir: str,
+    train_name: str,
+    config: dict,
+    log_dir: str,
+    started_at: str | None,
+) -> dict:
+    """Finalize a finished training and build the unified SSE completion event."""
+    finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    training_status = "completed" if returncode == 0 else "failed"
+    training_error = None
+    if returncode != 0:
+        if _running_training.get("status") == "aborted":
+            error_type, message = "user_cancelled", "训练被用户取消"
+        else:
+            error_type, message = "training_process_failed", f"训练进程退出码 {returncode}"
+        training_error = {
+            "stage": "training",
+            "error_type": error_type,
+            "message": message,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+    result = finalize_training_run(
+        train_dir,
+        train_name,
+        "manual",
+        config,
+        log_dir=log_dir,
+        training_status=training_status,
+        started_at=started_at,
+        finished_at=finished_at,
+        training_error=training_error,
+    )
+    if result["status"] == "completed" and result["analysis_status"] == "failed":
+        return {
+            "status": "done",
+            "level": "warning",
+            "message": "训练完成，结果分析失败",
+            "result": result,
+        }
+    if result["status"] == "completed":
+        return {
+            "status": "done",
+            "level": "success",
+            "message": f"训练完成: {train_name}",
+            "result": result,
+        }
+    return {
+        "status": "error",
+        "level": "error",
+        "message": f"训练失败 (exit code {returncode})",
+        "result": result,
+    }
+
 from .components.dataset_panel import get_dataset_report, format_dataset_summary
 from .components.train_panel import get_training_report
 from .components.tuning_panel import get_tuning_history, get_tuning_status
+from .components.experiment_panel import get_experiment_history
 from .i18n import make_translator, translate
 
 app = FastAPI(title="Auto-Tune Dashboard")
@@ -132,9 +206,10 @@ def _load_data():
     training = get_training_report()
     project = APP_CONFIG.get("project", {}) if APP_CONFIG else {}
     tuning_history = get_tuning_history()
+    experiment_history = get_experiment_history()
     dataset_analyzer_config = APP_CONFIG.get("dataset_analyzer", {})
 
-    result = (dataset, training, project, tuning_history, dataset_analyzer_config)
+    result = (dataset, training, project, tuning_history, experiment_history, dataset_analyzer_config)
     _set_cache(cache_key, result)
     return result
 
@@ -191,7 +266,7 @@ def _get_current_args(training):
 
 def _common_context():
     """Load all data needed by the SPA template."""
-    dataset, training, project, tuning_history, dataset_analyzer_config = _load_data()
+    dataset, training, project, tuning_history, experiment_history, dataset_analyzer_config = _load_data()
     # Read latest dataset info
     latest_dataset = None
     latest_ds_path = Path("log") / "latest_dataset.json"
@@ -208,6 +283,7 @@ def _common_context():
         "training": training,
         "project": project,
         "tuning_history": tuning_history,
+        "experiment_history": experiment_history,
         "latest_suggestion": _get_latest_suggestion(tuning_history, training),
         "current_args": _get_current_args(training),
         "dataset_analyzer_config": dataset_analyzer_config,
@@ -420,6 +496,21 @@ async def api_training_report_by_name(name: str = Query("")):
         return JSONResponse({"error": f"Module B analysis failed: {e}"}, status_code=500)
 
 
+@app.get("/api/audit/{filename}")
+async def api_audit_record(filename: str):
+    """Return a stored tuning audit record by basename (traversal-safe)."""
+    if filename != os.path.basename(filename) or not filename.startswith("tuning_audit_"):
+        return JSONResponse({"error": "Invalid audit file name"}, status_code=400)
+    path = os.path.join("log", filename)
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "Audit file not found"}, status_code=404)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return JSONResponse(json.load(f))
+    except Exception as exc:
+        return JSONResponse({"error": f"Failed to read audit file: {exc}"}, status_code=500)
+
+
 @app.post("/api/training/save-report-text")
 async def api_training_save_report_text(request: Request):
     """Save the module B analysis report as a TXT file in the training directory."""
@@ -574,6 +665,12 @@ async def api_training_save_report_text(request: Request):
 async def api_tuning_history():
     history = get_tuning_history()
     return JSONResponse(history)
+
+
+@app.get("/api/experiments/history")
+async def api_experiments_history():
+    """Unified experiment history (manual + tuning, incl. legacy) for the UI."""
+    return JSONResponse(get_experiment_history())
 
 
 @app.get("/api/tuning/status")
@@ -829,7 +926,7 @@ async def upload_dataset(file: UploadFile = File(...)):
 
         # Extract
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_path)
+            _safe_extract_zip(zf, extract_path)
         zip_path.unlink()  # remove zip after extraction
 
         # Find dataset root: look for data.yaml or images/ directory
@@ -1383,7 +1480,7 @@ async def _analyze_train_zip(file: UploadFile) -> JSONResponse:
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+            _safe_extract_zip(zf, extract_dir)
 
         # Find results.csv and args.yaml
         run_dir = None
@@ -1720,7 +1817,8 @@ async def start_first_training(request: Request):
                 _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
             # Build yolo command
-            cmd = ["yolo", "train"]
+            from auto_tune.modules.agent_engine.executor import resolve_yolo_executable
+            cmd = [resolve_yolo_executable(), "train"]
             for _k, _v in params.items():
                 cmd.append(f"{_k}={_v}")
 
@@ -1728,7 +1826,8 @@ async def start_first_training(request: Request):
             yield f"data: {_json.dumps({'status': 'running', 'message': f'数据集: {data_yaml}', 'level': 'info'})}\n\n"
             yield f"data: {_json.dumps({'status': 'running', 'message': f'模型: {model}  |  轮次: {epochs}  |  batch: {batch}  |  imgsz: {imgsz}', 'level': 'info'})}\n\n"
 
-            # Launch subprocess
+            # Capture started_at before launch, then launch subprocess
+            start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1743,6 +1842,7 @@ async def start_first_training(request: Request):
                 "train_dir": train_dir,
                 "proc": proc,
                 "start_time": time.time(),
+                "start_iso": start_iso,
                 "status": "running",
             })
             # Also write a status file so it survives reload
@@ -1770,10 +1870,12 @@ async def start_first_training(request: Request):
                 # Remove status file
                 if _os2.path.exists(status_f):
                     _os2.remove(status_f)
-                yield f"data: {_json.dumps({'status': 'done', 'message': f'训练完成: {train_name}', 'level': 'success', 'result': {'train_name': train_name}})}\n\n"
             else:
                 _running_training["status"] = "failed"
-                yield f"data: {_json.dumps({'status': 'error', 'message': f'训练失败 (exit code {proc.returncode})', 'level': 'error'})}\n\n"
+            event = _finalize_and_build_event(
+                proc.returncode, train_dir, train_name, APP_CONFIG, "log", _running_training.get("start_iso")
+            )
+            yield f"data: {_json.dumps(event, ensure_ascii=False, default=str)}\n\n"
 
         except Exception as _exc:
             yield f"data: {_json.dumps({'status': 'error', 'message': f'异常: {_exc}', 'level': 'error'})}\n\n"

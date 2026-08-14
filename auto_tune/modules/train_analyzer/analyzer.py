@@ -34,6 +34,7 @@ def analyze_training_results(detect_dir: str, config: dict,
     """
     # Project context — extracted upfront so it flows into every return path
     project_info = config.get("project", {}) if isinstance(config, dict) else {}
+    analysis_config = config.get("train_analyzer", config) if isinstance(config, dict) else {}
 
     if not os.path.isdir(detect_dir):
         return {
@@ -102,15 +103,17 @@ def analyze_training_results(detect_dir: str, config: dict,
             continue
 
         # Curve analysis
-        curve_analysis = analyze_loss_curves(run_data["results"], config)
-        metric_analysis = analyze_metric_curves(run_data["results"], config)
+        curve_analysis = analyze_loss_curves(run_data["results"], analysis_config)
+        metric_analysis = analyze_metric_curves(run_data["results"], analysis_config)
 
         # Early stopping analysis
-        early_stop = detect_early_stopping(run_data, config)
+        early_stop_input = dict(run_data["results"])
+        early_stop_input["args"] = run_data.get("args", {})
+        early_stop = detect_early_stopping(early_stop_input, analysis_config)
         curve_analysis["early_stopping"] = early_stop
 
         # Issue detection
-        issues = detect_issues(run_data, config)
+        issues = detect_issues(run_data, analysis_config)
         run_data["_issues"] = issues
 
         run_data["curve_analysis"] = curve_analysis
@@ -121,8 +124,8 @@ def analyze_training_results(detect_dir: str, config: dict,
         run_results[run_data["name"]] = run_data
 
     # Cross-run comparison
-    comparison = compare_runs(runs, config)
-    summary = summarize_runs(runs, config)
+    comparison = compare_runs(runs, analysis_config)
+    summary = summarize_runs(runs, analysis_config)
 
     # Build clean output (remove internal keys)
     output_runs = {}

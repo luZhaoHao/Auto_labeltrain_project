@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul
 title Auto-Tune 打包工具 (conda-pack)
 
@@ -12,6 +12,31 @@ set ROOT=%~dp0
 set OUTPUT=%ROOT%build_output
 set PACKAGE_DIR=%OUTPUT%\AutoTune_Package
 
+:: ---- 自动检测 conda 路径 ----
+set CONDA_CMD=conda
+where conda >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo [信息] conda 不在 PATH 中，正在搜索常见安装路径...
+    set CONDA_CMD=
+    if exist "D:\Program Files\anaconda3\Scripts\conda.exe" set "CONDA_CMD=D:\Program Files\anaconda3\Scripts\conda.exe"
+    if exist "D:\Program Files\Anaconda3\Scripts\conda.exe" set "CONDA_CMD=D:\Program Files\Anaconda3\Scripts\conda.exe"
+    if exist "%ProgramData%\anaconda3\Scripts\conda.exe" set "CONDA_CMD=%ProgramData%\anaconda3\Scripts\conda.exe"
+    if exist "%ProgramFiles%\anaconda3\Scripts\conda.exe" set "CONDA_CMD=%ProgramFiles%\anaconda3\Scripts\conda.exe"
+    if exist "%USERPROFILE%\anaconda3\Scripts\conda.exe" set "CONDA_CMD=%USERPROFILE%\anaconda3\Scripts\conda.exe"
+    if exist "%LOCALAPPDATA%\anaconda3\Scripts\conda.exe" set "CONDA_CMD=%LOCALAPPDATA%\anaconda3\Scripts\conda.exe"
+    if not defined CONDA_CMD (
+        echo [错误] 找不到 conda！
+        echo.
+        echo       请尝试以下方法之一：
+        echo       1. 从开始菜单打开 "Anaconda Prompt"，然后运行此脚本
+        echo       2. 手动设置 CONDA_CMD 环境变量指向 conda.exe
+        echo.
+        pause
+        exit /b 1
+    )
+    echo [OK] 找到 conda: %CONDA_CMD%
+)
+
 :: 清理上次构建
 if exist "%OUTPUT%" rmdir /s /q "%OUTPUT%"
 mkdir "%OUTPUT%"
@@ -19,10 +44,10 @@ mkdir "%PACKAGE_DIR%"
 
 :: ---- Step 1: 检查 conda-pack ----
 echo [1/4] 检查 conda-pack...
-pip show conda-pack >nul 2>&1
+"%CONDA_CMD%" run -n auto_tune pip show conda-pack >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [信息] 正在安装 conda-pack...
-    pip install conda-pack
+    "%CONDA_CMD%" install -n auto_tune conda-pack -y
     if %ERRORLEVEL% NEQ 0 (
         echo [错误] conda-pack 安装失败
         pause
@@ -34,7 +59,7 @@ echo [OK] conda-pack 就绪
 :: ---- Step 2: 打包 conda 环境 ----
 echo [2/4] 正在打包 conda 环境 (auto_tune)...
 echo       此步骤耗时 1~3 分钟，生成的包约 5~15 GB...
-conda pack -n auto_tune -o "%PACKAGE_DIR%\auto_tune_env.tar.gz" --force
+"%CONDA_CMD%" pack -n auto_tune -o "%PACKAGE_DIR%\auto_tune_env.tar.gz" --force
 if %ERRORLEVEL% NEQ 0 (
     echo [错误] conda pack 失败
     pause

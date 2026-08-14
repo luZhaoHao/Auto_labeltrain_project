@@ -5,7 +5,10 @@ Invalid values are clamped with a warning; conflicting combinations raise errors
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
+
+from .parameter_registry import PARAMETER_REGISTRY
 
 # ── Parameter bounds ──────────────────────────────────────────────
 BOUNDS: dict[str, tuple[float, float]] = {
@@ -68,6 +71,7 @@ class GuardResult:
     clamped: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 def validate_and_clamp(params: dict[str, Any], dataset_info: dict | None = None) -> GuardResult:
@@ -163,6 +167,79 @@ def validate_and_clamp(params: dict[str, Any], dataset_info: dict | None = None)
             result.errors.append(f"'{key}' has unsupported type {type(value).__name__}")
 
     result.valid = len(result.errors) == 0
+    result.params = {k: v for k, v in clamped.items() if not k.startswith("_")}
+    return result
+
+
+def _normalize_value(key: str, value: Any, result: GuardResult) -> Any:
+    """Normalize one LLM value according to the central parameter registry."""
+    spec = PARAMETER_REGISTRY[key]
+    if spec.kind in {"int", "float"}:
+        if isinstance(value, bool):
+            result.errors.append(f"'{key}' must be numeric, not bool")
+            return None
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            result.errors.append(f"'{key}' must be numeric")
+            return None
+        if not math.isfinite(normalized):
+            result.errors.append(f"'{key}' must be finite")
+            return None
+        normalized = max(spec.minimum, min(spec.maximum, normalized))
+        if normalized != float(value):
+            result.warnings.append(f"'{key}'={value} clamped to {normalized}")
+            result.clamped[key] = int(normalized) if spec.kind == "int" else normalized
+        return int(round(normalized)) if spec.kind == "int" else normalized
+    if spec.kind == "choice":
+        if not isinstance(value, str) or value not in spec.choices:
+            result.errors.append(f"'{key}' must be one of {sorted(spec.choices)}")
+            return None
+        return value
+    if spec.kind == "bool":
+        if not isinstance(value, bool):
+            result.errors.append(f"'{key}' must be bool")
+            return None
+        return value
+    if spec.kind == "string":
+        if not isinstance(value, str) or not value.strip():
+            result.errors.append(f"'{key}' must be a non-empty string")
+            return None
+        return value.strip()
+    result.errors.append(f"Unsupported parameter type for '{key}'")
+    return None
+
+
+def sanitize_tuning_parameters(
+    hyperparameter_changes: dict[str, Any],
+    training_overrides: dict[str, Any] | None = None,
+    dataset_info: dict | None = None,
+) -> GuardResult:
+    """Validate both LLM parameter sections and return the only executable values."""
+    result = GuardResult()
+    candidate = dict(hyperparameter_changes or {})
+    candidate.update(training_overrides or {})
+    normalized: dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key not in PARAMETER_REGISTRY:
+            result.errors.append(f"Unknown parameter '{key}'")
+            continue
+        converted = _normalize_value(key, value, result)
+        if converted is not None:
+            normalized[key] = converted
+
+    if normalized.get("optimizer") == "auto" and ({"lr0", "momentum"} & normalized.keys()):
+        result.errors.append("optimizer=auto causes Ultralytics to ignore explicit lr0/momentum")
+
+    if normalized.get("optimizer", "").upper() == "ADAMW" and normalized.get("lr0", 0.0) > 0.005:
+        result.warnings.append("AdamW with lr0 > 0.005 may be unstable")
+
+    if dataset_info and 0 < dataset_info.get("total_images", 0) < 500:
+        if normalized.get("mosaic", 0) > 0.5:
+            result.warnings.append("Small dataset with mosaic > 0.5 may underfit")
+
+    result.params = normalized
+    result.valid = not result.errors
     return result
 
 

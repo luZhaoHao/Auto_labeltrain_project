@@ -9,11 +9,31 @@ Supports:
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 import yaml
 from typing import Any
 from pathlib import Path
+
+
+def resolve_yolo_executable() -> str:
+    """Resolve YOLO from PATH or the active Python environment."""
+    found = shutil.which("yolo")
+    if found:
+        return found
+    candidates = (
+        Path(sys.prefix) / "Scripts" / "yolo.exe",
+        Path(sys.prefix) / "Scripts" / "yolo",
+        Path(sys.prefix) / "bin" / "yolo",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError(
+        f"YOLO executable not found in PATH or Python environment: {sys.prefix}"
+    )
 
 
 def find_detect_dir(base_dir: str = ".") -> str:
@@ -140,6 +160,50 @@ def prepare_training(
     return train_name, args_path
 
 
+def validate_training_preflight(
+    reference_run: str | None,
+    reference_dir: str | None,
+    merged_params: dict,
+) -> list[str]:
+    """Validate training prerequisites deterministically.
+
+    Returns a list of human-readable errors; empty list means valid.
+    Never raises for validation failures.
+    """
+    errors: list[str] = []
+
+    if reference_run:
+        if not reference_dir or not os.path.isdir(reference_dir):
+            errors.append(f"Reference directory missing: {reference_dir}")
+        else:
+            args_path = os.path.join(reference_dir, "args.yaml")
+            if not (os.path.isfile(args_path) and os.access(args_path, os.R_OK)):
+                errors.append(f"Reference args.yaml missing or unreadable: {args_path}")
+
+    model = merged_params.get("model")
+    if not isinstance(model, str) or not model.strip():
+        errors.append("Model must be a non-empty string")
+    else:
+        is_local = os.path.isabs(model) or ("/" in model) or ("\\" in model)
+        if is_local and not os.path.exists(model):
+            errors.append(f"Model file not found: {model}")
+
+    data = merged_params.get("data")
+    if not isinstance(data, str) or not data.strip():
+        errors.append("Data YAML must be a non-empty string")
+    elif not (data.endswith(".yaml") or data.endswith(".yml")):
+        errors.append(f"Data path must be a .yaml/.yml file: {data}")
+    elif not (os.path.isfile(data) and os.access(data, os.R_OK)):
+        errors.append(f"Data YAML missing or unreadable: {data}")
+
+    try:
+        resolve_yolo_executable()
+    except Exception as exc:
+        errors.append(f"YOLO executable unavailable: {exc}")
+
+    return errors
+
+
 def build_yolo_command(train_name: str, args_path: str, merged_params: dict) -> list[str]:
     """Build the YOLO training command.
 
@@ -151,7 +215,7 @@ def build_yolo_command(train_name: str, args_path: str, merged_params: dict) -> 
     Returns:
         Command list for subprocess.
     """
-    cmd = ["yolo", "train"]
+    cmd = [resolve_yolo_executable(), "train"]
 
     # Map merged params to CLI args
     param_map = {
@@ -225,18 +289,26 @@ def build_yolo_command(train_name: str, args_path: str, merged_params: dict) -> 
     return cmd
 
 
-def launch_training(train_name: str, args_path: str, merged_params: dict) -> subprocess.Popen:
+def launch_training(
+    train_name: str,
+    args_path: str,
+    merged_params: dict,
+    command: list[str] | None = None,
+) -> subprocess.Popen:
     """Launch a YOLO training subprocess.
 
     Args:
         train_name: training name.
         args_path: path to config.
         merged_params: merged training params.
+        command: exact prebuilt command to launch; when None, build it here.
 
     Returns:
         Popen process handle.
     """
-    cmd = build_yolo_command(train_name, args_path, merged_params)
+    cmd = list(command) if command is not None else build_yolo_command(
+        train_name, args_path, merged_params
+    )
     print(f"[Executor] Launching: {' '.join(cmd)}")
 
     # Redirect stdout/stderr to a log file to prevent pipe buffer deadlock
