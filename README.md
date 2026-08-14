@@ -344,7 +344,8 @@ environment.yml                       # Conda 环境
 
 - [项目路线规划](docs/roadmap_20260814.md)
 - [后续实施计划](docs/implementation_plan_20260814.md)
-- [统一训练收尾设计](docs/superpowers/specs/2026-08-14-unified-training-finalization-design.md)
+- [当前开发交接记录](docs/development_handoff_20260814.md)
+- [操作工手册](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C.md)
 
 ## GitHub 安全边界
 
