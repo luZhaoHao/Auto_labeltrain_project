@@ -115,3 +115,39 @@ def test_analyze_training_results_output_structure(tmp_path):
 def test_analyze_training_results_specific_run_not_found(tmp_path):
     result = analyze_training_results(str(tmp_path), {}, run_name="train_ghost")
     assert "error" in result
+
+
+def test_analyzer_uses_nested_train_analyzer_thresholds(tmp_path):
+    """Catches full config being passed where the analyzer expects its subsection."""
+    _create_run(tmp_path, "train")
+    config = {
+        "project": {"name": "test"},
+        "train_analyzer": {
+            "min_acceptable_map": 0.1,
+            "stale_threshold": 15,
+            "plateau_epochs": 10,
+        },
+    }
+
+    result = analyze_training_results(
+        str(tmp_path), config, run_name="train", enable_llm=False, enable_vision=False
+    )
+    issue_types = {issue["type"] for issue in result["runs"]["train"]["issues"]}
+
+    assert "low_final_map" not in issue_types
+    assert result["project"]["name"] == "test"
+
+
+def test_orchestrator_reports_early_stop_using_run_args(tmp_path):
+    """Catches detect_early_stopping receiving run_data at the wrong level."""
+    _create_run(tmp_path, "train")
+
+    result = analyze_training_results(
+        str(tmp_path), {"train_analyzer": {}}, run_name="train",
+        enable_llm=False, enable_vision=False,
+    )
+    early = result["runs"]["train"]["curve_analysis"]["early_stopping"]
+
+    assert early["actual_epochs"] == 3
+    assert early["planned_epochs"] == 100
+    assert early["stopped_early"] is True

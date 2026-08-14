@@ -1128,7 +1128,7 @@
   <div class="col">
     <div class="card" style="text-align:center;">
       <div class="card-title">{{ _("Epochs") }}</div>
-      <div class="card-value" style="font-size:22px;">
+      <div class="card-value" id="monitorEpochs" style="font-size:22px;">
         {% if latest_args %}{{ latest_args.epochs }}{% else %}—{% endif %}
       </div>
       <div class="card-desc">{{ _("Configured") }}</div>
@@ -1137,7 +1137,7 @@
   <div class="col">
     <div class="card" style="text-align:center;">
       <div class="card-title">{{ _("Best mAP50") }}</div>
-      <div class="card-value" style="font-size:22px; {% if latest_metrics %}color:var(--success){% endif %};">
+      <div class="card-value" id="monitorMap50" style="font-size:22px; {% if latest_metrics %}color:var(--success){% endif %};">
         {% if latest_metrics %}
         {{ "%.4f"|format(latest_metrics.get("metrics/mAP50(B)", 0)) }}
         {% else %}—{% endif %}
@@ -1148,7 +1148,7 @@
   <div class="col">
     <div class="card" style="text-align:center;">
       <div class="card-title">{{ _("mAP50-95") }}</div>
-      <div class="card-value" style="font-size:22px;">
+      <div class="card-value" id="monitorMap5095" style="font-size:22px;">
         {% if latest_metrics %}
         {{ "%.4f"|format(latest_metrics.get("metrics/mAP50-95(B)", 0)) }}
         {% else %}—{% endif %}
@@ -1159,7 +1159,7 @@
   <div class="col">
     <div class="card" style="text-align:center;">
       <div class="card-title">{{ _("Precision / Recall") }}</div>
-      <div class="card-value" style="font-size:18px; color:var(--text-secondary);">
+      <div class="card-value" id="monitorPR" style="font-size:18px; color:var(--text-secondary);">
         {% if latest_metrics %}
         {{ "%.3f"|format(latest_metrics.get("metrics/precision(B)", 0)) }} / {{ "%.3f"|format(latest_metrics.get("metrics/recall(B)", 0)) }}
         {% else %}—{% endif %}
@@ -1167,6 +1167,10 @@
       <div class="card-desc">{{ _("Precision / Recall") }}</div>
     </div>
   </div>
+</div>
+
+<div style="margin-top:8px;">
+  <a id="monitorReportLink" href="#" target="_blank" class="btn btn-outline btn-sm" style="display:none;">{{ _("View Report") }}</a>
 </div>
 
 <div class="row">
@@ -1275,82 +1279,139 @@
   <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training History") }}</div>
 </div>
 
-{% if tuning_history and tuning_history|length > 0 %}
+{% if experiment_history and experiment_history|length > 0 %}
+<div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap;">
+  <select id="historySourceFilter" style="width:auto;" onchange="filterHistory()">
+    <option value="">{{ _("All Sources") }}</option>
+    <option value="manual">{{ _("Manual Training") }}</option>
+    <option value="tuning">{{ _("Auto-Tuning") }}</option>
+  </select>
+  <select id="historyStatusFilter" style="width:auto;" onchange="filterHistory()">
+    <option value="">{{ _("All Statuses") }}</option>
+    <option value="completed">{{ _("Completed") }}</option>
+    <option value="failed">{{ _("Failed") }}</option>
+    <option value="cancelled">{{ _("Cancelled") }}</option>
+  </select>
+</div>
 <div class="card" style="padding:0; overflow-x:auto;">
   <table>
     <tr>
-      <th style="width:40px;">{{ _("#") }}</th>
+      <th>{{ _("Source") }}</th>
+      <th>{{ _("Run Name") }}</th>
+      <th>{{ _("Model") }}</th>
+      <th>{{ _("Training Status") }}</th>
+      <th>{{ _("Analysis Status") }}</th>
+      <th>mAP50</th>
+      <th>mAP50-95</th>
+      <th>Precision</th>
+      <th>Recall</th>
+      <th>{{ _("Epochs") }}</th>
       <th>{{ _("Time") }}</th>
-      <th>{{ _("Diagnosis") }}</th>
-      <th>{{ _("Changes") }}</th>
-      <th>{{ _("Status") }}</th>
       <th style="width:60px;">{{ _("View") }}</th>
     </tr>
-    {% for attempt in tuning_history|reverse %}
-    <tr style="cursor:pointer;">
-      <td><span class="badge badge-blue">#{{ attempt.iteration }}</span></td>
-      <td style="font-size:12px; color:var(--text-secondary);">{{ attempt.timestamp[:16] }}</td>
-      <td style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px;">
-        {{ attempt.decision.diagnosis[:60] if attempt.decision and attempt.decision.diagnosis else "—" }}
+    {% for exp in experiment_history %}
+    <tr class="history-row" data-source="{{ exp.source }}" data-status="{{ exp.status }}" data-detail="exp_details_{{ loop.index0 }}" style="cursor:pointer;">
+      <td>
+        {% if exp.source == "tuning" %}<span class="badge badge-purple">{{ _("Auto-Tuning") }}</span>
+        {% else %}<span class="badge badge-blue">{{ _("Manual Training") }}</span>{% endif %}
       </td>
-      <td style="font-size:12px; color:var(--text-muted); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-        {% if attempt.decision and attempt.decision.hyperparameter_changes %}
-          {% for k, v in attempt.decision.hyperparameter_changes.items() %}
-            {{ k }}={{ v }}{% if not loop.last %} {% endif %}
-          {% endfor %}
-        {% else %}—{% endif %}
+      <td style="font-weight:600;">{{ exp.run_name or "—" }}</td>
+      <td style="font-size:12px;">{{ (exp.params or {}).get("model", "—") }}</td>
+      <td>
+        {% if exp.status == "completed" %}<span class="badge badge-green">{{ _("Completed") }}</span>
+        {% elif exp.status == "cancelled" %}<span class="badge badge-yellow">{{ _("Cancelled") }}</span>
+        {% else %}<span class="badge badge-red">{{ _("Failed") }}</span>{% endif %}
       </td>
       <td>
-        {% if attempt.error %}
-        <span class="badge badge-red">{{ _("Failed") }}</span>
-        {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
-        <span class="badge badge-green">{{ _("Passed") }}</span>
-        {% else %}
-        <span class="badge badge-yellow">{{ _("Retry") }}</span>
-        {% endif %}
+        {% if exp.analysis_status == "completed" %}<span class="badge badge-green">{{ _("Completed") }}</span>
+        {% elif exp.analysis_status == "failed" %}<span class="badge badge-red">{{ _("Analysis Failed") }}</span>
+        {% else %}<span class="badge badge-yellow">{{ _("Skipped") }}</span>{% endif %}
       </td>
+      <td>{{ "%.4f"|format(exp.metrics.get("mAP50")) if exp.metrics and exp.metrics.get("mAP50") is not none else "—" }}</td>
+      <td>{{ "%.4f"|format(exp.metrics.get("mAP50_95")) if exp.metrics and exp.metrics.get("mAP50_95") is not none else "—" }}</td>
+      <td>{{ "%.4f"|format(exp.metrics.get("precision")) if exp.metrics and exp.metrics.get("precision") is not none else "—" }}</td>
+      <td>{{ "%.4f"|format(exp.metrics.get("recall")) if exp.metrics and exp.metrics.get("recall") is not none else "—" }}</td>
+      <td>{% if exp.epochs is mapping %}{{ exp.epochs.get("completed") if exp.epochs.get("completed") is not none else "—" }}{% if exp.epochs.get("best") is not none %} (best {{ exp.epochs.get("best") }}){% endif %}{% else %}—{% endif %}</td>
+      <td style="font-size:12px; color:var(--text-secondary);">{{ (exp.finished_at or "")[:16] }}</td>
       <td>
-        <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); toggleDetails('details_{{ loop.index0 }}')">{{ _("Details") }}</button>
+        <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); toggleDetails('exp_details_{{ loop.index0 }}')">{{ _("Details") }}</button>
       </td>
     </tr>
-    <tr id="details_{{ loop.index0 }}" style="display:none;">
-      <td colspan="6" style="padding:16px 24px; background:#F8FAFC;">
+    <tr id="exp_details_{{ loop.index0 }}" class="history-details" style="display:none;">
+      <td colspan="12" style="padding:16px 24px; background:#F8FAFC;">
         <div style="display:flex; gap:16px; flex-wrap:wrap;">
           <div style="flex:1; min-width:200px;">
-            <div class="card-title" style="margin-bottom:4px;">{{ _("Full Diagnosis") }}</div>
-            <div style="font-size:13px; color:var(--text-secondary); line-height:1.6;">
-              {{ attempt.decision.diagnosis if attempt.decision and attempt.decision.diagnosis else "—" }}
-            </div>
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Dataset") }}</div>
+            <div style="font-size:13px; color:var(--text-secondary); word-break:break-all;">{{ (exp.params or {}).get("data", "—") }}</div>
           </div>
           <div style="flex:1; min-width:200px;">
-            <div class="card-title" style="margin-bottom:4px;">{{ _("Hyperparameter Changes") }}</div>
-            {% if attempt.decision and attempt.decision.hyperparameter_changes %}
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Parameters") }}</div>
+            {% if exp.params %}
             <table style="font-size:12px;">
+              {% for k in ["model", "data", "epochs", "batch", "imgsz", "optimizer", "lr0", "device"] %}
+                {% if exp.params.get(k) is not none %}
+                <tr><td>{{ k }}</td><td style="word-break:break-all;">{{ exp.params.get(k) }}</td></tr>
+                {% endif %}
+              {% endfor %}
+            </table>
+            {% else %}—{% endif %}
+          </div>
+          {% if exp.source == "tuning" %}
+          {% set tuning = exp.tuning if exp.tuning is mapping else {} %}
+          {% set decision = tuning.decision if tuning and tuning.decision is mapping else (exp.decision if exp.decision is mapping else {}) %}
+          <div style="flex:1; min-width:200px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("AI Diagnosis") }}</div>
+            <div style="font-size:13px; color:var(--text-secondary);">{{ decision.diagnosis or "—" }}</div>
+            {% set changes = decision.hyperparameter_changes or {} %}
+            {% if changes %}
+            <table style="font-size:12px; margin-top:8px;">
               <tr><th>{{ _("Parameter") }}</th><th>{{ _("Value") }}</th></tr>
-              {% for k, v in attempt.decision.hyperparameter_changes.items() %}
+              {% for k, v in changes.items() %}
               <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
               {% endfor %}
             </table>
             {% else %}
-            <span class="text-muted">{{ _("No hyperparameter changes") }}</span>
+            <div style="font-size:13px; color:var(--text-muted); margin-top:8px;">{{ _("Keep Original Parameters") }}</div>
             {% endif %}
+          </div>
+          <div style="flex:1; min-width:200px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Guardrails") }}</div>
+            {% if tuning and tuning.guardrails is mapping %}
+            {% set guard = tuning.guardrails %}
+            {% if guard.valid %}
+            <span class="badge badge-green">{{ _("Passed") }}</span>
+            {% else %}
+            <span class="badge badge-red">{{ _("Rejected") }}</span>
+            {% endif %}
+            {% if guard.errors %}
+            <div style="font-size:12px; color:var(--danger); margin-top:6px;">{% for e in guard.errors %}{{ e }}<br>{% endfor %}</div>
+            {% endif %}
+            {% if guard.warnings %}
+            <div style="font-size:12px; color:var(--warning); margin-top:6px;">{% for w in guard.warnings %}{{ w }}<br>{% endfor %}</div>
+            {% endif %}
+            {% if guard.clamped %}
+            <table style="font-size:12px; margin-top:8px;">
+              <tr><th>{{ _("Parameter") }}</th><th>{{ _("Clamped Value") }}</th></tr>
+              {% for k, v in guard.clamped.items() %}
+              <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              {% endfor %}
+            </table>
+            {% endif %}
+            {% else %}—{% endif %}
           </div>
           <div style="flex:1; min-width:150px;">
-            <div class="card-title" style="margin-bottom:4px;">{{ _("Guardrails") }}</div>
-            {% if attempt.guard_results %}
-              {% if attempt.guard_results.warnings %}
-              <div style="font-size:12px; color:var(--warning);">{{ _("Warnings:") }} {{ attempt.guard_results.warnings|length }}</div>
-              {% endif %}
-              {% if attempt.guard_results.errors %}
-              <div style="font-size:12px; color:var(--destructive);">{{ _("Errors:") }} {{ attempt.guard_results.errors|length }}</div>
-              {% endif %}
-              {% if not attempt.guard_results.warnings and not attempt.guard_results.errors %}
-              <span class="text-muted" style="font-size:12px;">{{ _("All checks passed") }}</span>
-              {% endif %}
-            {% else %}
-              <span class="text-muted" style="font-size:12px;">{{ _("No guardrails data") }}</span>
-            {% endif %}
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Audit") }}</div>
+            {% if exp.audit_filename %}
+            <a href="/api/audit/{{ exp.audit_filename }}" target="_blank" class="btn btn-outline btn-sm">{{ _("View Audit Record") }}</a>
+            {% else %}—{% endif %}
           </div>
+          {% endif %}
+          {% if exp.artifacts and exp.artifacts.report_path %}
+          <div style="flex:1; min-width:150px;">
+            <div class="card-title" style="margin-bottom:4px;">{{ _("Artifacts") }}</div>
+            <a href="/api/training/report-by-name?name={{ exp.run_name }}" target="_blank" class="btn btn-outline btn-sm">{{ _("View Report") }}</a>
+          </div>
+          {% endif %}
         </div>
       </td>
     </tr>
@@ -1373,7 +1434,7 @@
     <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
     {{ _("Refresh") }}
   </button>
-  <a href="/api/tuning/history" target="_blank" class="btn btn-outline btn-sm">
+  <a href="/api/experiments/history" target="_blank" class="btn btn-outline btn-sm">
     <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle;" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
     {{ _("Export JSON") }}
   </a>
@@ -1495,6 +1556,24 @@ function toggleDetails(id) {
   if (row) {
     row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
   }
+}
+
+function filterHistory() {
+  var sourceEl = document.getElementById('historySourceFilter');
+  var statusEl = document.getElementById('historyStatusFilter');
+  var source = sourceEl ? sourceEl.value : '';
+  var status = statusEl ? statusEl.value : '';
+  var rows = document.querySelectorAll('#page4 .history-row');
+  rows.forEach(function(row) {
+    var show = (!source || row.getAttribute('data-source') === source) &&
+               (!status || row.getAttribute('data-status') === status);
+    row.style.display = show ? '' : 'none';
+    var detailId = row.getAttribute('data-detail');
+    if (detailId) {
+      var detail = document.getElementById(detailId);
+      if (detail) detail.style.display = 'none';
+    }
+  });
 }
 
 // ── Language toggle: redirect back ──
@@ -2153,8 +2232,26 @@ function startTraining() {
                   log.innerHTML += '<div class="destructive">[ERROR] ' + data.message + '</div>';
                   if (badge) { badge.textContent = 'Failed'; badge.className = 'badge badge-red'; }
                 } else if (data.status === 'done') {
-                  log.innerHTML += '<div class="success">[DONE] ' + data.message + '</div>';
-                  if (badge) { badge.textContent = 'Completed'; badge.className = 'badge badge-green'; }
+                  var warn = data.level === 'warning';
+                  log.innerHTML += '<div class="' + (warn ? 'warn' : 'success') + '">[DONE] ' + data.message + '</div>';
+                  if (badge) { badge.textContent = warn ? 'Warning' : 'Completed'; badge.className = warn ? 'badge badge-yellow' : 'badge badge-green'; }
+                  var result = data.result || {};
+                  var m = result.metrics || {};
+                  var epochsEl = document.getElementById('monitorEpochs');
+                  var map50El = document.getElementById('monitorMap50');
+                  var map5095El = document.getElementById('monitorMap5095');
+                  var prEl = document.getElementById('monitorPR');
+                  if (epochsEl && result.epochs != null) epochsEl.textContent = result.epochs;
+                  if (map50El && m.mAP50 != null) map50El.textContent = Number(m.mAP50).toFixed(4);
+                  if (map5095El && m.mAP50_95 != null) map5095El.textContent = Number(m.mAP50_95).toFixed(4);
+                  if (prEl && m.precision != null && m.recall != null) {
+                    prEl.textContent = Number(m.precision).toFixed(3) + ' / ' + Number(m.recall).toFixed(3);
+                  }
+                  var reportLink = document.getElementById('monitorReportLink');
+                  if (reportLink && result.artifacts && result.artifacts.report_path) {
+                    reportLink.href = '/api/training/report-by-name?name=' + encodeURIComponent(result.run_name || '');
+                    reportLink.style.display = '';
+                  }
                 } else if (data.status === 'running') {
                   // Filter YOLO output: only show epoch metrics and key status
                   var msg = data.message;
@@ -2189,8 +2286,8 @@ function startTraining() {
                     // Skip empty lines
                   } else if (/Class\s+Images\s+Instances/.test(msg)) {
                     // Skip YOLO validation progress bars ("Class Images Instances Box(P R mAP50 mAP50-95): 50% ...")
-                  } else {
-                    // Show all other YOLO output (model init, warnings, saving, etc.)
+                  } else if (/^(启动训练|数据集:|模型:|Starting training|Results saved|\[WARN\]|WARNING)/i.test(msg.trim())) {
+                    // Keep only actionable lifecycle messages in the default console.
                     log.innerHTML += '<div class="info">' + msg + '</div>';
                   }
                 }

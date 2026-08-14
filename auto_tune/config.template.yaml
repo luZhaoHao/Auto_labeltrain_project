@@ -1,14 +1,14 @@
 project:
-  name: 项目名称（如：PCB缺陷检测）
-  description: 项目描述（如：PCB焊点缺陷检测）
-  detection_target: 检测目标类型（如：缺陷、物体、文字）
-  data_type: 数据类型（如：缺陷、分类、检测）
+  name: 口服液瓶盖瑕疵检测
+  description: 瓶盖侧边的
+  detection_target: 口服液瓶盖侧边铝盖上缺陷，划痕、破损、翘边、锁边没锁好和连接处断裂
+  data_type: 缺陷
   extra: {}
   data_yaml: ''
   model: yolov8n.pt
 llm:
   provider: deepseek
-  api_key: YOUR_DEEPSEEK_API_KEY_HERE
+  api_key: YOUR_DEEPSEEK_API_KEY        # <-- 在此填入你的 DeepSeek API Key
   model: deepseek-chat
   endpoint: https://api.deepseek.com/v1/chat/completions
   temperature: 0.3
@@ -16,7 +16,7 @@ llm:
   enabled: true
 vision:
   provider: qwen
-  api_key: YOUR_QWEN_VL_API_KEY_HERE
+  api_key: YOUR_QWEN_API_KEY            # <-- 在此填入你的 通义千问 API Key
   model: qwen-vl-plus
   endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
   temperature: 0.3

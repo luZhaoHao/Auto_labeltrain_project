@@ -6,7 +6,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 请用中文回答用户。
 
-## Project Overview
+## 协作分工与工作流程（重要）
+
+本项目采用 **Claude Code + Codex 双工具协作**：
+
+| 职责 | 负责方 |
+|------|--------|
+| 编写代码 | **Claude Code** |
+| 方案定调、技术路线决策、代码审核 | **Codex** |
+| 运行测试、验证结果 | **Codex** |
+| 测试通过后将代码上传到 GitHub | **Codex** |
+
+### 工作流程
+
+1. **定调**：Codex 确定技术方案、路线与验收标准。规划文档见：
+   - `docs/roadmap_20260814.md`（路线图）
+   - `docs/方案审查_20260814.md`（Codex 审查结论）
+   - `docs/后续研发计划_20260814.md`（全量后续计划）
+   - `docs/superpowers/plans/2026-08-14-hyperparameter-tuning-reliability.md`（A0 代码级任务）
+2. **编码**：Claude Code 按 Codex 定调的计划编写/修改代码。
+3. **测试**：Codex 运行测试验证（完整 pytest + 必要的 1 epoch 冒烟训练）。
+4. **发布**：测试通过后由 **Codex** 上传代码到 GitHub。
+
+### 注意事项
+
+- **Claude Code 不执行 GitHub 上传**，上传统一由 Codex 负责。
+- 测试结果以 **Codex 的验证为准**；Claude Code 完成编码后不得宣称"已验证通过"，须等 Codex 测试确认。
+- **当前阶段为 A0（当前闭环可靠性加固）**，优先完成可靠性加固，再进入 A1 任务/版本框架、A2 Linux 基线等后续阶段。
+- 每次测试完后杀死测试用的服务器进程，让用户自己开启服务器自己测试。
 
 YOLOv8 Auto-Tuning Agent — a three-module closed-loop system for automated YOLOv8 training optimization:
 

@@ -9,6 +9,8 @@ import re
 import requests
 from typing import Any
 
+from .parameter_registry import get_tunable_parameter_names
+
 
 def _extract_json(text: str) -> dict | None:
     """Extract the first JSON object from LLM response text."""
@@ -29,6 +31,41 @@ def _extract_json(text: str) -> dict | None:
             pass
 
     return None
+
+
+def parse_decision_response(text: str) -> dict:
+    """Parse and structurally validate one LLM tuning decision."""
+    parsed = _extract_json(text)
+    if not isinstance(parsed, dict):
+        return {"error": "Failed to parse JSON from LLM response"}
+
+    diagnosis = parsed.get("diagnosis")
+    action = parsed.get("action")
+    changes = parsed.get("hyperparameter_changes", {})
+    overrides = parsed.get("training_overrides", {})
+    if not isinstance(diagnosis, str) or not diagnosis.strip():
+        return {"error": "diagnosis must be a non-empty string"}
+    if not isinstance(action, str) or not action.strip():
+        return {"error": "action must be a non-empty string"}
+    if not isinstance(changes, dict) or not isinstance(overrides, dict):
+        return {"error": "parameter sections must be JSON objects"}
+
+    combined = {**changes, **overrides}
+    unknown = sorted(set(combined) - get_tunable_parameter_names())
+    if unknown:
+        return {"error": f"Unknown parameter(s): {', '.join(unknown)}"}
+    if not combined and action != "keep_params":
+        return {"error": "empty changes require action=keep_params"}
+    if len(combined) > 3:
+        return {"error": "正常模式每轮最多修改 3 个参数"}
+
+    return {
+        "diagnosis": diagnosis.strip(),
+        "action": action.strip(),
+        "hyperparameter_changes": changes,
+        "training_overrides": overrides,
+        "error": None,
+    }
 
 
 def build_decision_prompt(
@@ -223,22 +260,22 @@ def decide_hyperparameters(
             "error": str(e),
         }
 
-    parsed = _extract_json(raw)
-    if parsed is None:
+    parsed = parse_decision_response(raw)
+    if parsed.get("error"):
         return {
             "diagnosis": None,
             "action": None,
             "hyperparameter_changes": {},
             "training_overrides": {},
             "raw_response": raw,
-            "error": "Failed to parse JSON from LLM response",
+            "error": parsed["error"],
         }
 
     return {
-        "diagnosis": parsed.get("diagnosis"),
-        "action": parsed.get("action"),
-        "hyperparameter_changes": parsed.get("hyperparameter_changes", {}),
-        "training_overrides": parsed.get("training_overrides", {}),
+        "diagnosis": parsed["diagnosis"],
+        "action": parsed["action"],
+        "hyperparameter_changes": parsed["hyperparameter_changes"],
+        "training_overrides": parsed["training_overrides"],
         "raw_response": raw,
         "error": None,
     }

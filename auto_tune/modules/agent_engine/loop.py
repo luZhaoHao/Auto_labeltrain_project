@@ -8,19 +8,174 @@ Orchestrates the full closed-loop hyperparameter optimization cycle:
 5. Probe: monitor early epochs, decide to continue/abort/retry
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
 import logging
+import datetime
 from typing import Any
 
 from .perception import build_perception, find_module_b_report
 from .decision_agent import decide_hyperparameters
-from .guardrails import validate_and_clamp, merge_params
-from .executor import find_detect_dir, read_args_yaml, prepare_training, launch_training, TrainingProcess
+from .guardrails import sanitize_tuning_parameters, merge_params
+from .executor import (
+    find_detect_dir, read_args_yaml, prepare_training, launch_training, TrainingProcess,
+    build_yolo_command, validate_training_preflight, write_training_config,
+)
 from .probe_monitor import monitor_training, ProbeDecision
+from .audit import TuningAuditSession, atomic_write_json
+from auto_tune.modules.train_analyzer.results_parser import parse_results_csv
+from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_and_merge_tuning_params(
+    base_args: dict,
+    hyperparameter_changes: dict,
+    training_overrides: dict,
+    dataset_info: dict | None = None,
+) -> tuple[dict | None, Any]:
+    """Return merged executable params, or ``None`` when validation rejects them."""
+    guard_result = sanitize_tuning_parameters(
+        hyperparameter_changes,
+        training_overrides,
+        dataset_info,
+    )
+    if not guard_result.valid:
+        return None, guard_result
+    return merge_params(base_args, guard_result.params), guard_result
+
+
+def _failure(stage: str, error_type: str, message: str, fatal: bool = True) -> dict:
+    """Structured failure dict used by both the audit record and the loop result."""
+    return {
+        "stage": stage,
+        "error_type": error_type,
+        "message": message,
+        "fatal": fatal,
+    }
+
+
+def _metric_delta(before: dict, after: dict) -> dict:
+    """Compute after-before deltas for metrics present in both; zero is kept."""
+    delta: dict[str, float] = {}
+    for key, after_value in after.items():
+        before_value = before.get(key)
+        if before_value is None or after_value is None:
+            continue
+        delta[key] = round(float(after_value) - float(before_value), 10)
+    return delta
+
+
+def _read_reference_before_metrics(reference_run: str | None, detect_dir: str) -> tuple[dict, dict]:
+    """Read reference-run metrics from its results.csv as authoritative before facts.
+
+    Uses the final-epoch metrics so before and after share the same scope.
+    Missing metrics stay missing; real zeros are kept. Returns (metrics, source)
+    where source records provenance and any structured parse error.
+    """
+    source: dict = {"type": "results_csv", "path": None, "epoch_scope": "final", "error": None}
+    if not reference_run:
+        source["error"] = "no_reference_run"
+        return {}, source
+    csv_path = os.path.join(detect_dir, reference_run, "results.csv")
+    source["path"] = csv_path
+    if not os.path.isfile(csv_path):
+        source["error"] = "results_csv_missing"
+        return {}, source
+    try:
+        results = parse_results_csv(csv_path)
+    except Exception as exc:
+        source["error"] = f"results_csv_parse_error: {exc}"
+        return {}, source
+    if "error" in results:
+        source["error"] = results["error"]
+        return {}, source
+    final = results.get("final_metrics", {}) or {}
+    mapping = {
+        "metrics/mAP50(B)": "mAP50",
+        "metrics/mAP50-95(B)": "mAP50_95",
+        "metrics/precision(B)": "precision",
+        "metrics/recall(B)": "recall",
+    }
+    metrics: dict[str, float] = {}
+    for source_key, target in mapping.items():
+        value = final.get(source_key)
+        if value is not None:
+            metrics[target] = value
+    if not metrics:
+        source["error"] = "no_valid_metric_columns"
+    return metrics, source
+
+
+def _extract_after_metrics(iter_result: TuningResult) -> dict:
+    """Collect result metrics from an iteration result, keeping zero values."""
+    after = {
+        "mAP50": iter_result.result_mAP50,
+        "mAP50_95": iter_result.result_mAP50_95,
+        "precision": iter_result.result_precision,
+        "recall": iter_result.result_recall,
+    }
+    return {k: v for k, v in after.items() if v is not None}
+
+
+def _persist_iteration_failure(
+    audit: TuningAuditSession,
+    iteration: int,
+    stage: str,
+    error_type: str,
+    message: str,
+    fatal: bool = True,
+) -> dict:
+    """Record a failure in the audit session, translating persistence errors to
+    audit_persistence_error without recursing into fail_iteration again."""
+    try:
+        audit.fail_iteration(iteration, stage, error_type, message, fatal=fatal)
+        return _failure(stage, error_type, message, fatal=fatal)
+    except Exception as exc:
+        return _failure("audit", "audit_persistence_error",
+                        f"{message}; 审计写入失败: {exc}")
+
+
+def _abort_tuning(
+    tuning_result: dict,
+    iter_result: TuningResult,
+    audit: TuningAuditSession,
+    iteration: int,
+    failure: dict,
+    history: TuningHistory,
+    log_dir: str,
+    on_progress: callable = None,
+) -> None:
+    """Finalize a fatal failure into the loop result and audit (best effort).
+
+    When the failure is already an audit_persistence_error, no further audit
+    write is attempted (the audit file cannot be updated); the error is still
+    reported in the return value. Best-iteration data is never overwritten.
+    """
+    iter_result.error = failure["message"]
+    history.add_attempt(iter_result.to_dict())
+    tuning_result["iterations"].append(iter_result.to_dict())
+    if on_progress:
+        on_progress(iteration, failure["message"])
+    tuning_result["failure"] = failure
+    tuning_result["error"] = iter_result.error
+    if failure["error_type"] != "audit_persistence_error":
+        try:
+            audit.finalize("failed", failure)
+        except Exception as exc:
+            tuning_result["failure"] = _failure(
+                "audit", "audit_persistence_error",
+                f"{failure['message']}; 最终审计写入失败: {exc}",
+            )
+            tuning_result["error"] = tuning_result["failure"]["message"]
+    try:
+        history.to_json(os.path.join(log_dir, "tuning_history.json"))
+    except Exception:
+        pass
 
 
 class TuningHistory:
@@ -34,21 +189,38 @@ class TuningHistory:
 
     def get_previous_changes(self) -> list[dict]:
         """Return previous attempts formatted for LLM context."""
-        return [
-            {
-                "changes": a.get("hyperparameter_changes", {}),
-                "result": a.get("result", "unknown"),
-                "diagnosis": a.get("diagnosis", ""),
+        feedback = []
+        for attempt in self.attempts:
+            decision = attempt.get("decision", {}) or {}
+            before = attempt.get("before_metrics", {}) or {}
+            after = {
+                "mAP50": attempt.get("result_mAP50"),
+                "mAP50_95": attempt.get("result_mAP50_95"),
+                "precision": attempt.get("result_precision"),
+                "recall": attempt.get("result_recall"),
             }
-            for a in self.attempts
-        ]
+            after = {k: v for k, v in after.items() if v is not None}
+            delta = {}
+            for key, value in after.items():
+                if before.get(key) is not None:
+                    delta[key] = round(value - before[key], 10)
+            probe = attempt.get("probe_decision", {}) or {}
+            feedback.append({
+                "changes": decision.get("hyperparameter_changes", {}),
+                "before_metrics": before,
+                "after_metrics": after,
+                "metric_delta": delta,
+                "probe_verdict": probe.get("verdict"),
+                "status": "failed" if attempt.get("error") else "completed",
+                "diagnosis": decision.get("diagnosis", ""),
+            })
+        return feedback
 
     def to_dict(self) -> list[dict]:
         return self.attempts
 
     def to_json(self, path: str):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.attempts, f, ensure_ascii=False, indent=2)
+        atomic_write_json(path, self.attempts)
 
     @classmethod
     def from_json(cls, path: str) -> "TuningHistory":
@@ -222,6 +394,27 @@ def run_tuning_loop(
     detect_dir = find_detect_dir()
     tuning_session_id = str(int(time.time() * 1000))  # unique per tuning session
 
+    audit = TuningAuditSession(tuning_session_id, log_dir, reference_run, max_retries)
+    try:
+        audit.flush()
+    except Exception as exc:
+        failure = _failure("audit", "audit_persistence_error", f"审计初始化失败: {exc}")
+        tuning_result = {
+            "module": "agent_engine",
+            "version": "1.0",
+            "detect_dir": detect_dir,
+            "reference_run": reference_run,
+            "max_retries": max_retries,
+            "iterations": [],
+            "final_result": None,
+            "error": f"审计持久化失败: {exc}",
+            "eval_mode": eval_mode,
+            "session_id": tuning_session_id,
+            "audit_path": audit.path,
+            "failure": failure,
+        }
+        return tuning_result
+
     tuning_result = {
         "module": "agent_engine",
         "version": "1.0",
@@ -232,6 +425,9 @@ def run_tuning_loop(
         "final_result": None,
         "error": None,
         "eval_mode": eval_mode,
+        "session_id": tuning_session_id,
+        "audit_path": audit.path,
+        "failure": None,
     }
 
     for iteration in range(1, max_retries + 1):
@@ -239,10 +435,12 @@ def run_tuning_loop(
         if cancel_event and cancel_event.is_set():
             logger.info("[AutoTune] Cancelled before iteration %d", iteration)
             tuning_result["error"] = "用户取消"
+            audit.finalize("cancelled")
             history.to_json(os.path.join(log_dir, "tuning_history.json"))
             return tuning_result
 
         iter_result = TuningResult(iteration)
+        audit.start_iteration(iteration)
         if on_progress:
             on_progress(iteration, f"迭代 {iteration}/{max_retries} 开始")
 
@@ -282,13 +480,26 @@ def run_tuning_loop(
                                     step="decision", params={"_keep_params": True, "reason": "AI 判断无需调整超参数"})
             iter_result.decision = decision
 
+            audit.update_iteration(iteration, decision={
+                "raw_response": decision.get("raw_response"),
+                "diagnosis": decision.get("diagnosis"),
+                "action": decision.get("action"),
+                "hyperparameter_changes": decision.get("hyperparameter_changes", {}),
+                "training_overrides": decision.get("training_overrides", {}),
+            })
+
             if decision.get("error"):
-                iter_result.error = f"决策失败: {decision['error']}"
-                history.add_attempt(iter_result.to_dict())
-                tuning_result["iterations"].append(iter_result.to_dict())
-                if on_progress:
-                    on_progress(iteration, f"决策失败: {decision['error']}")
-                continue
+                err_msg = str(decision["error"])
+                iter_result.error = f"决策失败: {err_msg}"
+                lower = err_msg.lower()
+                if ("deepseek api error" in lower or "request" in lower
+                        or "timeout" in lower or "connection" in lower):
+                    error_type = "decision_api_error"
+                else:
+                    error_type = "decision_schema_error"
+                failure = _persist_iteration_failure(audit, iteration, "decision", error_type, err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
 
             # ── Step 3: Guardrails ──
             if on_progress:
@@ -297,18 +508,7 @@ def run_tuning_loop(
             overrides = decision.get("training_overrides", {})
             dataset_info = perception.get("dataset", {})
 
-            guard_result = validate_and_clamp(changes, dataset_info)
-            iter_result.guard_result = guard_result
-
-            if not guard_result.valid:
-                iter_result.error = f"护栏拦截: {'; '.join(guard_result.errors)}"
-                history.add_attempt(iter_result.to_dict())
-                tuning_result["iterations"].append(iter_result.to_dict())
-                if on_progress:
-                    on_progress(iteration, f"护栏拦截: {iter_result.error}")
-                continue
-
-            # ── Merge params ──
+            # ── Load base and build the only executable parameter set ──
             if reference_run:
                 ref_dir = os.path.join(detect_dir, reference_run)
                 if os.path.isdir(ref_dir):
@@ -318,19 +518,46 @@ def run_tuning_loop(
             else:
                 base_args = {}
 
-            all_changes = dict(changes)
-            all_changes.update(overrides)
-            merged = merge_params(base_args, all_changes)
+            merged, guard_result = sanitize_and_merge_tuning_params(
+                base_args, changes, overrides, dataset_info
+            )
+            iter_result.guard_result = guard_result
+            audit.update_iteration(iteration, guardrails={
+                "valid": guard_result.valid,
+                "warnings": list(guard_result.warnings),
+                "errors": list(guard_result.errors),
+                "clamped": dict(getattr(guard_result, "clamped", {})),
+                "sanitized_changes": dict(getattr(guard_result, "params", {})),
+            })
+            if not guard_result.valid:
+                err_msg = f"护栏拦截: {'; '.join(guard_result.errors)}"
+                failure = _persist_iteration_failure(audit, iteration, "guardrails", "guardrail_rejected", err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
             iter_result.merged_params = merged
 
             # Store old batch for guardrail scaling check
             merged["_old_batch"] = base_args.get("batch", 16)
 
-            # Re-validate with merged params
-            guard_result2 = validate_and_clamp(merged, dataset_info)
-            if guard_result2.warnings:
-                for w in guard_result2.warnings:
-                    logger.warning(f"[Guardrail] {w}")
+            # Write real baseline facts bound to the same reference_run:
+            # reference params (or merged params when no reference run exists)
+            # plus before metrics read from the reference results.csv.
+            # Internal underscore-prefixed fields are excluded.
+            if reference_run:
+                base_params = {k: v for k, v in base_args.items() if not str(k).startswith("_")}
+            else:
+                base_params = {k: v for k, v in merged.items() if not str(k).startswith("_")}
+            before_metrics, metrics_source = _read_reference_before_metrics(reference_run, detect_dir)
+            audit.update_iteration(iteration, baseline={
+                "reference_run": reference_run,
+                "params": base_params,
+                "metrics": before_metrics,
+                "metrics_source": metrics_source,
+            })
+
+            for warning in guard_result.warnings:
+                logger.warning(f"[Guardrail] {warning}")
 
             if skip_execute:
                 iter_result.train_name = "dry_run"
@@ -345,22 +572,65 @@ def run_tuning_loop(
                 }
                 if on_progress:
                     on_progress(iteration, "跳过执行（dry-run 模式）")
-                continue
+                audit.complete_iteration(iteration)
+                audit.finalize("completed")
+                history.to_json(os.path.join(log_dir, "tuning_history.json"))
+                return tuning_result
 
             # ── Step 4: Execute ──
             if on_progress:
                 on_progress(iteration, f"执行层：启动训练 {merged.get('model', 'yolov8')}", step="execute")
             train_name = f"autotune_{iteration}_{reference_run or 'latest'}_{tuning_session_id}"
             output_dir = os.path.join(detect_dir, train_name)
+
+            # ── Preflight before creating the output directory ──
+            reference_dir = os.path.join(detect_dir, reference_run) if reference_run else None
+            preflight_errors = validate_training_preflight(reference_run, reference_dir, merged)
+            if preflight_errors:
+                err_msg = f"训练预检失败: {'; '.join(preflight_errors)}"
+                failure = _persist_iteration_failure(audit, iteration, "preflight", "preflight_error", err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
             os.makedirs(output_dir, exist_ok=False)  # fresh directory — must not exist
 
             # Write merged config
-            from .executor import write_training_config
             args_path = write_training_config(base_args, merged, output_dir)
             iter_result.train_name = train_name
 
+            # Build the exact command once, audit it, then launch it.
+            try:
+                command = build_yolo_command(train_name, args_path, merged)
+            except Exception as exc:
+                err_msg = f"命令构造失败: {exc}"
+                failure = _persist_iteration_failure(audit, iteration, "execute", "command_build_error", err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
+            actual_params = {k: v for k, v in merged.items() if not k.startswith("_")}
+            try:
+                audit.update_iteration(iteration, execution={
+                    "actual_params": actual_params,
+                    "args_yaml_path": args_path,
+                    "command": command,
+                    "train_name": train_name,
+                })
+            except Exception as exc:
+                err_msg = f"审计写入失败: {exc}"
+                failure = _failure("audit", "audit_persistence_error", err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
+            # Capture started_at before launch so duration is never zero.
+            training_start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
             # Launch training
-            proc = launch_training(train_name, args_path, merged)
+            try:
+                proc = launch_training(train_name, args_path, merged, command=command)
+            except Exception as exc:
+                err_msg = f"训练启动失败: {exc}"
+                failure = _persist_iteration_failure(audit, iteration, "execute", "training_launch_error", err_msg)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
             train_proc = TrainingProcess(train_name, output_dir, proc)
             training_start_time = time.time()
 
@@ -382,6 +652,10 @@ def run_tuning_loop(
 
             if probe_decision.verdict == ProbeDecision.ABORT:
                 iter_result.error = f"训练中止: {probe_decision.reason}"
+                failure = _persist_iteration_failure(audit, iteration, "probe", "probe_abort", iter_result.error, fatal=False)
+                if failure["error_type"] == "audit_persistence_error":
+                    _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                    return tuning_result
                 history.add_attempt(iter_result.to_dict())
                 tuning_result["iterations"].append(iter_result.to_dict())
                 if on_progress:
@@ -389,6 +663,10 @@ def run_tuning_loop(
                 continue
             elif probe_decision.verdict == ProbeDecision.RETRY:
                 iter_result.error = f"需要重试: {probe_decision.reason}"
+                failure = _persist_iteration_failure(audit, iteration, "probe", "probe_retry", iter_result.error, fatal=False)
+                if failure["error_type"] == "audit_persistence_error":
+                    _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                    return tuning_result
                 history.add_attempt(iter_result.to_dict())
                 tuning_result["iterations"].append(iter_result.to_dict())
                 if on_progress:
@@ -415,6 +693,29 @@ def run_tuning_loop(
                         history.add_attempt(iter_result.to_dict())
                         tuning_result["iterations"].append(iter_result.to_dict())
                         tuning_result["error"] = "用户取消"
+                        failure = _persist_iteration_failure(audit, iteration, "execute", "user_cancelled", iter_result.error)
+                        if failure["error_type"] == "audit_persistence_error":
+                            tuning_result["failure"] = failure
+                            tuning_result["error"] = f"审计持久化失败: {failure['message']}"
+                            try:
+                                history.to_json(os.path.join(log_dir, "tuning_history.json"))
+                            except Exception:
+                                pass
+                            return tuning_result
+                        try:
+                            audit.finalize("cancelled", failure)
+                        except Exception as exc:
+                            tuning_result["failure"] = _failure(
+                                "audit", "audit_persistence_error",
+                                f"{iter_result.error}; 最终审计写入失败: {exc}",
+                            )
+                            tuning_result["error"] = tuning_result["failure"]["message"]
+                            try:
+                                history.to_json(os.path.join(log_dir, "tuning_history.json"))
+                            except Exception:
+                                pass
+                            return tuning_result
+                        tuning_result["failure"] = failure
                         history.to_json(os.path.join(log_dir, "tuning_history.json"))
                         return tuning_result
 
@@ -440,71 +741,83 @@ def run_tuning_loop(
                     if on_progress:
                         on_progress(iteration, f"训练进程异常退出")
                     if auto_loop:
+                        failure = _persist_iteration_failure(audit, iteration, "execute", "training_failed", iter_result.error)
+                        if failure["error_type"] == "audit_persistence_error":
+                            _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                            return tuning_result
                         continue
-                    tuning_result["error"] = iter_result.error
-                    history.to_json(os.path.join(log_dir, "tuning_history.json"))
+                    failure = _persist_iteration_failure(audit, iteration, "execute", "training_failed", iter_result.error)
+                    _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
                     return tuning_result
 
-                # ── Run Module B analysis ──
+                # ── Run shared finalizer: Module B analysis + KPI + unified history ──
                 if on_progress:
                     on_progress(iteration, "训练完成，开始 Module B 分析...")
-                try:
-                    from auto_tune.modules.train_analyzer.results_parser import load_training_run
-                    from auto_tune.modules.train_analyzer.curve_analysis import (
-                        analyze_loss_curves, analyze_metric_curves, detect_early_stopping
-                    )
-                    from auto_tune.modules.train_analyzer.issue_detector import detect_issues
-                    from auto_tune.modules.train_analyzer.run_comparator import compare_runs, summarize_runs
+                finalizer_result = finalize_training_run(
+                    output_dir,
+                    train_name,
+                    "tuning",
+                    config,
+                    log_dir=log_dir,
+                    training_status="completed",
+                    session_id=tuning_session_id,
+                    audit_path=audit.path,
+                    started_at=training_start_iso,
+                    finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    tuning_context={
+                        "decision": {
+                            "diagnosis": decision.get("diagnosis"),
+                            "action": decision.get("action"),
+                            "hyperparameter_changes": dict(decision.get("hyperparameter_changes", {}) or {}),
+                            "training_overrides": dict(decision.get("training_overrides", {}) or {}),
+                        },
+                        "guardrails": {
+                            "valid": guard_result.valid,
+                            "warnings": list(guard_result.warnings),
+                            "errors": list(guard_result.errors),
+                            "clamped": dict(getattr(guard_result, "clamped", {}) or {}),
+                        },
+                    },
+                )
+                finalizer_metrics = finalizer_result.get("metrics", {})
+                iter_result.result_mAP50 = finalizer_metrics.get("mAP50")
+                iter_result.result_mAP50_95 = finalizer_metrics.get("mAP50_95")
+                iter_result.result_precision = finalizer_metrics.get("precision")
+                iter_result.result_recall = finalizer_metrics.get("recall")
+                _epochs_info = finalizer_result.get("epochs") or {}
+                iter_result.result_best_epoch = _epochs_info.get("best") if isinstance(_epochs_info, dict) else None
 
-                    run_data = load_training_run(output_dir)
-                    run_data["name"] = train_name
-
-                    ta_config = config.get("train_analyzer", {})
-                    curve_analysis = analyze_loss_curves(run_data["results"], ta_config)
-                    metric_analysis = analyze_metric_curves(run_data["results"], ta_config)
-                    early_stop = detect_early_stopping(run_data, ta_config)
-                    curve_analysis["early_stopping"] = early_stop
-                    issues = detect_issues(run_data, ta_config)
-
-                    run_data["curve_analysis"] = curve_analysis
-                    run_data["metric_analysis"] = metric_analysis
-                    run_data["issues"] = issues
-
-                    report = {
-                        "module": "train_analyzer",
-                        "version": "1.0",
-                        "analysis_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "detect_dir": output_dir,
-                        "project": config.get("project", {}),
-                        "total_runs": 1,
-                        "runs": {train_name: run_data},
-                        "comparison": compare_runs([run_data], ta_config),
-                        "summary": summarize_runs([run_data], ta_config),
-                    }
-
-                    # Extract metrics from Module B results
-                    final_metrics = run_data.get("results", {}).get("final_metrics", {})
-                    iter_result.result_mAP50 = final_metrics.get("metrics/mAP50(B)")
-                    iter_result.result_mAP50_95 = final_metrics.get("metrics/mAP50-95(B)")
-                    iter_result.result_precision = final_metrics.get("metrics/precision(B)")
-                    iter_result.result_recall = final_metrics.get("metrics/recall(B)")
-                    iter_result.result_best_epoch = run_data.get("results", {}).get("best_epoch")
-
-                    report_path = os.path.join(log_dir, f"{train_name}_report.json")
-                    os.makedirs(log_dir, exist_ok=True)
-                    with open(report_path, "w", encoding="utf-8") as f:
-                        json.dump(report, f, ensure_ascii=False, indent=2)
-
+                analysis_record = None
+                if finalizer_result.get("analysis_status") != "completed":
+                    analysis_record = finalizer_result.get("analysis_error")
+                    logger.warning("Module B analysis failed for %s: %s", train_name,
+                                   (analysis_record or {}).get("message"))
                     if on_progress:
-                        cs = iter_result.get_composite_score(eval_mode)
-                        on_progress(iteration, f"Module B 分析完成: mAP50={iter_result.result_mAP50}, mAP50-95={iter_result.result_mAP50_95}, Precision={iter_result.result_precision}, Recall={iter_result.result_recall}, 综合分={cs:.4f}")
-                except Exception as e:
-                    logger.exception(f"Module B analysis failed for {train_name}")
-                    if on_progress:
-                        on_progress(iteration, f"Module B 分析失败: {e}")
+                        on_progress(iteration, f"Module B 分析失败: {(analysis_record or {}).get('message', 'unknown')}")
+                elif on_progress:
+                    cs = iter_result.get_composite_score(eval_mode)
+                    on_progress(iteration, f"Module B 分析完成: mAP50={iter_result.result_mAP50}, mAP50-95={iter_result.result_mAP50_95}, Precision={iter_result.result_precision}, Recall={iter_result.result_recall}, 综合分={cs:.4f}")
+
+                if finalizer_result.get("history_error") and on_progress:
+                    on_progress(iteration, f"历史写入警告: {finalizer_result['history_error'].get('message')}")
+
+                # ── Record result facts (only metrics actually present) ──
+                after_metrics = _extract_after_metrics(iter_result)
+                audit.update_iteration(iteration, result={
+                    "before_metrics": before_metrics,
+                    "after_metrics": after_metrics,
+                    "metric_delta": _metric_delta(before_metrics, after_metrics),
+                    "probe": {
+                        "verdict": probe_decision.verdict,
+                        "reason": probe_decision.reason,
+                        "suggestion": probe_decision.suggestion,
+                    },
+                    "analysis": analysis_record,
+                })
 
                 # ── Auto-loop: continue to next iteration ──
                 if auto_loop:
+                    audit.complete_iteration(iteration)
                     history.add_attempt(iter_result.to_dict())
                     tuning_result["iterations"].append(iter_result.to_dict())
                     reference_run = train_name
@@ -515,22 +828,41 @@ def run_tuning_loop(
                 # ── auto_analyze only: return success ──
                 history.add_attempt(iter_result.to_dict())
                 tuning_result["iterations"].append(iter_result.to_dict())
+                _analysis_status = finalizer_result.get("analysis_status")
                 tuning_result["final_result"] = {
                     "train_name": train_name,
                     "iteration": iteration,
                     "decision": decision.get("diagnosis"),
                     "changes": changes,
                     "guard_warnings": guard_result.warnings,
-                    "module_b_analyzed": True,
+                    "module_b_analyzed": _analysis_status == "completed",
+                    "analysis_status": _analysis_status,
+                    "analysis_error": finalizer_result.get("analysis_error"),
                 }
                 if on_progress:
-                    on_progress(iteration, f"✅ 训练 {train_name} 完成，Module B 分析已生成")
+                    if _analysis_status == "completed":
+                        on_progress(iteration, f"✅ 训练 {train_name} 完成，Module B 分析已生成")
+                    else:
+                        on_progress(iteration, f"⚠️ 训练 {train_name} 完成，Module B 分析失败")
                 # ── Compute best iteration from all completed iterations ──
                 _compute_best(tuning_result, eval_mode)
+                audit.complete_iteration(iteration)
+                audit.finalize("completed")
                 history.to_json(os.path.join(log_dir, "tuning_history.json"))
                 return tuning_result
 
             # ── No auto-analyze: training continues in background ──
+            audit.update_iteration(iteration, result={
+                "before_metrics": before_metrics,
+                "after_metrics": {},
+                "metric_delta": _metric_delta(before_metrics, {}),
+                "probe": {
+                    "verdict": probe_decision.verdict,
+                    "reason": probe_decision.reason,
+                    "suggestion": probe_decision.suggestion,
+                },
+                "analysis": None,
+            })
             history.add_attempt(iter_result.to_dict())
             tuning_result["iterations"].append(iter_result.to_dict())
             tuning_result["final_result"] = {
@@ -545,31 +877,40 @@ def run_tuning_loop(
 
             # ── Compute best iteration from all completed iterations ──
             _compute_best(tuning_result, eval_mode)
+            audit.complete_iteration(iteration)
+            audit.finalize("completed")
             # Save history
             history.to_json(os.path.join(log_dir, "tuning_history.json"))
             return tuning_result
 
         except Exception as e:
             iter_result.error = f"异常: {str(e)}"
-            tuning_result["iterations"].append(iter_result.to_dict())
+            failure = _persist_iteration_failure(
+                audit, iteration, "loop", "iteration_exception", iter_result.error, fatal=True
+            )
+            _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
             logger.exception(f"Tuning iteration {iteration} failed")
-            if on_progress:
-                on_progress(iteration, f"❌ 异常: {str(e)}")
+            return tuning_result
 
     # All retries exhausted — check if we have any successful iterations
     _compute_best(tuning_result, eval_mode)
-    if tuning_result.get("best_iteration") is not None and on_progress:
-        best_m = tuning_result.get("best_metrics", {})
-        on_progress(
-            tuning_result["best_iteration"],
-            f"🏆 最佳迭代: 第 {tuning_result['best_iteration']} 次 ({tuning_result['best_train_name']}) — "
-            f"mAP50={best_m.get('mAP50')}, "
-            f"mAP50-95={best_m.get('mAP50_95')}, "
-            f"Precision={best_m.get('precision')}, "
-            f"Recall={best_m.get('recall')}",
-        )
+    if tuning_result.get("best_iteration") is not None:
+        audit.finalize("completed")
+        if on_progress:
+            best_m = tuning_result.get("best_metrics", {})
+            on_progress(
+                tuning_result["best_iteration"],
+                f"🏆 最佳迭代: 第 {tuning_result['best_iteration']} 次 ({tuning_result['best_train_name']}) — "
+                f"mAP50={best_m.get('mAP50')}, "
+                f"mAP50-95={best_m.get('mAP50_95')}, "
+                f"Precision={best_m.get('precision')}, "
+                f"Recall={best_m.get('recall')}",
+            )
     else:
         tuning_result["error"] = f"已达最大重试次数 ({max_retries})，所有尝试均未成功"
+        failure = _failure("loop", "retries_exhausted", tuning_result["error"])
+        audit.finalize("failed", failure)
+        tuning_result["failure"] = failure
 
     # Save history
     history.to_json(os.path.join(log_dir, "tuning_history.json"))

@@ -165,10 +165,15 @@ def detect_early_stopping(results: dict, config: dict) -> dict:
     total_epochs = results.get("total_epochs", 0)
     map_col = columns.get("metrics/mAP50(B)", [])
     valid_map = [(i, v) for i, v in enumerate(map_col) if v is not None]
+    args = results.get("args", {})
+    planned_epochs = args.get("epochs", 100) if isinstance(args, dict) else 100
+    patience = args.get("patience", 15) if isinstance(args, dict) else 15
+    stopped_early = total_epochs < planned_epochs
 
     if len(valid_map) < 5:
-        return {"stopped_early": False, "was_improving": False,
-                "improvement_potential": "unknown", "recommended_epochs": None}
+        return {"stopped_early": stopped_early, "was_improving": False,
+                "improvement_potential": "unknown", "recommended_epochs": None,
+                "planned_epochs": planned_epochs, "actual_epochs": total_epochs}
 
     # Check slope in last 10 epochs
     last_vals = [v for _, v in valid_map[-10:]]
@@ -180,11 +185,6 @@ def detect_early_stopping(results: dict, config: dict) -> dict:
     slope = np.polyfit(xs, last_vals, 1)[0]
 
     was_improving = bool(slope > 0.005)
-    args = results.get("args", {})
-    planned_epochs = args.get("epochs", 100) if isinstance(args, dict) else 100
-    patience = args.get("patience", 15) if isinstance(args, dict) else 15
-    stopped_early = total_epochs < planned_epochs
-
     if not stopped_early:
         return {"stopped_early": False, "was_improving": was_improving,
                 "improvement_potential": "low" if was_improving else "none",

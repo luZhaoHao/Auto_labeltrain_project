@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 dist/
 build/
 
@@ -9,43 +10,37 @@ build/
 .vscode/
 .idea/
 .vs/
+.claude/
 *.swp
 *.swo
 
 # Project: large data / output dirs (keep these out of version control)
-# Anchored to repo root so nested source dirs (auto_tune/modules/dataset_analyzer, train_analyzer) are NOT ignored
 /dataset_*/
 /train_*/
 /new_test_*/
 /detect/
-log/uploads/
-log/*.json
-log/*.csv
-log/*.txt
-log/*.md
+/runs/
+/log/
 
 # Packaging output
 build_output/
 *.tar.gz
 *.zip
+*.pt
 
 # Config with secrets
 auto_tune/config.yaml
 !auto_tune/config.template.yaml
 
-# Ad-hoc test scripts (contain local paths and API key placeholders / history)
-_test_*.py
-test_module_a.py
+# Local secrets and ad-hoc verification scripts
+/qwen.txt
+/_test_*.py
+/test_module_a.py
 
-# Generated test outputs
-_llm_diagnosis.txt
-_vision_output.txt
-
-# Model weights (download on demand via YOLO)
-*.pt
-
-# Claude AI personal config
-.claude/
+# Generated local test outputs
+/_llm_diagnosis.txt
+/_vision_output.txt
+/docs/_render_leader_roadmap*/
 
 # Environment
 env/
