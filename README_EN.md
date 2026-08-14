@@ -344,7 +344,8 @@ Detailed documents:
 
 - [Project Roadmap (Chinese)](docs/roadmap_20260814.md)
 - [Implementation Plan (Chinese)](docs/implementation_plan_20260814.md)
-- [Unified Training Finalization Design (Chinese)](docs/superpowers/specs/2026-08-14-unified-training-finalization-design.md)
+- [Current Development Handoff (Chinese)](docs/development_handoff_20260814.md)
+- [Operator Manual (Chinese)](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C.md)
 
 ## GitHub Safety Boundary
 
