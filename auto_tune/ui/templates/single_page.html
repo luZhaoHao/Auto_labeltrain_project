@@ -1046,6 +1046,13 @@
       <div class="console-log" id="tuningLog">
         <div class="dim">{{ _("Waiting to start...") }}</div>
       </div>
+      <div style="margin-top:8px;">
+        <button type="button" class="btn btn-outline btn-sm" id="toggleTuningFullLog" onclick="toggleFullLog('tuningFullLog', this)">
+          <span class="expand-label">{{ _("展开完整日志") }}</span>
+          <span class="collapse-label hidden">{{ _("收起完整日志") }}</span>
+        </button>
+      </div>
+      <div class="console-log hidden" id="tuningFullLog" style="max-height:400px;"></div>
       <div id="bestResult" class="hidden" style="margin-top:12px; padding:12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px;">
         <div style="font-weight:700; font-size:14px; margin-bottom:8px;">⭐ {{ _("Best Iteration") }}</div>
         <div id="bestResultContent"></div>
@@ -1191,6 +1198,13 @@
         <div class="dim">{{ _("No training runs recorded yet.") }}</div>
         {% endif %}
       </div>
+      <div style="margin-top:8px;">
+        <button type="button" class="btn btn-outline btn-sm" id="toggleMonitorFullLog" onclick="toggleFullLog('monitorFullLog', this)">
+          <span class="expand-label">{{ _("展开完整日志") }}</span>
+          <span class="collapse-label hidden">{{ _("收起完整日志") }}</span>
+        </button>
+      </div>
+      <div class="console-log hidden" id="monitorFullLog" style="max-height:400px;"></div>
     </div>
   </div>
 </div>
@@ -1856,6 +1870,159 @@ function saveBestReport(trainName) {
   });
 }
 
+// ── S1.1 shared log-layering helpers (safe DOM + bounded ring buffer + SSE buffering) ──
+var MAX_DEFAULT_LOG_LINES = 500;
+var MAX_FULL_LOG_LINES = 2000;
+var LOG_BATCH_SIZE = 20;
+var LOG_BATCH_MS = 50;
+
+function toggleFullLog(id, btn) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  var willShow = el.classList.contains('hidden');
+  el.classList.toggle('hidden', !willShow);
+  if (btn) {
+    var expand = btn.querySelector('.expand-label');
+    var collapse = btn.querySelector('.collapse-label');
+    if (expand) expand.classList.toggle('hidden', willShow);
+    if (collapse) collapse.classList.toggle('hidden', !willShow);
+  }
+}
+
+function appendTrainingLogLine(container, text, cssClass) {
+  if (!container || text == null) return;
+  var row = document.createElement('div');
+  row.className = cssClass || 'info';
+  row.textContent = String(text);
+  container.appendChild(row);
+  return row;
+}
+
+function logElementCount(container) {
+  var n = 0;
+  for (var i = 0; i < container.childNodes.length; i++) {
+    if (container.childNodes[i].nodeType === 1) n++;
+  }
+  return n;
+}
+
+// O(1) ring-buffer counters: the DOM node count is tracked on the element so
+// trimming never rescans the child list. logElementCount() is only called once
+// per container (lazy init); the hot path removes overflow directly via
+// firstElementChild without any scan.
+function ringCount(container) {
+  if (container._ringCount === undefined) {
+    container._ringCount = logElementCount(container);
+  }
+  return container._ringCount;
+}
+
+function trimToCap(container, cap) {
+  if (!container) return;
+  if (container._ringCount === undefined) {
+    container._ringCount = logElementCount(container);
+  }
+  while (container._ringCount > cap) {
+    if (container.firstElementChild) {
+      container.removeChild(container.firstElementChild);
+    }
+    container._ringCount--;
+  }
+}
+
+function appendBounded(container, text, cssClass, cap) {
+  if (!container || text == null) return;
+  var row = appendTrainingLogLine(container, text, cssClass);
+  if (container._ringCount === undefined) {
+    container._ringCount = logElementCount(container);
+  }
+  container._ringCount++;
+  trimToCap(container, cap);
+  return row;
+}
+
+function makeLogRenderer(defaultEl, fullEl, defaultCap, fullCap) {
+  function makeSlot(el, cap) {
+    return { el: el, cap: cap, count: el ? logElementCount(el) : 0, pending: [], timer: null };
+  }
+  var d = makeSlot(defaultEl, defaultCap);
+  var f = makeSlot(fullEl, fullCap);
+
+  function flush(slot) {
+    if (slot.timer) { clearTimeout(slot.timer); slot.timer = null; }
+    if (!slot.el || !slot.pending.length) return;
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < slot.pending.length; i++) {
+      var row = document.createElement('div');
+      row.className = slot.pending[i].css || 'info';
+      row.textContent = slot.pending[i].text;
+      frag.appendChild(row);
+    }
+    var n = slot.pending.length;
+    slot.pending = [];
+    // Strict O(1) trimming: remove only the overflow from the front via the
+    // firstElementChild pointer. The count is bookkept, never recomputed.
+    var overflow = slot.count + n - slot.cap;
+    for (var k = 0; k < overflow; k++) {
+      if (slot.el.firstElementChild) {
+        slot.el.removeChild(slot.el.firstElementChild);
+      }
+    }
+    slot.el.appendChild(frag);
+    slot.count = Math.min(slot.cap, slot.count + n);
+    if (slot.el._ringCount !== undefined) {
+      slot.el._ringCount = slot.count;
+    }
+    slot.el.scrollTop = slot.el.scrollHeight;
+  }
+
+  function push(slot, text, css) {
+    if (!slot.el || text == null || text === '') return;
+    slot.pending.push({ text: String(text), css: css });
+    if (slot.pending.length >= LOG_BATCH_SIZE) {
+      flush(slot);
+    } else if (!slot.timer) {
+      slot.timer = setTimeout(function() { flush(slot); }, LOG_BATCH_MS);
+    }
+  }
+
+  return {
+    pushDefault: function(text, css) { push(d, text, css); },
+    pushFull: function(text, css) { push(f, text, css); },
+    flushAll: function() { flush(d); flush(f); }
+  };
+}
+
+function levelClass(level) {
+  if (level === 'error' || level === 'destructive') return 'destructive';
+  if (level === 'warning' || level === 'warn') return 'warn';
+  if (level === 'success') return 'success';
+  return 'info';
+}
+
+function cssClassFor(data) {
+  return levelClass(data.level);
+}
+
+function consumeSseChunk(state, chunk, onEvent) {
+  state.buffer = (state.buffer || '') + state.decoder.decode(chunk, { stream: true });
+  var lines = state.buffer.split('\n');
+  state.buffer = lines.pop();
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.lastIndexOf('data: ', 0) === 0) {
+      onEvent(JSON.parse(line.slice(6)));
+    }
+  }
+}
+
+function makeSseConsumer() {
+  var state = { decoder: new TextDecoder(), buffer: '' };
+  return function(chunk, onEvent) {
+    consumeSseChunk(state, chunk, onEvent);
+  };
+}
+
 (function() {
   var tuningForm = document.getElementById('tuningForm');
   if (!tuningForm) return;
@@ -1865,6 +2032,12 @@ function saveBestReport(trainName) {
   var tuningLog = document.getElementById('tuningLog');
   var startBtn = document.getElementById('startTuningBtn');
   var stopBtn = document.getElementById('stopTuningBtn');
+  var tuningRenderer = makeLogRenderer(
+    tuningLog,
+    document.getElementById('tuningFullLog'),
+    MAX_DEFAULT_LOG_LINES,
+    MAX_FULL_LOG_LINES
+  );
 
   tuningForm.addEventListener('submit', async function(e) {
     e.preventDefault();
@@ -1874,17 +2047,26 @@ function saveBestReport(trainName) {
     stopBtn.style.display = 'inline-flex';
     tuningProgress.classList.remove('hidden');
     // Append instead of replacing — keep previous tuning output visible (issue #1/#2)
-    tuningLog.innerHTML += '<div class="dim">--- {{ _("Starting tuning...") }} ---</div>';
+    tuningRenderer.pushDefault('--- {{ _("Starting tuning...") }} ---', 'dim');
     tuningStatus.textContent = '{{ _("Connecting...") }}';
 
     var pipelineSteps = {};  // track completed steps per iteration
 
     function appendLog(msg, level) {
-      var div = document.createElement('div');
-      div.className = level;
-      div.textContent = msg;
-      tuningLog.appendChild(div);
-      tuningLog.scrollTop = tuningLog.scrollHeight;
+      tuningRenderer.pushDefault(msg, levelClass(level));
+    }
+
+    function handleTuningSse(data) {
+      if (data.event === 'training_log') {
+        if (data.message != null) tuningRenderer.pushDefault(data.message, cssClassFor(data));
+        if (data.detail != null) tuningRenderer.pushFull(data.detail, cssClassFor(data));
+        return true;
+      }
+      if (data.event === 'log_persistence_error') {
+        tuningRenderer.pushDefault(data.message, 'warn');
+        return true;
+      }
+      return false;
     }
 
     function updatePipeline(step, iteration) {
@@ -1982,28 +2164,24 @@ function saveBestReport(trainName) {
       });
 
       var reader = response.body.getReader();
-      var decoder = new TextDecoder();
+      var consumer = makeSseConsumer();
 
       while (true) {
         var r = await reader.read();
         if (r.done) break;
-        var text = decoder.decode(r.value, { stream: true });
-        var lines = text.split('\n');
-        for (var j = 0; j < lines.length; j++) {
-          var line = lines[j];
-          if (line.startsWith('data: ')) {
-            var data = JSON.parse(line.slice(6));
-            appendLog(data.message, data.level || 'info');
-            // Update pipeline visualization
-            if (data.step) {
-              updatePipeline(data.step, data.iteration);
-              if (data.step === 'iteration_start') {
-                document.getElementById('paramChanges').classList.add('hidden');
-              }
+        consumer(r.value, function(data) {
+          if (handleTuningSse(data)) return;  // training-log lines handled by renderer
+          appendLog(data.message, data.level || 'info');
+          // Update pipeline visualization
+          if (data.step) {
+            updatePipeline(data.step, data.iteration);
+            if (data.step === 'iteration_start') {
+              document.getElementById('paramChanges').classList.add('hidden');
             }
-            if (data.params) {
-              showParamChanges(data.params);
-            }
+          }
+          if (data.params) {
+            showParamChanges(data.params);
+          }
             if (data.status === 'cancelled') {
               tuningStatus.innerHTML = '[{{ _("已取消") }}] {{ _("Training stopped") }}';
             } else if (data.status === 'error') {
@@ -2045,8 +2223,7 @@ function saveBestReport(trainName) {
             } else if (data.status === 'running') {
               tuningStatus.textContent = '[{{ _("运行中") }}] ' + data.message;
             }
-          }
-        }
+        });
       }
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -2056,6 +2233,7 @@ function saveBestReport(trainName) {
         appendLog('{{ _("Connection error") }}: ' + err.message, 'error');
       }
     } finally {
+      tuningRenderer.flushAll();
       startBtn.style.display = 'inline-flex';
       stopBtn.style.display = 'none';
       tuningAbortController = null;
@@ -2197,17 +2375,63 @@ function startTraining() {
   });
   hideTrainModal();
   switchPage(3);
-  var log = document.getElementById('monitorLog');
   var badge = document.getElementById('statusBadge');
   var startBtn = document.getElementById('startNewTrainingBtn');
   var stopBtn = document.getElementById('stopTrainingBtn');
-  var currentEpoch = '';
-  // Append separator instead of clearing (issue #2)
-  if (log) log.innerHTML += '<div class="dim">--- {{ _("Starting training...") }} ---</div>';
+  var renderer = makeLogRenderer(
+    document.getElementById('monitorLog'),
+    document.getElementById('monitorFullLog'),
+    MAX_DEFAULT_LOG_LINES,
+    MAX_FULL_LOG_LINES
+  );
+  renderer.pushDefault('--- {{ _("Starting training...") }} ---', 'dim');
   if (badge) { badge.textContent = 'Running'; badge.className = 'badge badge-yellow'; }
   if (startBtn) startBtn.style.display = 'none';
   if (stopBtn) stopBtn.style.display = 'inline-flex';
   trainingAbortController = new AbortController();
+
+  function onTrainingEvent(data) {
+    if (data.event === 'training_log') {
+      if (data.message != null) renderer.pushDefault(data.message, cssClassFor(data));
+      if (data.detail != null) renderer.pushFull(data.detail, cssClassFor(data));
+      return;
+    }
+    if (data.event === 'log_persistence_error') {
+      renderer.pushDefault(data.message, 'warn');
+      return;
+    }
+    if (data.status === 'error') {
+      renderer.pushDefault('[ERROR] ' + data.message, 'destructive');
+      if (badge) { badge.textContent = 'Failed'; badge.className = 'badge badge-red'; }
+      return;
+    }
+    if (data.status === 'done') {
+      var warn = data.level === 'warning';
+      renderer.pushDefault('[DONE] ' + data.message, warn ? 'warn' : 'success');
+      if (badge) { badge.textContent = warn ? 'Warning' : 'Completed'; badge.className = warn ? 'badge badge-yellow' : 'badge badge-green'; }
+      var result = data.result || {};
+      var m = result.metrics || {};
+      var epochsEl = document.getElementById('monitorEpochs');
+      var map50El = document.getElementById('monitorMap50');
+      var map5095El = document.getElementById('monitorMap5095');
+      var prEl = document.getElementById('monitorPR');
+      if (epochsEl && result.epochs != null) epochsEl.textContent = result.epochs;
+      if (map50El && m.mAP50 != null) map50El.textContent = Number(m.mAP50).toFixed(4);
+      if (map5095El && m.mAP50_95 != null) map5095El.textContent = Number(m.mAP50_95).toFixed(4);
+      if (prEl && m.precision != null && m.recall != null) {
+        prEl.textContent = Number(m.precision).toFixed(3) + ' / ' + Number(m.recall).toFixed(3);
+      }
+      var reportLink = document.getElementById('monitorReportLink');
+      if (reportLink && result.artifacts && result.artifacts.report_path) {
+        reportLink.href = '/api/training/report-by-name?name=' + encodeURIComponent(result.run_name || '');
+        reportLink.style.display = '';
+      }
+      return;
+    }
+    // Legacy lifecycle messages (server-start banner, dataset/model lines, etc.)
+    if (data.message) renderer.pushDefault(data.message, cssClassFor(data));
+  }
+
   fetch('/api/training/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2216,102 +2440,25 @@ function startTraining() {
   }).then(function(response) {
     if (!response.ok) throw new Error('HTTP ' + response.status);
     var reader = response.body.getReader();
-    var decoder = new TextDecoder();
+    var consumer = makeSseConsumer();
     function readStream() {
       return reader.read().then(function(result) {
-        if (result.done) return;
-        var text = decoder.decode(result.value, { stream: true });
-        var lines = text.split('\n');
-        for (var i = 0; i < lines.length; i++) {
-          var line = lines[i];
-          if (line.startsWith('data: ')) {
-            try {
-              var data = JSON.parse(line.slice(6));
-              if (log) {
-                if (data.status === 'error') {
-                  log.innerHTML += '<div class="destructive">[ERROR] ' + data.message + '</div>';
-                  if (badge) { badge.textContent = 'Failed'; badge.className = 'badge badge-red'; }
-                } else if (data.status === 'done') {
-                  var warn = data.level === 'warning';
-                  log.innerHTML += '<div class="' + (warn ? 'warn' : 'success') + '">[DONE] ' + data.message + '</div>';
-                  if (badge) { badge.textContent = warn ? 'Warning' : 'Completed'; badge.className = warn ? 'badge badge-yellow' : 'badge badge-green'; }
-                  var result = data.result || {};
-                  var m = result.metrics || {};
-                  var epochsEl = document.getElementById('monitorEpochs');
-                  var map50El = document.getElementById('monitorMap50');
-                  var map5095El = document.getElementById('monitorMap5095');
-                  var prEl = document.getElementById('monitorPR');
-                  if (epochsEl && result.epochs != null) epochsEl.textContent = result.epochs;
-                  if (map50El && m.mAP50 != null) map50El.textContent = Number(m.mAP50).toFixed(4);
-                  if (map5095El && m.mAP50_95 != null) map5095El.textContent = Number(m.mAP50_95).toFixed(4);
-                  if (prEl && m.precision != null && m.recall != null) {
-                    prEl.textContent = Number(m.precision).toFixed(3) + ' / ' + Number(m.recall).toFixed(3);
-                  }
-                  var reportLink = document.getElementById('monitorReportLink');
-                  if (reportLink && result.artifacts && result.artifacts.report_path) {
-                    reportLink.href = '/api/training/report-by-name?name=' + encodeURIComponent(result.run_name || '');
-                    reportLink.style.display = '';
-                  }
-                } else if (data.status === 'running') {
-                  // Filter YOLO output: only show epoch metrics and key status
-                  var msg = data.message;
-                  // Strip ANSI escape codes (tqdm uses \x1b[K to clear lines)
-                  msg = msg.replace(/\x1b\[[\d;?]*[a-zA-Z]/g, '');
-                  // YOLO epoch header line: "     1/100      1.2G      1.234 ..."
-                  // YOLO validation metrics: "          all         10        50      0.123 ..."
-                  // tqdm progress updates: "     1/100  ...  50%|████| 5/10 [00:01<00:01,  4.57it/s]"
-                  if (/^\s+\d+\/\d+\s+/.test(msg)) {
-                    // Epoch training loss line — show only once per epoch (dedup tqdm spam)
-                    var parts = msg.trim().split(/\s+/);
-                    if (parts.length >= 4) {
-                      var epochParts = parts[0].split('/');
-                      var newEpoch = epochParts[0];
-                      if (newEpoch !== currentEpoch) {
-                        currentEpoch = newEpoch;
-                        var totalEpochs = epochParts[1] || '';
-                        log.innerHTML += '<div class="info">epoch ' + currentEpoch + '/' + totalEpochs + ': box_loss=' + parts[2] + ' cls_loss=' + parts[3] + (parts[4] ? ' dfl_loss=' + parts[4] : '') + '</div>';
-                      }
-                    } else {
-                      log.innerHTML += '<div class="info">' + msg + '</div>';
-                    }
-                  } else if (/^\s+all\s+\d+/.test(msg)) {
-                    // Validation metrics line
-                    var vparts = msg.trim().split(/\s+/);
-                    if (vparts.length >= 7) {
-                      log.innerHTML += '<div class="success">epoch ' + currentEpoch + ' val: R=' + vparts[4] + ' mAP50=' + vparts[5] + ' mAP50-95=' + vparts[6] + '</div>';
-                    } else {
-                      log.innerHTML += '<div class="success">' + msg + '</div>';
-                    }
-                  } else if (msg.trim() === '') {
-                    // Skip empty lines
-                  } else if (/Class\s+Images\s+Instances/.test(msg)) {
-                    // Skip YOLO validation progress bars ("Class Images Instances Box(P R mAP50 mAP50-95): 50% ...")
-                  } else if (/^(启动训练|数据集:|模型:|Starting training|Results saved|\[WARN\]|WARNING)/i.test(msg.trim())) {
-                    // Keep only actionable lifecycle messages in the default console.
-                    log.innerHTML += '<div class="info">' + msg + '</div>';
-                  }
-                }
-                log.scrollTop = log.scrollHeight;
-              }
-            } catch(e) {}
-          }
-        }
+        if (result.done) { renderer.flushAll(); return; }
+        consumer(result.value, onTrainingEvent);
         return readStream();
-      }).catch(function(err) {
-        if (log) log.innerHTML += '<div class="destructive">Stream error: ' + err.message + '</div>';
-        if (badge) { badge.textContent = 'Error'; badge.className = 'badge badge-red'; }
       });
     }
     return readStream();
   }).catch(function(err) {
     if (err.name === 'AbortError') {
-      if (log) log.innerHTML += '<div class="warn">[{{ _("已停止") }}] {{ _("Training stopped by user") }}</div>';
+      renderer.pushDefault('[{{ _("已停止") }}] {{ _("Training stopped by user") }}', 'warn');
       if (badge) { badge.textContent = '{{ _("已停止") }}'; badge.className = 'badge badge-yellow'; }
     } else {
-      if (log) log.innerHTML += '<div class="destructive">Connection error: ' + err.message + '</div>';
+      renderer.pushDefault('Connection error: ' + err.message, 'destructive');
       if (badge) { badge.textContent = 'Error'; badge.className = 'badge badge-red'; }
     }
   }).finally(function() {
+    renderer.flushAll();
     if (startBtn) startBtn.style.display = 'inline-flex';
     if (stopBtn) stopBtn.style.display = 'none';
     trainingAbortController = null;

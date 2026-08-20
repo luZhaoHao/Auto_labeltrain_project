@@ -37,6 +37,11 @@ def _safe_extract_zip(zf: zipfile.ZipFile, destination: str | Path) -> None:
 
 
 from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
+from auto_tune.modules.agent_engine.training_log import (
+    append_training_log,
+    build_training_sse_payload,
+    classify_training_line,
+)
 
 
 def _finalize_and_build_event(
@@ -93,6 +98,90 @@ def _finalize_and_build_event(
         "message": f"训练失败 (exit code {returncode})",
         "result": result,
     }
+
+
+def _remove_status_file() -> None:
+    """Delete the training_running.json status file if present (best-effort)."""
+    _sf = os.path.join("log", "training_running.json")
+    if os.path.exists(_sf):
+        try:
+            os.remove(_sf)
+        except OSError:
+            pass
+
+
+def _sse_chunk(payloads) -> str:
+    """Serialize payload dicts into one SSE chunk (multiple ``data:`` events)."""
+    return "".join("data: " + json.dumps(p, ensure_ascii=False) + "\n\n" for p in payloads)
+
+
+def _process_training_output_line(line, train_name, log_path, warned_once):
+    """Sanitize/persist/classify one stdout line into an SSE payload dict.
+
+    Returns ``None`` when a persistence warning was already emitted for
+    ``log_path`` (warn-once per run). Never raises on a broken log file.
+    """
+    event = classify_training_line(line)
+    try:
+        append_training_log(log_path, event.raw)
+    except OSError:
+        if log_path in warned_once:
+            return None
+        warned_once.add(log_path)
+        return {
+            "status": "running",
+            "event": "log_persistence_error",
+            "level": "warning",
+            "message": "日志保存失败，训练继续运行",
+        }
+    return build_training_sse_payload(event, train_name)
+
+
+def _enqueue_bounded(msg_queue, payload) -> None:
+    """Put a transient SSE payload on a bounded queue, dropping on overflow.
+
+    Terminal events are never routed through here, so a slow client can only
+    lose transient progress (constraints 9/11c), never the final status.
+    """
+    import queue as _queue_module
+
+    try:
+        msg_queue.put_nowait(json.dumps(payload, ensure_ascii=False))
+    except _queue_module.Full:
+        pass
+
+
+class _SseBatch:
+    """Bounded SSE batch buffer: flush on max size or a short time window.
+
+    Keeps the event rate bounded without accumulating the full log in memory.
+    """
+
+    def __init__(self, max_batch=20, flush_interval=0.1):
+        self.max_batch = max_batch
+        self.flush_interval = flush_interval
+        self._payloads: list[dict] = []
+        self._last_flush = time.monotonic()
+
+    def add(self, payload) -> None:
+        self._payloads.append(payload)
+
+    @property
+    def pending(self) -> int:
+        return len(self._payloads)
+
+    def should_flush(self) -> bool:
+        return (
+            len(self._payloads) >= self.max_batch
+            or (time.monotonic() - self._last_flush) > self.flush_interval
+        )
+
+    def take(self) -> str:
+        chunk = _sse_chunk(self._payloads)
+        self._payloads = []
+        self._last_flush = time.monotonic()
+        return chunk
+
 
 from .components.dataset_panel import get_dataset_report, format_dataset_summary
 from .components.train_panel import get_training_report
@@ -713,20 +802,26 @@ async def start_tuning(request: Request):
 
         # Use a thread-safe queue so on_progress (running in thread pool)
         # can deliver messages to the async generator in real time.
-        msg_queue: _queue.Queue[str] = _queue.Queue()
+        # Bounded (constraint 9/11c): under slow-client backpressure transient
+        # progress is dropped; terminal events are emitted by the generator
+        # itself, never through on_progress, so they can never be dropped.
+        msg_queue: _queue.Queue[str] = _queue.Queue(maxsize=500)
         last_iteration = 0
+
+        def _enqueue(payload: dict) -> None:
+            _enqueue_bounded(msg_queue, payload)
 
         def on_progress(iteration, message, step=None, params=None, **kwargs):
             nonlocal last_iteration
             if iteration != last_iteration:
                 last_iteration = iteration
-                msg_queue.put(json.dumps({
+                _enqueue({
                     "status": "running",
                     "message": f"--- Iter {iteration} ---",
                     "level": "info",
                     "iteration": iteration,
                     "step": "iteration_start",
-                }))
+                })
             data = {
                 "status": "running",
                 "message": message,
@@ -737,7 +832,10 @@ async def start_tuning(request: Request):
                 data["step"] = step
             if params:
                 data["params"] = params
-            msg_queue.put(json.dumps(data))
+            for _k in ("event", "log_kind", "detail", "epoch", "total_epochs", "train_name"):
+                if _k in kwargs and kwargs[_k] is not None:
+                    data[_k] = kwargs[_k]
+            _enqueue(data)
 
         from auto_tune.modules.agent_engine.loop import run_tuning_loop
 
@@ -1854,24 +1952,48 @@ async def start_first_training(request: Request):
                     "start_time": time.time(),
                 }, _sf)
 
-            # Stream stdout line by line
+            # Open the run's full-log file (new run dir => empty file is safe)
+            _log_path = os.path.join(train_dir, "training.log")
+            with open(_log_path, "w", encoding="utf-8") as _lf:
+                _lf.write("")
+
+            # Single consumer: this coroutine reads the merged stdout/stderr,
+            # persists every line to training.log and emits bounded SSE batches.
+            _warned_once = set()
+            _epoch_keys = set()
+            _batcher = _SseBatch()
             while True:
                 _line_b = await proc.stdout.readline()
                 if not _line_b:
                     break
                 _line = _line_b.decode("utf-8", errors="replace").rstrip()
-                if _line:
-                    yield f"data: {_json.dumps({'status': 'running', 'message': _line, 'level': 'info'})}\n\n"
+                if not _line:
+                    continue
+                _payload = _process_training_output_line(_line, train_name, _log_path, _warned_once)
+                if _payload is None:
+                    continue
+                # Dedup default summary for the same epoch/validation row: the
+                # detail still reaches the log and full panel, only message drops.
+                if _payload.get("event") == "training_log" and _payload.get("log_kind") in ("epoch", "validation"):
+                    _key = (_payload.get("log_kind"), _payload.get("epoch"), _payload.get("message"))
+                    if _key in _epoch_keys:
+                        _payload["message"] = None
+                    else:
+                        _epoch_keys.add(_key)
+                _batcher.add(_payload)
+                if _batcher.should_flush():
+                    yield _batcher.take()
+            if _batcher.pending:
+                yield _batcher.take()
 
             await proc.wait()
 
-            if proc.returncode == 0:
-                _running_training["status"] = "completed"
-                # Remove status file
-                if _os2.path.exists(status_f):
-                    _os2.remove(status_f)
-            else:
-                _running_training["status"] = "failed"
+            # Preserve an aborted state set by /api/training/stop; otherwise
+            # record the real terminal state of the subprocess.
+            if _running_training.get("status") != "aborted":
+                _running_training["status"] = "completed" if proc.returncode == 0 else "failed"
+            # The status file must not stay "running" in any terminal state.
+            _remove_status_file()
             event = _finalize_and_build_event(
                 proc.returncode, train_dir, train_name, APP_CONFIG, "log", _running_training.get("start_iso")
             )
@@ -1895,8 +2017,14 @@ async def start_first_training(request: Request):
 
 @app.get("/api/training/running")
 async def training_running_status():
-    """Check if a first-time training is currently running."""
-    # Check in-memory first
+    """Check if a first-time training is currently running.
+
+    Reconciles the in-memory process first: if it finished, the terminal
+    status (completed/failed) is recorded and the status file is cleaned up so
+    it can never stay "running". Terminal in-memory states take precedence over
+    the status file; the file only reports running=True to survive a server
+    restart that happened mid-training (in-memory state was lost).
+    """
     if _running_training.get("proc") and _running_training["status"] == "running":
         _proc = _running_training["proc"]
         _ret = _proc.poll()
@@ -1908,8 +2036,13 @@ async def training_running_status():
                 "elapsed": time.time() - _running_training.get("start_time", time.time()),
             })
         _running_training["status"] = "completed" if _ret == 0 else "failed"
+        _remove_status_file()
 
-    # Check status file (survives server restart)
+    _status = _running_training.get("status")
+    if _status in ("completed", "failed", "aborted"):
+        return JSONResponse({"running": False, "status": _status})
+
+    # Status file fallback (survives server restart).
     _sf = os.path.join("log", "training_running.json")
     if os.path.exists(_sf):
         try:

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from auto_tune.modules.train_analyzer.experiment_history import ExperimentHistoryStore
 from auto_tune.ui.app import _finalize_and_build_event
 from auto_tune.ui.components.experiment_panel import get_experiment_history
@@ -397,3 +399,372 @@ def test_api_audit_route_returns_record_and_blocks_traversal(tmp_path, monkeypat
     import asyncio
     blocked = asyncio.run(app_mod.api_audit_record("../secret.json"))
     assert blocked.status_code == 400
+
+
+# ── S1.1 structured training-log SSE (Task 2) ──
+
+
+def test_process_training_output_line_persists_and_builds_payload(tmp_path):
+    from auto_tune.ui.app import _process_training_output_line
+
+    log_path = tmp_path / "training.log"
+    payload = _process_training_output_line(
+        "  1/100  1.20G  1.234  0.456  0.789", "train87", log_path, set()
+    )
+
+    assert payload["event"] == "training_log"
+    assert payload["log_kind"] == "epoch"
+    assert payload["message"].startswith("Epoch 1/100:")
+    assert payload["detail"] == "  1/100  1.20G  1.234  0.456  0.789"
+    assert log_path.read_text("utf-8") == "  1/100  1.20G  1.234  0.456  0.789\n"
+
+
+def test_process_training_output_line_detail_writes_log_only(tmp_path):
+    from auto_tune.ui.app import _process_training_output_line
+
+    log_path = tmp_path / "training.log"
+    payload = _process_training_output_line(
+        "1/100 50%|█████| 5/10 [00:01<00:01, 4.5it/s]", "train87", log_path, set()
+    )
+
+    assert payload["log_kind"] == "detail"
+    assert payload["message"] is None
+    assert "5/10" in payload["detail"]
+    assert log_path.read_text("utf-8") == "1/100 50%|█████| 5/10 [00:01<00:01, 4.5it/s]\n"
+
+
+def test_process_training_output_line_persistence_warn_once(tmp_path, monkeypatch):
+    from auto_tune.ui import app as app_mod
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app_mod, "append_training_log", boom)
+    warned = set()
+    log_path = tmp_path / "training.log"
+
+    first = app_mod._process_training_output_line("epoch line", "train87", log_path, warned)
+    second = app_mod._process_training_output_line("another line", "train87", log_path, warned)
+
+    assert first["event"] == "log_persistence_error"
+    assert first["level"] == "warning"
+    assert "训练继续" in first["message"]
+    assert second is None
+
+
+def test_training_sse_batching_bounds_chunk_size():
+    from auto_tune.ui.app import _SseBatch
+
+    # Simulate the streaming loop: add one payload then flush when due.
+    batcher = _SseBatch(max_batch=20, flush_interval=999)
+    chunk_sizes = []
+    for i in range(50):
+        batcher.add({
+            "status": "running",
+            "event": "training_log",
+            "log_kind": "detail",
+            "message": None,
+            "detail": str(i),
+        })
+        if batcher.should_flush():
+            chunk_sizes.append(batcher.take().count("data: "))
+
+    assert chunk_sizes == [20, 20]
+    assert batcher.pending == 10
+    chunk_sizes.append(batcher.take().count("data: "))
+    assert chunk_sizes == [20, 20, 10]
+    assert sum(chunk_sizes) == 50
+    assert all(size <= 20 for size in chunk_sizes)
+
+
+def test_training_sse_batch_flushes_by_time_window():
+    from auto_tune.ui.app import _SseBatch
+
+    batcher = _SseBatch(max_batch=1000, flush_interval=1.0)
+    batcher.add({"status": "running", "message": "m"})
+    batcher._last_flush -= 2.0  # simulate elapsed > interval
+    assert batcher.should_flush() is True
+    assert batcher.take().count("data: ") == 1
+    assert batcher.pending == 0
+
+
+# ── S1.1 frontend log-layering contract (Task 3) ──
+
+
+def test_s11_template_log_layering_contract():
+    from auto_tune.ui.app import _jinja_env
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator("zh")
+    training = {
+        "summary": {
+            "total_runs_analyzed": 0,
+            "best_mAP50": None,
+            "best_overall_run": None,
+            "average_mAP50": None,
+            "runs_with_issues": 0,
+        },
+        "runs": {},
+        "suggestion": None,
+    }
+    html = _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang="zh",
+        active_page="training_monitor",
+        experiment_history=[],
+        tuning_history=[],
+        dataset=None,
+        training=training,
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=None,
+    )
+
+    assert 'id="monitorLog"' in html
+    assert 'id="monitorFullLog"' in html
+    assert 'id="toggleMonitorFullLog"' in html
+    assert 'id="tuningLog"' in html
+    assert 'id="tuningFullLog"' in html
+    assert 'function consumeSseChunk' in html
+    assert 'function appendBounded' in html
+    assert 'function appendTrainingLogLine' in html
+    assert 'var MAX_DEFAULT_LOG_LINES = 500' in html
+    assert 'var MAX_FULL_LOG_LINES = 2000' in html
+    assert 'DocumentFragment' in html
+    assert 'textContent' in html
+    # S1.1 constraint 1/2: training-log rendering must not use innerHTML
+    assert "monitorLog.innerHTML" not in html
+    assert "tuningLog.innerHTML" not in html
+
+
+def test_s11_log_layering_i18n_keys_present():
+    from auto_tune.ui.i18n import TRANSLATIONS
+
+    zh = TRANSLATIONS["zh"]
+    en = TRANSLATIONS["en"]
+    for key in ("完整日志", "展开完整日志", "收起完整日志", "日志保存失败"):
+        assert key in zh
+        assert zh[key]
+    assert en["完整日志"] == "Full Log"
+    assert en["日志保存失败"] == "Log save failed"
+
+
+# ── Ordinary-training running status: terminal states must be reported ──
+
+
+def _training_running_log_dir(monkeypatch, tmp_path):
+    """Redirect os.path.join("log", ...) to a temp dir, returning that dir."""
+    import os as real_os
+
+    log_dir = tmp_path / "log"
+    log_dir.mkdir(exist_ok=True)
+    real_join = real_os.path.join
+
+    def fake_join(*parts):
+        if parts and parts[0] == "log":
+            return str(log_dir / parts[1])
+        return real_join(*parts)
+
+    monkeypatch.setattr(real_os.path, "join", fake_join)
+    return log_dir
+
+
+class _FakeProc:
+    def __init__(self, ret):
+        self._ret = ret
+
+    def poll(self):
+        return self._ret
+
+
+@pytest.mark.parametrize("ret,expected", [(0, "completed"), (1, "failed")])
+def test_training_running_terminal_from_finished_proc(tmp_path, monkeypatch, ret, expected):
+    """A finished subprocess (returncode 0/1) must be reported and the stale
+    training_running.json status file must be cleaned up."""
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    (log_dir / "training_running.json").write_text(
+        json.dumps({"train_name": "train1", "status": "running"}), encoding="utf-8")
+
+    app_mod._running_training.clear()
+    app_mod._running_training.update({
+        "proc": _FakeProc(ret), "status": "running", "train_name": "train1", "start_time": 0,
+    })
+    try:
+        client = TestClient(app_mod.app)
+        data = client.get("/api/training/running").json()
+
+        assert data == {"running": False, "status": expected}
+        # training_running.json must not remain "running" after a terminal state.
+        assert not (log_dir / "training_running.json").exists()
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_running_aborted_reported(tmp_path, monkeypatch):
+    """The aborted terminal state (set by /api/training/stop) is reported."""
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    app_mod._running_training.clear()
+    app_mod._running_training.update({"status": "aborted", "proc": None})
+    try:
+        client = TestClient(app_mod.app)
+        assert client.get("/api/training/running").json() == {"running": False, "status": "aborted"}
+        assert not (log_dir / "training_running.json").exists()
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_running_idle_when_nothing_pending(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    _training_running_log_dir(monkeypatch, tmp_path)
+    app_mod._running_training.clear()
+    try:
+        client = TestClient(app_mod.app)
+        assert client.get("/api/training/running").json() == {"running": False, "status": "idle"}
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_running_true_while_proc_alive(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    _training_running_log_dir(monkeypatch, tmp_path)
+    app_mod._running_training.clear()
+    app_mod._running_training.update({
+        "proc": _FakeProc(None), "status": "running", "train_name": "train9", "start_time": 1,
+    })
+    try:
+        client = TestClient(app_mod.app)
+        data = client.get("/api/training/running").json()
+        assert data["running"] is True
+        assert data["status"] == "running"
+        assert data["train_name"] == "train9"
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_running_true_from_status_file_survives_restart(tmp_path, monkeypatch):
+    """A stale running file (server restarted mid-training) still reports running."""
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    (log_dir / "training_running.json").write_text(
+        json.dumps({"train_name": "trainX", "status": "running"}), encoding="utf-8")
+    app_mod._running_training.clear()
+    try:
+        client = TestClient(app_mod.app)
+        data = client.get("/api/training/running").json()
+        assert data["running"] is True
+        assert data["train_name"] == "trainX"
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_start_failed_cleans_status_file(tmp_path, monkeypatch):
+    """Simulate ordinary training exiting non-zero: the SSE stream records
+    status=failed and removes training_running.json (no stale 'running')."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+
+    class FakeStdout:
+        async def readline(self):
+            return b""
+
+    class FakeProc:
+        returncode = 1
+        stdout = FakeStdout()
+
+        async def wait(self):
+            return 1
+
+    async def fake_subprocess_exec(*args, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.executor.find_detect_dir",
+        lambda: str(tmp_path / "detect"),
+    )
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.executor.resolve_yolo_executable",
+        lambda: "yolo",
+    )
+
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status,
+                      started_at=None, finished_at=None, training_error=None, **kw):
+        return {
+            "run_id": f"manual:{run_name}", "run_name": run_name, "source": "manual",
+            "status": "failed", "analysis_status": "skipped", "metrics": {},
+            "artifacts": {"report_path": None}, "error": training_error,
+            "analysis_error": None, "history_error": None,
+        }
+
+    monkeypatch.setattr("auto_tune.ui.app.finalize_training_run", fake_finalize)
+
+    app_mod._running_training.clear()
+    try:
+        client = TestClient(app_mod.app)
+        resp = client.post("/api/training/start", json={
+            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+        })
+        assert resp.status_code == 200
+        assert "训练失败" in resp.text
+        # The status file written at launch must be removed on failure.
+        assert not (log_dir / "training_running.json").exists()
+        assert app_mod._running_training["status"] == "failed"
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_training_monitor_stop_button_hidden_after_terminal_state():
+    """On page refresh the stop button must not appear for a terminal state:
+    it starts hidden and the page-load handler only shows it when running."""
+    from auto_tune.ui.app import _jinja_env
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator("zh")
+    html = _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang="zh",
+        active_page="training_monitor",
+        experiment_history=[],
+        tuning_history=[],
+        dataset=None,
+        training={
+            "summary": {"total_runs_analyzed": 0, "best_mAP50": None,
+                        "best_overall_run": None, "average_mAP50": None, "runs_with_issues": 0},
+            "runs": {},
+            "suggestion": None,
+        },
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=None,
+    )
+
+    # Stop button is hidden by default...
+    assert 'id="stopTrainingBtn"' in html
+    assert 'style="display:none;" id="stopTrainingBtn"' in html
+    # ...and the page-load handler only reveals it when /api/training/running says running.
+    assert "data.running === true" in html
