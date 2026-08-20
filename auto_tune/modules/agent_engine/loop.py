@@ -15,6 +15,7 @@ import os
 import time
 import logging
 import datetime
+import threading
 from typing import Any
 
 from .perception import build_perception, find_module_b_report
@@ -28,8 +29,68 @@ from .probe_monitor import monitor_training, ProbeDecision
 from .audit import TuningAuditSession, atomic_write_json
 from auto_tune.modules.train_analyzer.results_parser import parse_results_csv
 from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
+from auto_tune.modules.agent_engine.training_log import (
+    append_training_log,
+    classify_training_line,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _forward_output_line(log_path, iteration, on_progress, line):
+    """Classify/persist/forward one raw output line into the unified log contract."""
+    event = classify_training_line(line)
+    try:
+        append_training_log(log_path, event.raw)
+    except OSError:
+        return
+    if on_progress:
+        on_progress(
+            iteration,
+            event.summary,
+            step="execute",
+            event="training_log",
+            log_kind=event.kind,
+            level=event.level,
+            detail=event.raw,
+            epoch=event.epoch,
+            total_epochs=event.total_epochs,
+        )
+
+
+def _start_output_forwarder(train_proc, log_path, iteration, on_progress):
+    """Drain the training subprocess output into training.log + SSE in background.
+
+    Single consumer of ``train_proc.drain_output`` (constraint 10): the loop's
+    probe/wait paths never read the output log themselves. The daemon thread
+    exits once the subprocess ends, after one final drain so no tail line is lost.
+    """
+    def forward(line):
+        _forward_output_line(log_path, iteration, on_progress, line)
+
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            try:
+                train_proc.drain_output(on_line=forward)
+            except Exception:
+                pass
+            try:
+                done = train_proc.proc is None or train_proc.proc.poll() is not None
+            except Exception:
+                done = True
+            if done:
+                break
+            stop.wait(0.05)
+        try:
+            train_proc.drain_output(on_line=forward)  # final flush after process end
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=loop, name="training-output-forwarder", daemon=True)
+    thread.start()
+    return thread
 
 
 def sanitize_and_merge_tuning_params(
@@ -634,6 +695,14 @@ def run_tuning_loop(
             train_proc = TrainingProcess(train_name, output_dir, proc)
             training_start_time = time.time()
 
+            # S1.1: forward subprocess output into unified training.log + SSE.
+            _train_log_path = os.path.join(output_dir, "training.log")
+            with open(_train_log_path, "w", encoding="utf-8") as _lf:
+                _lf.write("")
+            _output_forwarder = _start_output_forwarder(
+                train_proc, _train_log_path, iteration, on_progress
+            )
+
             # ── Step 5: Probe Monitor ──
             if on_progress:
                 on_progress(iteration, "探针监控：监测前 N 个 epoch 的训练趋势", step="probe")
@@ -658,6 +727,7 @@ def run_tuning_loop(
                     return tuning_result
                 history.add_attempt(iter_result.to_dict())
                 tuning_result["iterations"].append(iter_result.to_dict())
+                _output_forwarder.join(timeout=2)
                 if on_progress:
                     on_progress(iteration, f"训练中止: {probe_decision.reason}")
                 continue
@@ -669,6 +739,7 @@ def run_tuning_loop(
                     return tuning_result
                 history.add_attempt(iter_result.to_dict())
                 tuning_result["iterations"].append(iter_result.to_dict())
+                _output_forwarder.join(timeout=2)
                 if on_progress:
                     on_progress(iteration, f"需要重试: {probe_decision.reason}")
                 continue
@@ -733,6 +804,8 @@ def run_tuning_loop(
                             if on_progress:
                                 on_progress(iteration, f"训练进度: Epoch {epoch}/{merged.get('epochs', '?')}, mAP50={mAP}")
                     time.sleep(10)
+
+                _output_forwarder.join(timeout=2)
 
                 if status == "failed":
                     iter_result.error = "训练进程异常退出"

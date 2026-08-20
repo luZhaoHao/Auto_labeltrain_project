@@ -316,14 +316,18 @@ def launch_training(
     train_dir = os.path.dirname(args_path)
     log_path = os.path.join(train_dir, "yolo_train.log")
     log_file = open(log_path, "w", encoding="utf-8")
-    log_file.write(f"# Command: {' '.join(cmd)}\n\n")
-    log_file.flush()
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        log_file.write(f"# Command: {' '.join(cmd)}\n\n")
+        log_file.flush()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    finally:
+        # Close the parent's handle; the child holds its own inherited handle,
+        # so the log file stays valid for the training process lifetime.
+        log_file.close()
     return proc
 
 
@@ -338,6 +342,8 @@ class TrainingProcess:
         self.start_time = time.time()
         self.current_epoch = 0
         self.latest_metrics: dict[str, float] = {}
+        self._output_offset = 0
+        self._output_tail = ""
 
     @property
     def elapsed(self) -> float:
@@ -360,6 +366,42 @@ class TrainingProcess:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             self.status = "aborted"
+
+    def drain_output(self, on_line=None) -> list[str]:
+        """Non-blockingly consume newly available decoded output lines once.
+
+        Reads the subprocess output log (``yolo_train.log``) incrementally from
+        the last consumed offset. A trailing partial line is carried over so no
+        tail line is lost at process end. ``on_line`` (optional) is invoked for
+        each decoded line; the full list of consumed lines is also returned.
+        """
+        lines: list[str] = []
+        log_path = os.path.join(self.train_dir, "yolo_train.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                f.seek(self._output_offset)
+                data = f.read()
+                self._output_offset = f.tell()
+        except OSError:
+            return lines
+
+        if not data:
+            return lines
+
+        text = self._output_tail + data
+        terminated = text.endswith("\n") or text.endswith("\r")
+        pieces = text.splitlines()
+        if pieces:
+            complete = pieces if terminated else pieces[:-1]
+            self._output_tail = "" if terminated else pieces[-1]
+        else:
+            complete = []
+            self._output_tail = text if not terminated else ""
+        for ln in complete:
+            if on_line is not None:
+                on_line(ln)
+        lines.extend(complete)
+        return lines
 
     def read_results_csv(self) -> dict | None:
         """Read the latest results.csv and extract metrics."""

@@ -241,6 +241,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "Idle": "空闲",
         "Running": "运行中",
         "training completed": "训练完成",
+        "完整日志": "完整日志",
+        "展开完整日志": "展开完整日志",
+        "收起完整日志": "收起完整日志",
+        "日志保存失败": "日志保存失败",
 
         # Probe
         "Probe Complete": "探查完成",
@@ -314,6 +318,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "中文": "中文",
         "English": "English",
         "Switch Language": "Switch Language",
+        "完整日志": "Full Log",
+        "展开完整日志": "Expand Full Log",
+        "收起完整日志": "Collapse Full Log",
+        "日志保存失败": "Log save failed",
     },
 }
 

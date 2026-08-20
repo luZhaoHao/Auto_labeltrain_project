@@ -455,6 +455,103 @@ def test_read_reference_before_metrics_missing_csv(tmp_path):
     assert source["error"] == "results_csv_missing"
 
 
+def test_tuning_training_output_forwarded_to_log_and_sse(tmp_path, monkeypatch):
+    """S1.1: candidate training output lands in training.log and emits training_log SSE.
+
+    Uses auto_analyze=True so the loop's wait path joins the output forwarder
+    before finalizing, making the log assertion deterministic.
+    """
+    from auto_tune.modules.agent_engine.probe_monitor import ProbeDecision
+
+    detect_dir = tmp_path / "detect"
+    ref_dir = detect_dir / "train38"
+    ref_dir.mkdir(parents=True)
+    (ref_dir / "args.yaml").write_text(
+        "model: yolov8n.pt\ndata: test_data.yaml\nepochs: 1\nbatch: 16\n",
+        encoding="utf-8",
+    )
+    (ref_dir / "results.csv").write_text(
+        "epoch, metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B)\n"
+        "0, 0.1, 0.2, 0.3, 0.05\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect_dir))
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception", lambda **k: {"dataset": {"total_images": 10}})
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters", lambda *a, **k: _valid_decision())
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.validate_training_preflight", lambda *a, **k: [])
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_yolo_command", lambda *a, **k: ["yolo", "train", "epochs=1"])
+
+    launched = {}
+
+    class FakeProc:
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    def fake_launch(train_name, args_path, merged_params, command=None):
+        out_dir = str(Path(args_path).parent)
+        launched["dir"] = out_dir
+        with open(Path(out_dir) / "yolo_train.log", "w", encoding="utf-8") as f:
+            f.write("  1/100  1.20G  1.234  0.456  0.789\n")
+            f.write("all 10 50 0.123 0.456 0 0.111\n")
+            f.write("1/100 50%|█████| 5/10 [00:01<00:01, 4.5it/s]\n")
+        return FakeProc()
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.launch_training", fake_launch)
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.monitor_training",
+        lambda *a, **k: ProbeDecision(ProbeDecision.CONTINUE, "ok"),
+    )
+
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None,
+                      audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+        return {
+            "run_id": f"tuning:{run_name}",
+            "run_name": run_name,
+            "source": "tuning",
+            "status": "completed",
+            "analysis_status": "completed",
+            "metrics": {"mAP50": 0.3, "mAP50_95": 0.05},
+            "epochs": 1,
+            "artifacts": {"report_path": str(tmp_path / "r.json")},
+            "analysis_error": None,
+            "history_error": None,
+            "error": None,
+        }
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.finalize_training_run", fake_finalize)
+
+    events = []
+
+    def on_progress(iteration, message, **kwargs):
+        events.append({"iteration": iteration, "message": message, "kwargs": kwargs})
+
+    run_tuning_loop(
+        {"probe": {"max_retries": 3}, "train_analyzer": {}},
+        reference_run="train38",
+        log_dir=str(tmp_path),
+        on_progress=on_progress,
+        auto_analyze=True,
+    )
+
+    log_text = (Path(launched["dir"]) / "training.log").read_text(encoding="utf-8")
+    assert "  1/100  1.20G  1.234  0.456  0.789" in log_text
+    assert "all 10 50 0.123 0.456 0 0.111" in log_text
+    assert "5/10" in log_text
+
+    training_events = [e for e in events if e["kwargs"].get("event") == "training_log"]
+    kinds = [e["kwargs"]["log_kind"] for e in training_events]
+    assert "epoch" in kinds
+    assert "validation" in kinds
+    epoch_event = next(e for e in training_events if e["kwargs"]["log_kind"] == "epoch")
+    assert epoch_event["kwargs"]["epoch"] == 1
+    assert epoch_event["kwargs"]["total_epochs"] == 100
+    assert epoch_event["kwargs"]["detail"] == "  1/100  1.20G  1.234  0.456  0.789"
+
+
 def _finalizer_loop_setup(tmp_path, monkeypatch, fake_finalize):
     """Common setup: train38 reference + mocked perception/decision/probe/finalizer."""
     from auto_tune.modules.agent_engine.probe_monitor import ProbeDecision
