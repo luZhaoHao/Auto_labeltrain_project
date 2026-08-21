@@ -10,40 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from auto_tune.modules.security.credentials import known_credentials
+from auto_tune.modules.security.redaction import REDACTED, redact_sensitive
+
 AUDIT_SCHEMA_VERSION = "1.0"
-REDACTED = "***REDACTED***"
-SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "credential",
-)
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).lower()
-    return any(part in normalized for part in SENSITIVE_KEY_PARTS)
-
-
-def redact_sensitive(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            key: REDACTED if _is_sensitive_key(key) else redact_sensitive(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_sensitive(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_sensitive(item) for item in value)
-    return value
 
 
 def atomic_write_json(path: str | os.PathLike, payload: object) -> None:
@@ -61,7 +35,7 @@ def atomic_write_json(path: str | os.PathLike, payload: object) -> None:
         ) as handle:
             temp_path = Path(handle.name)
             json.dump(
-                redact_sensitive(payload),
+                redact_sensitive(payload, known_secrets=known_credentials()),
                 handle,
                 ensure_ascii=False,
                 indent=2,

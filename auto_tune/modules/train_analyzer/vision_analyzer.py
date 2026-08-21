@@ -5,6 +5,14 @@ import re
 import base64
 import requests
 
+from auto_tune.modules.security.credentials import resolve_credential
+from auto_tune.modules.security.endpoint_policy import (
+    DEFAULT_QWEN_ENDPOINT,
+    EndpointPolicyError,
+    validate_endpoint,
+)
+from auto_tune.modules.security.redaction import safe_provider_error
+
 
 def clean_llm_response(text: str) -> str:
     """Strip markdown prefixes, weak opening phrases, and trailing whitespace."""
@@ -117,16 +125,21 @@ def analyze_error_crops(run_dir: str, config: dict,
 
 
 def _call_vision_api(image_path: str, config: dict, prompt: str) -> dict:
-    """Internal: call Qwen-VL API with an image."""
+    """Internal: call Qwen-VL API with an image using the resolved credential."""
     vision_cfg = config.get("vision", {})
-    api_key = vision_cfg.get("api_key", "")
+    api_key = resolve_credential("vision")
+    if not api_key:
+        return {"error": "credential_missing"}
+    try:
+        endpoint = validate_endpoint(
+            vision_cfg.get("endpoint") or DEFAULT_QWEN_ENDPOINT,
+            bool(vision_cfg.get("allow_private_endpoint", False)),
+        )
+    except EndpointPolicyError:
+        return {"error": "endpoint_rejected"}
     model = vision_cfg.get("model", "qwen3-vl-flash")
-    endpoint = vision_cfg.get("endpoint", "")
     temperature = vision_cfg.get("temperature", 0.3)
     max_tokens = vision_cfg.get("max_tokens", 500)
-
-    if not endpoint:
-        return {"error": "Vision API endpoint not configured."}
 
     try:
         img_b64 = _encode_image(image_path)
@@ -157,20 +170,26 @@ def _call_vision_api(image_path: str, config: dict, prompt: str) -> dict:
     }
 
     try:
-        resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
-        if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"]
-            cleaned = clean_llm_response(content)
-            return {
-                "model_used": model,
-                "image_analyzed": os.path.basename(image_path),
-                "analysis": cleaned,
-                "error": None,
-            }
-        err = resp.json().get("error", {}).get("message", resp.text[:200])
-        return {"error": f"Vision API error ({resp.status_code}): {err}"}
-    except Exception as e:
-        return {"error": f"Vision API exception: {e}"}
+        resp = requests.post(
+            endpoint, headers=headers, json=payload, timeout=(10, 120), allow_redirects=False
+        )
+    except requests.exceptions.RequestException:
+        return {"error": "network_failed"}
+    if resp.status_code != 200:
+        return {
+            "error": f"Vision API error ({resp.status_code}): {safe_provider_error(resp.status_code)}"
+        }
+    try:
+        content = resp.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return {"error": "incompatible_response"}
+    cleaned = clean_llm_response(content)
+    return {
+        "model_used": model,
+        "image_analyzed": os.path.basename(image_path),
+        "analysis": cleaned,
+        "error": None,
+    }
 
 
 def multimodal_consult(run_dir: str, config: dict,

@@ -154,17 +154,19 @@ training:
   workers: 4
 
 llm:
-  api_key: YOUR_DEEPSEEK_API_KEY
   enabled: false
+  provider: deepseek
+  credential_ref: AutoTuneStudio/text/deepseek
 
 vision:
-  api_key: YOUR_QWEN_API_KEY
   enabled: false
+  provider: qwen
+  credential_ref: AutoTuneStudio/vision/qwen
 ```
 
-Without API keys, set `llm.enabled` and `vision.enabled` to `false`. Python metric analysis, manual training, and `keep_params` verification do not require an LLM.
+API keys are not stored in YAML. Save them through AI Service Settings into Windows Credential Manager, or provide the read-only environment variables `AUTO_TUNE_TEXT_API_KEY` / `AUTO_TUNE_VISION_API_KEY`. Without keys, disable `llm.enabled` and `vision.enabled`; local metric analysis and manual training remain available.
 
-> `auto_tune/config.yaml` may contain secrets and local paths and is intentionally excluded from GitHub. Never place real API keys in README files, Issues, logs, or screenshots.
+> `auto_tune/config.yaml` may contain local paths but must not contain API keys and remains excluded from GitHub. Never place real API keys in README files, Issues, logs, scripts, or screenshots.
 
 ## Operator Guide
 
