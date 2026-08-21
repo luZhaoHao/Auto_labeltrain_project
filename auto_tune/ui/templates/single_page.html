@@ -390,6 +390,55 @@
   </div>
 </div>
 
+{# ─── AI 服务配置 (S1.3) ─── #}
+<div style="display:flex; justify-content:space-between; align-items:center; margin:20px 0 12px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("AI Service Settings") }}</div>
+</div>
+<div class="row">
+  {% for purpose, cfg in (ai_config if ai_config is defined else {}).items() %}
+  <div class="col" style="flex:1;">
+    <div class="card">
+      <div class="card-title">{{ _("Text & Tuning Service") if purpose == 'text' else _("Vision Service") }}</div>
+      <div data-ai-purpose="{{ purpose }}">
+        <div class="ai-status" data-ai-status style="font-size:12px; margin-bottom:8px;"></div>
+        <label class="ai-field" style="display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" data-ai-enabled {% if cfg.enabled %}checked{% endif %}>
+          <span>{{ _("Enabled") }}</span>
+        </label>
+        <label class="ai-field" style="display:block; margin-top:6px;">
+          <span style="font-size:12px; color:var(--text-secondary);">{{ _("Provider") }}</span>
+          <input data-ai-provider value="{{ cfg.provider|e }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;">
+        </label>
+        <label class="ai-field" style="display:block; margin-top:6px;">
+          <span style="font-size:12px; color:var(--text-secondary);">{{ _("Model") }}</span>
+          <input data-ai-model value="{{ cfg.model|e }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;">
+        </label>
+        <label class="ai-field" style="display:block; margin-top:6px;">
+          <span style="font-size:12px; color:var(--text-secondary);">{{ _("Endpoint") }}</span>
+          <input data-ai-endpoint value="{{ cfg.endpoint|e }}" placeholder="{{ cfg.default_endpoint|e }}" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;">
+        </label>
+        <label class="ai-field" style="display:flex; align-items:center; gap:6px; margin-top:6px;">
+          <input type="checkbox" data-ai-private {% if cfg.allow_private_endpoint %}checked{% endif %}>
+          <span style="font-size:12px;">{{ _("Allow local/private model endpoints") }}</span>
+        </label>
+        <div class="ai-http-warning" data-ai-http-warning style="display:none; margin-top:6px; padding:4px 8px; background:#FFF7ED; border:1px solid #FDBA74; border-radius:4px; font-size:12px; color:#9A3412;">{{ _("HTTP is not encrypted") }}</div>
+        <div class="ai-migrate" data-ai-migrate style="display:none; margin-top:6px; padding:4px 8px; background:#FEF3C7; border:1px solid #FDE68A; border-radius:4px; font-size:12px; color:#92400E;">{{ _("Legacy plaintext key detected") }}</div>
+        <div class="ai-credential-status" data-ai-credential-status style="margin-top:6px; font-size:12px; color:var(--text-secondary);"></div>
+        <input type="password" data-ai-key placeholder="{{ _("New API Key") }}" autocomplete="new-password" style="width:100%; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px; margin-top:8px;">
+        <div class="mt-2" style="display:flex; flex-wrap:wrap; gap:6px;">
+          <button class="btn btn-sm btn-outline" data-ai-save>{{ _("Save") }}</button>
+          <button class="btn btn-sm btn-outline" data-ai-test>{{ _("Test Connection") }}</button>
+          <button class="btn btn-sm btn-primary" data-ai-store>{{ _("Save Key") }}</button>
+          <button class="btn btn-sm btn-outline" data-ai-delete>{{ _("Delete Key") }}</button>
+          <button class="btn btn-sm btn-outline" data-ai-migrate-btn style="display:none;">{{ _("Migrate Key") }}</button>
+        </div>
+        <div class="ai-action-message" data-ai-action-message style="margin-top:6px; font-size:12px;"></div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
 <div class="row">
   <div class="col">
     <div class="card">
@@ -691,48 +740,6 @@
     </div>
   </div>
 </details>
-
-{# ─── Dataset Split Section ─── #}
-{% if latest_dataset %}
-<div class="card" style="margin-top:12px;">
-  <div class="card-title" style="margin-bottom:8px;">
-    <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-    数据集划分
-  </div>
-  <div style="font-size:13px; color:var(--text-secondary); margin-bottom:10px;">
-    数据集路径: <code style="background:var(--accent-bg); padding:2px 6px; border-radius:3px;">{{ latest_dataset.dataset_path }}</code>
-  </div>
-  {% if latest_dataset.split %}
-    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-      <span class="badge badge-green">已划分</span>
-      <span style="font-size:13px; color:var(--text-secondary);">
-        训练: <strong>{{ latest_dataset.train_count }}</strong> 张 |
-        验证: <strong>{{ latest_dataset.val_count }}</strong> 张
-      </span>
-      <span style="font-size:12px; color:var(--text-muted);">
-        data.yaml: <code>{{ latest_dataset.data_yaml_path }}</code>
-      </span>
-    </div>
-  {% else %}
-    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-      <span class="badge badge-yellow">未划分</span>
-      <span style="font-size:13px; color:var(--text-secondary);">需要将数据集划分为训练集和验证集才能用于训练</span>
-    </div>
-    <div style="margin-top:10px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-      <label style="font-size:13px; display:flex; align-items:center; gap:4px;">
-        验证集比例:
-        <input id="splitRatio" type="number" min="0.05" max="0.5" step="0.05" value="0.2" style="width:60px; padding:4px 6px; border:1px solid var(--border); border-radius:4px; font-size:13px; text-align:center;">
-      </label>
-      <button class="btn btn-primary btn-sm" onclick="splitDataset()">
-        <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-        开始划分
-      </button>
-      <span id="splitStatus" style="font-size:13px; display:none;"></span>
-    </div>
-  {% endif %}
-</div>
-{% endif %}
-
 {% else %}
 <div class="card">
   <div style="text-align:center; padding:40px 20px;">
@@ -740,6 +747,67 @@
     <div style="font-size:15px; color:var(--text-secondary); margin-bottom:4px;">{{ _("No Dataset Analysis Available") }}</div>
     <div style="font-size:13px; color:var(--text-muted);">{{ _("Upload a dataset ZIP above to start analysis.") }}</div>
   </div>
+</div>
+{% endif %}
+
+{# ─── Dataset Snapshot Section ─── #}
+{% if latest_dataset %}
+<div class="card" style="margin-top:12px;">
+  <div class="card-title" style="margin-bottom:8px;">
+    <svg viewBox="0 0 24 24" style="width:16px; height:16px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:6px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+    {{ _("Dataset Snapshot") }}
+  </div>
+  <div style="font-size:13px; color:var(--text-secondary); margin-bottom:10px;">
+    {{ _("Dataset path") }}: <code style="background:var(--accent-bg); padding:2px 6px; border-radius:3px;">{{ latest_dataset.dataset_path }}</code>
+    {% if latest_dataset.source_dataset_path and latest_dataset.source_dataset_path != latest_dataset.dataset_path %}
+    <div style="margin-top:4px;">{{ _("Source path") }}: <code style="background:var(--accent-bg); padding:2px 6px; border-radius:3px;">{{ latest_dataset.source_dataset_path }}</code></div>
+    {% endif %}
+  </div>
+  {% if latest_dataset.split and latest_dataset.snapshot_id %}
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <span class="badge {% if latest_dataset.snapshot_valid %}badge-green{% else %}badge-yellow{% endif %}">
+        {% if latest_dataset.snapshot_valid %}{{ _("Snapshot Valid") }}{% else %}{{ _("Snapshot Corrupted") }}{% endif %}
+      </span>
+      <span style="font-size:13px; color:var(--text-secondary);">
+        {{ _("Snapshot ID") }}: <code>{{ latest_dataset.snapshot_id[:12] }}…</code>
+      </span>
+      <span style="font-size:13px; color:var(--text-secondary);">
+        {{ _("Train") }}: <strong>{{ latest_dataset.train_count }}</strong> | {{ _("Val") }}: <strong>{{ latest_dataset.val_count }}</strong>
+      </span>
+      {% if latest_dataset.background_count %}
+      <span style="font-size:12px; color:var(--text-muted);">{{ _("Background") }}: {{ latest_dataset.background_count }}</span>
+      {% endif %}
+      <span style="font-size:12px; color:var(--text-muted);">
+        data.yaml: <code>{{ latest_dataset.data_yaml_path }}</code>
+      </span>
+    </div>
+    {% if not latest_dataset.snapshot_valid %}
+    <div style="margin-top:8px; font-size:12px; color:var(--destructive);">{{ _("Snapshot files are missing or digest mismatch; it cannot be used for training.") }}</div>
+    {% endif %}
+  {% else %}
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <span class="badge badge-yellow">{{ _("No Snapshot") }}</span>
+      <span style="font-size:13px; color:var(--text-secondary);">{{ _("Create a materialized snapshot before training.") }}</span>
+    </div>
+    <div style="margin-top:10px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <label style="font-size:13px; display:flex; align-items:center; gap:4px;">
+        {{ _("Validation Ratio") }}:
+        <input id="splitRatio" type="number" min="0.05" max="0.5" step="0.05" value="0.2" style="width:60px; padding:4px 6px; border:1px solid var(--border); border-radius:4px; font-size:13px; text-align:center;">
+      </label>
+      <label style="font-size:13px; display:flex; align-items:center; gap:4px;">
+        {{ _("Random Seed") }}:
+        <input id="splitSeed" type="number" step="1" value="42" style="width:70px; padding:4px 6px; border:1px solid var(--border); border-radius:4px; font-size:13px; text-align:center;">
+      </label>
+      <button class="btn btn-primary btn-sm" id="splitBtn" onclick="splitDataset()">
+        <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none; vertical-align:middle; margin-right:4px;" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        {{ _("Create Training Snapshot") }}
+      </button>
+      <span id="splitStatus" style="font-size:13px; display:none;"></span>
+    </div>
+    <div style="margin-top:8px; font-size:12px; color:var(--text-muted);">
+      {{ _("Original data will not be moved or modified; a full snapshot uses extra disk space.") }}
+    </div>
+  {% endif %}
 </div>
 {% endif %}
 </div>
@@ -1241,15 +1309,20 @@
 <div id="trainModal" class="modal-overlay" style="display:none;">
   <div class="modal-content" style="max-width:520px;">
     <div style="font-weight:600; font-size:15px; margin-bottom:14px;">{{ _("Start New Training") }}</div>
-    {% if latest_dataset and latest_dataset.split %}
+    {% if latest_dataset and latest_dataset.snapshot_valid %}
     <div style="font-size:12px; background:var(--success-bg); border:1px solid var(--success); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
       <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--success); stroke-width:2; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-      <span>数据集已就绪: <strong>{{ latest_dataset.train_count }}</strong> 训练 / <strong>{{ latest_dataset.val_count }}</strong> 验证</span>
+      <span>{{ _("Dataset ready") }}: <strong>{{ latest_dataset.train_count }}</strong> {{ _("Train") }} / <strong>{{ latest_dataset.val_count }}</strong> {{ _("Val") }}</span>
+    </div>
+    {% elif latest_dataset and latest_dataset.split and not latest_dataset.snapshot_valid %}
+    <div style="font-size:12px; background:var(--warning-bg); border:1px solid var(--destructive); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+      <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--warning); stroke-width:2; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span>{{ _("Snapshot is corrupted and cannot be used for training.") }}</span>
     </div>
     {% elif latest_dataset and not latest_dataset.split %}
     <div style="font-size:12px; background:var(--warning-bg); border:1px solid var(--accent-border); border-radius:var(--radius); padding:8px 12px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
       <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:var(--warning); stroke-width:2; fill:none; flex-shrink:0;" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-      <span>数据集已上传但<strong>未划分</strong>，请先到数据集报告页划分数据集</span>
+      <span>{{ _("Dataset uploaded but no immutable snapshot; create a training snapshot first.") }}</span>
     </div>
     {% endif %}
     <div style="font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
@@ -1258,7 +1331,7 @@
     <table>
       <tr>
         <td style="width:130px;">data.yaml *</td>
-        <td><input id="trainDataYaml" value="{% if latest_dataset and latest_dataset.split %}{{ latest_dataset.data_yaml_path }}{% else %}{{ project.get("data_yaml", training_config.get("data_yaml", "")) }}{% endif %}" placeholder="D:\path\to\data.yaml" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+        <td><input id="trainDataYaml" value="{% if latest_dataset and latest_dataset.snapshot_valid %}{{ latest_dataset.data_yaml_path }}{% else %}{{ project.get("data_yaml", training_config.get("data_yaml", "")) }}{% endif %}" placeholder="D:\path\to\data.yaml" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
       </tr>
       <tr>
         <td>{{ _("Model") }}</td>
@@ -1494,6 +1567,8 @@
 </div>
 
 <script>
+window._CSRF_TOKEN = {{ csrf_token|default('')|tojson }};
+
 // ── Tab switching ──
 function switchPage(idx) {
   var pages = document.querySelectorAll('.page');
@@ -1563,6 +1638,169 @@ function saveProject() {
     })
     .catch(function(){ alert('{{ _("Save failed") }}'); btn.disabled=false; btn.textContent='{{ _("Save") }}'; });
 }
+
+// ── AI Service Settings (S1.3) ──
+var _AI_RESULT_LABELS = {
+  success: '{{ _("Success") }}',
+  authentication_failed: '{{ _("Authentication failed") }}',
+  network_failed: '{{ _("Network failed") }}',
+  endpoint_rejected: '{{ _("Endpoint rejected") }}',
+  incompatible_response: '{{ _("Incompatible response") }}',
+  rate_limited: '{{ _("Rate limited") }}',
+  provider_failed: '{{ _("Provider failed") }}',
+  untested: '{{ _("Untested") }}'
+};
+var _AI_SOURCE_LABELS = {
+  environment: '{{ _("Environment variable") }}',
+  windows_credential_manager: '{{ _("Windows Credential Manager") }}',
+  missing: '{{ _("Not configured") }}'
+};
+
+function _aiCard(purpose) { return document.querySelector('[data-ai-purpose="' + purpose + '"]'); }
+function _aiField(card, name) { return card.querySelector('[data-ai-' + name + ']'); }
+function _aiMsg(card, text, isError) {
+  var el = _aiField(card, 'action-message');
+  el.textContent = text || '';
+  el.style.color = isError ? '#B91C1C' : 'var(--text-secondary)';
+}
+function _aiRefreshHttpWarning(card) {
+  var endpoint = (_aiField(card, 'endpoint').value || '').trim();
+  _aiField(card, 'http-warning').style.display = endpoint.indexOf('http://') === 0 ? 'block' : 'none';
+}
+function _aiFetch(url, options) {
+  options = options || {};
+  options.headers = options.headers || {};
+  options.headers['X-CSRF-Token'] = window._CSRF_TOKEN;
+  return fetch(url, options).then(function(r){
+    return r.json().catch(function(){ return {}; }).then(function(body){
+      return {status: r.status, body: body};
+    });
+  });
+}
+
+function aiRefreshSettings() {
+  return fetch('/api/ai-settings').then(function(r){ return r.json(); }).then(function(all){
+    ['text','vision'].forEach(function(purpose){
+      var s = all[purpose];
+      if (!s) return;
+      var card = _aiCard(purpose);
+      _aiField(card, 'enabled').checked = !!s.enabled;
+      _aiField(card, 'provider').value = s.provider || '';
+      _aiField(card, 'model').value = s.model || '';
+      _aiField(card, 'endpoint').value = s.endpoint || '';
+      _aiField(card, 'private').checked = !!s.allow_private_endpoint;
+      var source = _AI_SOURCE_LABELS[s.source] || s.source;
+      var statusText = s.configured ? ('{{ _("Configured") }}: ' + source) : ('{{ _("Not configured") }} (' + source + ')');
+      if (!s.writable) statusText += ' · {{ _("read-only") }}';
+      _aiField(card, 'status').textContent = statusText;
+      var credParts = [];
+      if (s.last_test_result) {
+        credParts.push('{{ _("Last test") }}: ' + (_AI_RESULT_LABELS[s.last_test_result] || s.last_test_result));
+      }
+      if (s.last_tested_at) credParts.push(String(s.last_tested_at).replace('T',' ').slice(0,19));
+      _aiField(card, 'credential-status').textContent = credParts.join(' · ');
+      _aiField(card, 'migrate').style.display = s.migration_required ? 'block' : 'none';
+      _aiField(card, 'migrate-btn').style.display = s.migration_required ? 'inline-flex' : 'none';
+      _aiField(card, 'store').disabled = !s.writable;
+      _aiField(card, 'delete').disabled = !s.writable;
+      _aiRefreshHttpWarning(card);
+    });
+  }).catch(function(){});
+}
+
+function aiSaveSettings(purpose) {
+  var card = _aiCard(purpose);
+  var payload = {
+    enabled: _aiField(card, 'enabled').checked,
+    provider: _aiField(card, 'provider').value.trim(),
+    model: _aiField(card, 'model').value.trim(),
+    endpoint: _aiField(card, 'endpoint').value.trim(),
+    allow_private_endpoint: _aiField(card, 'private').checked
+  };
+  if (payload.allow_private_endpoint && !window.confirm('{{ _("Enable local/private model endpoints?") }}')) { return; }
+  _aiMsg(card, '{{ _("Saving...") }}', false);
+  _aiFetch('/api/ai-settings/' + purpose, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+  }).then(function(res){
+    if (res.status === 200) { _aiMsg(card, '{{ _("Settings saved") }}', false); aiRefreshSettings(); }
+    else { _aiMsg(card, (res.body && res.body.error) || '{{ _("Save failed") }}', true); }
+  });
+}
+
+function aiTestConnection(purpose) {
+  var card = _aiCard(purpose);
+  _aiMsg(card, '{{ _("Testing...") }}', false);
+  _aiFetch('/api/credentials/' + purpose + '/test', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+  }).then(function(res){
+    if (res.status === 200) {
+      _aiMsg(card, '{{ _("Test result") }}: ' + (_AI_RESULT_LABELS[res.body.result] || res.body.result), false);
+    } else {
+      _aiMsg(card, (res.body && res.body.error) || '{{ _("Test failed") }}', true);
+    }
+    aiRefreshSettings();
+  });
+}
+
+function aiStoreKey(purpose) {
+  var card = _aiCard(purpose);
+  var key = _aiField(card, 'key').value;
+  if (!key) { _aiMsg(card, '{{ _("Please enter a new API key") }}', true); return; }
+  var testBefore = window.confirm('{{ _("Test the new key before saving?") }}');
+  _aiFetch('/api/credentials/' + purpose, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: key, test_before_replace: testBefore})
+  }).then(function(res){
+    if (res.status === 200) {
+      _aiMsg(card, testBefore ? '{{ _("Key saved (tested)") }}' : '{{ _("Key saved (untested)") }}', false);
+      _aiField(card, 'key').value = '';
+      aiRefreshSettings();
+    } else { _aiMsg(card, (res.body && res.body.error) || '{{ _("Save failed") }}', true); }
+  });
+}
+
+function aiDeleteKey(purpose) {
+  var card = _aiCard(purpose);
+  if (!window.confirm('{{ _("Delete this API key?") }}')) { return; }
+  _aiFetch('/api/credentials/' + purpose, {
+    method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm: true})
+  }).then(function(res){
+    if (res.status === 200) { _aiMsg(card, '{{ _("Key deleted") }}', false); aiRefreshSettings(); }
+    else { _aiMsg(card, (res.body && res.body.error) || '{{ _("Delete failed") }}', true); }
+  });
+}
+
+function aiMigrateKey(purpose) {
+  var card = _aiCard(purpose);
+  if (!window.confirm('{{ _("Migrate the legacy plaintext key to the secure store? If the old key was ever exposed, revoke it in the provider console and use a new key.") }}')) { return; }
+  _aiFetch('/api/credentials/' + purpose + '/migrate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+  }).then(function(res){
+    if (res.status === 200) { _aiMsg(card, '{{ _("Key migrated") }}', false); aiRefreshSettings(); }
+    else { _aiMsg(card, (res.body && res.body.error) || '{{ _("Migration failed") }}', true); }
+  });
+}
+
+aiRefreshSettings();
+
+document.querySelectorAll('[data-ai-save]').forEach(function(btn){
+  btn.addEventListener('click', function(){ aiSaveSettings(btn.closest('[data-ai-purpose]').getAttribute('data-ai-purpose')); });
+});
+document.querySelectorAll('[data-ai-test]').forEach(function(btn){
+  btn.addEventListener('click', function(){ aiTestConnection(btn.closest('[data-ai-purpose]').getAttribute('data-ai-purpose')); });
+});
+document.querySelectorAll('[data-ai-store]').forEach(function(btn){
+  btn.addEventListener('click', function(){ aiStoreKey(btn.closest('[data-ai-purpose]').getAttribute('data-ai-purpose')); });
+});
+document.querySelectorAll('[data-ai-delete]').forEach(function(btn){
+  btn.addEventListener('click', function(){ aiDeleteKey(btn.closest('[data-ai-purpose]').getAttribute('data-ai-purpose')); });
+});
+document.querySelectorAll('[data-ai-migrate-btn]').forEach(function(btn){
+  btn.addEventListener('click', function(){ aiMigrateKey(btn.closest('[data-ai-purpose]').getAttribute('data-ai-purpose')); });
+});
+document.querySelectorAll('[data-ai-endpoint]').forEach(function(input){
+  input.addEventListener('input', function(){ _aiRefreshHttpWarning(input.closest('[data-ai-purpose]')); });
+});
 
 // ── History details toggle ──
 function toggleDetails(id) {
@@ -1723,30 +1961,48 @@ function analyzeDatasetFolder() {
     });
 }
 
-// ── Dataset Split ──
+// ── Dataset Snapshot ──
 function splitDataset() {
   var ratio = document.getElementById('splitRatio').value;
+  var seed = document.getElementById('splitSeed').value;
   var statusEl = document.getElementById('splitStatus');
-  if (!statusEl) return;
+  var btn = document.getElementById('splitBtn');
+  if (!statusEl || !btn) return;
+  var ratioNum = parseFloat(ratio);
+  var seedNum = parseInt(seed, 10);
   statusEl.style.display = 'inline';
-  statusEl.textContent = '划分中...';
+  if (!isFinite(ratioNum) || ratioNum <= 0 || ratioNum >= 1) {
+    statusEl.textContent = '{{ _("Validation ratio must be a number in (0,1).") }}';
+    statusEl.style.color = 'var(--destructive)';
+    return;
+  }
+  if (!Number.isInteger(seedNum)) {
+    statusEl.textContent = '{{ _("Random seed must be an integer.") }}';
+    statusEl.style.color = 'var(--destructive)';
+    return;
+  }
+  statusEl.textContent = '{{ _("Verifying and copying...") }}';
   statusEl.style.color = 'var(--text-secondary)';
+  btn.disabled = true;
   fetch('/api/dataset/split', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ val_ratio: parseFloat(ratio) || 0.2 }),
+    body: JSON.stringify({ val_ratio: ratioNum, seed: seedNum }),
   }).then(function(r) { return r.json(); }).then(function(result) {
     if (result.status === 'success') {
-      statusEl.textContent = '划分完成！训练: ' + result.train_count + ' 张, 验证: ' + result.val_count + ' 张';
+      var reused = result.reused ? ' {{ _("(reused existing snapshot)") }}' : '';
+      statusEl.textContent = '{{ _("Snapshot created") }}' + reused + ': {{ _("Train") }} ' + result.train_count + ' / {{ _("Val") }} ' + result.val_count;
       statusEl.style.color = 'var(--success)';
       setTimeout(function() { location.reload(); }, 2000);
     } else {
-      statusEl.textContent = '划分失败: ' + (result.error || 'Unknown');
+      statusEl.textContent = '{{ _("Snapshot creation failed") }}: ' + (result.error || 'Unknown');
       statusEl.style.color = 'var(--destructive)';
+      btn.disabled = false;
     }
   }).catch(function(err) {
-    statusEl.textContent = '请求失败: ' + err.message;
+    statusEl.textContent = '{{ _("Request failed") }}: ' + err.message;
     statusEl.style.color = 'var(--destructive)';
+    btn.disabled = false;
   });
 }
 

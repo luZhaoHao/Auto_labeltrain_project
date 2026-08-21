@@ -9,6 +9,7 @@ Provides three major pages:
 import json
 import os
 import time
+import secrets
 import asyncio
 import threading
 import zipfile
@@ -17,10 +18,31 @@ import shutil
 import datetime
 from pathlib import Path
 from functools import lru_cache
+from urllib.parse import urlsplit
 from fastapi import FastAPI, Request, Query, Cookie, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+import requests
 import yaml
+
+from auto_tune.modules.security.credentials import (
+    CredentialError,
+    UnsupportedPlatformError,
+    clear_last_test_result,
+    delete_credential,
+    get_credential_status,
+    invalidate_credential_cache,
+    resolve_credential,
+    set_last_test_result,
+    store_credential,
+)
+from auto_tune.modules.security.endpoint_policy import (
+    DEFAULT_DEEPSEEK_ENDPOINT,
+    DEFAULT_QWEN_ENDPOINT,
+    EndpointPolicyError,
+    validate_endpoint,
+)
+from auto_tune.modules.security.redaction import safe_provider_error
 
 
 def _safe_extract_zip(zf: zipfile.ZipFile, destination: str | Path) -> None:
@@ -41,6 +63,17 @@ from auto_tune.modules.agent_engine.training_log import (
     append_training_log,
     build_training_sse_payload,
     classify_training_line,
+)
+from auto_tune.modules.dataset_snapshot import (
+    SnapshotConflictError,
+    SnapshotError,
+    SnapshotInsufficientSpaceError,
+    SnapshotIOError,
+    SnapshotValidationError,
+)
+from auto_tune.modules.dataset_snapshot.service import (
+    create_dataset_snapshot,
+    validate_dataset_snapshot,
 )
 
 
@@ -200,14 +233,23 @@ _jinja_env = jinja2.Environment(
     auto_reload=True,
 )
 
-# Config
+# Config — plaintext api_key is never loaded into the public APP_CONFIG.
 config_path = Path(__file__).parent.parent / "config.yaml"
-if config_path.exists():
-    import yaml
+
+
+def _load_public_config() -> dict:
+    if not config_path.exists():
+        return {}
     with open(config_path, encoding="utf-8") as f:
-        APP_CONFIG = yaml.safe_load(f)
-else:
-    APP_CONFIG = {}
+        cfg = yaml.safe_load(f) or {}
+    for _section in ("llm", "vision"):
+        _sec = cfg.get(_section)
+        if isinstance(_sec, dict):
+            _sec.pop("api_key", None)
+    return cfg
+
+
+APP_CONFIG = _load_public_config()
 
 # Track running training process (single-worker only)
 _running_training: dict = {}
@@ -236,6 +278,241 @@ def _update_config(section: str, data: dict) -> tuple[bool, str]:
         return True, "ok"
     except Exception as e:
         return False, str(e)
+
+
+# ── S1.3 AI settings / credential security ──
+_CSRF_TOKEN = secrets.token_urlsafe(32)
+_PLACEHOLDER_KEYS = {"YOUR_DEEPSEEK_API_KEY", "YOUR_QWEN_API_KEY"}
+_AI_SETTINGS_WHITELIST = {
+    "enabled",
+    "provider",
+    "model",
+    "endpoint",
+    "allow_private_endpoint",
+}
+_MAX_KEY_LENGTH = 512
+_MAX_REQUEST_BODY = 64 * 1024
+
+
+class _SecurityRejected(Exception):
+    pass
+
+
+class _BodyError(Exception):
+    pass
+
+
+def _section_for(purpose: str) -> str:
+    return "llm" if purpose == "text" else "vision"
+
+
+def _default_endpoint_for(purpose: str) -> str:
+    return DEFAULT_DEEPSEEK_ENDPOINT if purpose == "text" else DEFAULT_QWEN_ENDPOINT
+
+
+def _default_model_for(purpose: str) -> str:
+    return "deepseek-chat" if purpose == "text" else "qwen-vl-plus"
+
+
+def _read_config_file() -> dict:
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _atomic_write_yaml(path: object, data: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            yaml.safe_dump(
+                data, handle, default_flow_style=False, allow_unicode=True, sort_keys=False
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _legacy_key_in_config(purpose: str) -> str | None:
+    """Detect a non-empty, non-placeholder legacy api_key for a purpose.
+
+    The value is never exposed outside this module; only the boolean state is.
+    """
+    section = _section_for(purpose)
+    cfg = _read_config_file()
+    value = (cfg.get(section) or {}).get("api_key")
+    if isinstance(value, str) and value.strip() and value not in _PLACEHOLDER_KEYS:
+        return value
+    return None
+
+
+def _validate_key_value(key: object) -> None:
+    if not isinstance(key, str):
+        raise ValueError("key must be a string")
+    if not key.strip():
+        raise ValueError("key must not be empty")
+    if any(ord(c) < 32 for c in key):
+        raise ValueError("key must not contain control characters")
+    if len(key) > _MAX_KEY_LENGTH:
+        raise ValueError("key is too long")
+    if key in _PLACEHOLDER_KEYS:
+        raise ValueError("key must not be a placeholder")
+
+
+def _check_same_origin(request: Request) -> bool:
+    host = request.headers.get("host", "")
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        origin_host = urlsplit(origin).netloc
+    except ValueError:
+        return False
+    return origin_host == host
+
+
+def _require_security(request: Request) -> None:
+    if not _check_same_origin(request):
+        raise _SecurityRejected("cross-origin request rejected")
+    token = request.headers.get("x-csrf-token", "")
+    if not token or not secrets.compare_digest(token, _CSRF_TOKEN):
+        raise _SecurityRejected("missing or invalid CSRF token")
+
+
+async def _safe_json_body(request: Request) -> object:
+    raw = await request.body()
+    if not raw:
+        return {}
+    if len(raw) > _MAX_REQUEST_BODY:
+        raise _BodyError("request body too large")
+    try:
+        return json.loads(raw)
+    except Exception:
+        raise _BodyError("request body must be valid JSON")
+
+
+def _ai_settings_for(purpose: str) -> dict:
+    section = _section_for(purpose)
+    cfg_section = (APP_CONFIG.get(section) or {}) if APP_CONFIG else {}
+    status = get_credential_status(purpose)
+    return {
+        "purpose": purpose,
+        "enabled": bool(cfg_section.get("enabled", True)),
+        "provider": cfg_section.get("provider", "deepseek" if purpose == "text" else "qwen"),
+        "model": cfg_section.get("model", _default_model_for(purpose)),
+        "endpoint": cfg_section.get("endpoint", ""),
+        "allow_private_endpoint": bool(cfg_section.get("allow_private_endpoint", False)),
+        "default_endpoint": _default_endpoint_for(purpose),
+        "configured": status.configured,
+        "source": status.source,
+        "writable": status.writable,
+        "last_tested_at": status.last_tested_at,
+        "last_test_result": status.last_test_result,
+        "migration_required": _legacy_key_in_config(purpose) is not None,
+    }
+
+
+def _ai_settings_context() -> dict:
+    return {"text": _ai_settings_for("text"), "vision": _ai_settings_for("vision")}
+
+
+def _ai_config_basic() -> dict:
+    """Non-sensitive settings for the template (no credential status reads)."""
+    result = {}
+    for purpose in ("text", "vision"):
+        section = _section_for(purpose)
+        cfg_section = (APP_CONFIG.get(section) or {}) if APP_CONFIG else {}
+        result[purpose] = {
+            "purpose": purpose,
+            "enabled": bool(cfg_section.get("enabled", True)),
+            "provider": cfg_section.get("provider", "deepseek" if purpose == "text" else "qwen"),
+            "model": cfg_section.get("model", _default_model_for(purpose)),
+            "endpoint": cfg_section.get("endpoint", ""),
+            "allow_private_endpoint": bool(cfg_section.get("allow_private_endpoint", False)),
+            "default_endpoint": _default_endpoint_for(purpose),
+            "migration_required": _legacy_key_in_config(purpose) is not None,
+        }
+    return result
+
+
+def _probe_connection(purpose: str, api_key_override: str | None = None) -> str:
+    """Send a minimal probe using the current (or candidate) credential.
+
+    Returns one of the fixed safe categories; never returns provider bodies.
+    """
+    section = _section_for(purpose)
+    cfg_section = (APP_CONFIG.get(section) or {}) if APP_CONFIG else {}
+    api_key = api_key_override if api_key_override is not None else resolve_credential(purpose)
+    if not api_key:
+        return "credential_missing"
+    try:
+        endpoint = validate_endpoint(
+            cfg_section.get("endpoint") or _default_endpoint_for(purpose),
+            bool(cfg_section.get("allow_private_endpoint", False)),
+        )
+    except EndpointPolicyError:
+        return "endpoint_rejected"
+    payload = {
+        "model": cfg_section.get("model", _default_model_for(purpose)),
+        "messages": [{"role": "user", "content": "Reply with OK"}],
+        "max_tokens": 5,
+        "temperature": 0,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(
+            endpoint, headers=headers, json=payload, timeout=(10, 30), allow_redirects=False
+        )
+    except requests.exceptions.RequestException:
+        return "network_failed"
+    if resp.status_code != 200:
+        return safe_provider_error(resp.status_code)
+    try:
+        resp.json()
+    except Exception:
+        return "incompatible_response"
+    return "success"
+
+
+def _atomic_update_ai_section(purpose: str, data: dict) -> None:
+    section = _section_for(purpose)
+    cfg = _read_config_file()
+    current = dict(cfg.get(section) or {})
+    for key in _AI_SETTINGS_WHITELIST:
+        if key in data:
+            current[key] = data[key]
+    cfg[section] = current
+    _atomic_write_yaml(config_path, cfg)
+    if APP_CONFIG:
+        APP_CONFIG[section] = dict(current)
+
+
+def _remove_legacy_key_from_config(purpose: str) -> None:
+    section = _section_for(purpose)
+    cfg = _read_config_file()
+    sec = cfg.get(section)
+    if isinstance(sec, dict):
+        sec.pop("api_key", None)
+    _atomic_write_yaml(config_path, cfg)
+    if APP_CONFIG:
+        cur = APP_CONFIG.setdefault(section, {})
+        if isinstance(cur, dict):
+            cur.pop("api_key", None)
 
 
 # ── Simple TTL Cache ──
@@ -358,12 +635,16 @@ def _common_context():
     dataset, training, project, tuning_history, experiment_history, dataset_analyzer_config = _load_data()
     # Read latest dataset info
     latest_dataset = None
-    latest_ds_path = Path("log") / "latest_dataset.json"
-    if latest_ds_path.exists():
+    if LATEST_DATASET_PATH.exists():
         try:
-            with open(latest_ds_path, encoding="utf-8") as f:
+            with open(LATEST_DATASET_PATH, encoding="utf-8") as f:
                 ld = json.load(f)
-            if ld.get("dataset_path") and os.path.isdir(ld["dataset_path"]):
+            source_path = ld.get("source_dataset_path") or ld.get("dataset_path", "")
+            snapshot_path = ld.get("snapshot_path")
+            # A registered snapshot remains usable even if the original source
+            # directory was later removed (immutability goal).
+            if (source_path and os.path.isdir(source_path)) or (snapshot_path and os.path.isdir(snapshot_path)):
+                ld["snapshot_valid"] = _latest_snapshot_valid(ld)
                 latest_dataset = ld
         except Exception:
             pass
@@ -380,6 +661,8 @@ def _common_context():
         "llm_analysis": training.get("llm_analysis") if training else None,
         "vision_analysis": training.get("vision_analysis") if training else None,
         "latest_dataset": latest_dataset,
+        "csrf_token": _CSRF_TOKEN,
+        "ai_config": _ai_config_basic(),
     }
 
 
@@ -767,6 +1050,188 @@ async def api_tuning_status():
     return JSONResponse({"status": get_tuning_status()})
 
 
+# ── S1.3 AI settings / credentials / migration API ──
+
+
+@app.get("/api/ai-settings")
+async def get_ai_settings():
+    return JSONResponse(_ai_settings_context())
+
+
+@app.put("/api/ai-settings/{purpose}")
+async def update_ai_settings(purpose: str, request: Request):
+    if purpose not in ("text", "vision"):
+        return JSONResponse({"error": "invalid purpose"}, status_code=404)
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    try:
+        body = await _safe_json_body(request)
+    except _BodyError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    unknown = set(body) - _AI_SETTINGS_WHITELIST
+    if unknown:
+        return JSONResponse(
+            {"error": f"unsupported field(s): {', '.join(sorted(unknown))}"}, status_code=400
+        )
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        return JSONResponse({"error": "enabled must be a boolean"}, status_code=400)
+    if "allow_private_endpoint" in body and not isinstance(body["allow_private_endpoint"], bool):
+        return JSONResponse({"error": "allow_private_endpoint must be a boolean"}, status_code=400)
+    for field in ("provider", "model", "endpoint"):
+        if field in body:
+            value = body[field]
+            if not isinstance(value, str) or not value.strip():
+                return JSONResponse(
+                    {"error": f"{field} must be a non-empty string"}, status_code=400
+                )
+    if "endpoint" in body:
+        try:
+            validate_endpoint(
+                body["endpoint"], bool(body.get("allow_private_endpoint", False))
+            )
+        except EndpointPolicyError:
+            return JSONResponse({"error": "endpoint rejected by policy"}, status_code=400)
+    try:
+        _atomic_update_ai_section(purpose, body)
+    except Exception:
+        return JSONResponse({"error": "failed to save settings"}, status_code=500)
+    invalidate_credential_cache(purpose)
+    return JSONResponse(_ai_settings_for(purpose))
+
+
+@app.put("/api/credentials/{purpose}")
+async def put_credential(purpose: str, request: Request):
+    if purpose not in ("text", "vision"):
+        return JSONResponse({"error": "invalid purpose"}, status_code=404)
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    try:
+        body = await _safe_json_body(request)
+    except _BodyError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    key = body.get("key")
+    test_before_replace = bool(body.get("test_before_replace", False))
+    try:
+        _validate_key_value(key)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    env_var = "AUTO_TUNE_TEXT_API_KEY" if purpose == "text" else "AUTO_TUNE_VISION_API_KEY"
+    if os.environ.get(env_var):
+        return JSONResponse(
+            {"error": "credential is managed by the environment and cannot be modified"},
+            status_code=409,
+        )
+    if test_before_replace:
+        category = _probe_connection(purpose, api_key_override=key)
+        if category != "success":
+            return JSONResponse({"error": f"credential test failed: {category}"}, status_code=400)
+    try:
+        store_credential(purpose, key)
+    except (CredentialError, UnsupportedPlatformError) as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    set_last_test_result(purpose, "success" if test_before_replace else "untested")
+    return JSONResponse({"status": "stored", "purpose": purpose})
+
+
+@app.delete("/api/credentials/{purpose}")
+async def delete_credential_route(purpose: str, request: Request):
+    if purpose not in ("text", "vision"):
+        return JSONResponse({"error": "invalid purpose"}, status_code=404)
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    try:
+        body = await _safe_json_body(request)
+    except _BodyError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not (isinstance(body, dict) and body.get("confirm") is True):
+        return JSONResponse({"error": "confirmation required"}, status_code=400)
+    env_var = "AUTO_TUNE_TEXT_API_KEY" if purpose == "text" else "AUTO_TUNE_VISION_API_KEY"
+    if os.environ.get(env_var):
+        return JSONResponse(
+            {"error": "credential is managed by the environment and cannot be deleted"},
+            status_code=409,
+        )
+    try:
+        delete_credential(purpose)
+    except CredentialError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    invalidate_credential_cache(purpose)
+    return JSONResponse({"status": "deleted", "purpose": purpose})
+
+
+@app.post("/api/credentials/{purpose}/test")
+async def test_credential_route(purpose: str, request: Request):
+    if purpose not in ("text", "vision"):
+        return JSONResponse({"error": "invalid purpose"}, status_code=404)
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    category = _probe_connection(purpose)
+    if category == "credential_missing":
+        return JSONResponse({"error": "no credential configured"}, status_code=400)
+    set_last_test_result(purpose, category)
+    return JSONResponse({"result": category})
+
+
+@app.post("/api/credentials/{purpose}/migrate")
+async def migrate_credential(purpose: str, request: Request):
+    if purpose not in ("text", "vision"):
+        return JSONResponse({"error": "invalid purpose"}, status_code=404)
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    legacy = _legacy_key_in_config(purpose)
+    if not legacy:
+        return JSONResponse({"error": "no legacy credential to migrate"}, status_code=400)
+    env_var = "AUTO_TUNE_TEXT_API_KEY" if purpose == "text" else "AUTO_TUNE_VISION_API_KEY"
+    if os.environ.get(env_var):
+        return JSONResponse(
+            {"error": "credential is managed by the environment"}, status_code=409
+        )
+    # Conservative migration: never overwrite an existing secure credential.
+    # Leave both the YAML legacy key and the secure store untouched on conflict.
+    invalidate_credential_cache(purpose)
+    if resolve_credential(purpose):
+        return JSONResponse(
+            {
+                "error": "a secure credential already exists for this service; "
+                "delete it before migrating the legacy key"
+            },
+            status_code=409,
+        )
+    try:
+        store_credential(purpose, legacy)
+        invalidate_credential_cache(purpose)
+        verify = resolve_credential(purpose)
+        if not verify or verify != legacy:
+            raise CredentialError("credential read-back verification failed")
+        _remove_legacy_key_from_config(purpose)
+        invalidate_credential_cache(purpose)
+        clear_last_test_result(purpose)
+    except CredentialError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    except OSError:
+        # Secure store succeeded but the YAML rewrite failed: keep the secure
+        # credential and the migration_required state for a safe retry.
+        return JSONResponse(
+            {"error": "credential stored but config update failed; migration incomplete"},
+            status_code=500,
+        )
+    return JSONResponse({"status": "migrated", "purpose": purpose})
+
+
 @app.post("/tuning/start")
 async def start_tuning(request: Request):
     """Start the auto-tuning loop with real-time SSE progress streaming."""
@@ -783,6 +1248,21 @@ async def start_tuning(request: Request):
     if auto_analyze and max_retries > 1 and not auto_loop:
         auto_loop = True
     eval_mode = body.get("eval_mode", "comprehensive")
+
+    # Snapshot gate: auto-tuning must never bypass a registered snapshot.
+    latest = _read_latest_dataset()
+    snapshot_data_yaml = None
+    if latest and latest.get("snapshot_id"):
+        try:
+            snapshot_data_yaml = _resolve_validated_snapshot_data_yaml(latest)
+        except SnapshotError as exc:
+            return _snapshot_error_response(exc)
+    elif not skip_execute:
+        return JSONResponse(
+            {"error": "没有已校验的不可变数据集快照，无法启动自动调优",
+             "error_code": "SNAPSHOT_VALIDATION_FAILED"},
+            status_code=400,
+        )
 
     global _tuning_cancel_event, _current_tuning_train_proc
     _tuning_cancel_event.clear()
@@ -840,8 +1320,16 @@ async def start_tuning(request: Request):
         from auto_tune.modules.agent_engine.loop import run_tuning_loop
 
         def run():
+            # Inject the validated snapshot data.yaml into a config copy; never
+            # mutate the shared APP_CONFIG.
+            cfg = APP_CONFIG
+            if snapshot_data_yaml is not None:
+                cfg = dict(APP_CONFIG)
+                training = dict(APP_CONFIG.get("training", {}) or {})
+                training["data_yaml"] = str(snapshot_data_yaml)
+                cfg["training"] = training
             return run_tuning_loop(
-                config=APP_CONFIG,
+                config=cfg,
                 reference_run=reference_run,
                 max_retries=max_retries,
                 log_dir="log",
@@ -1001,6 +1489,145 @@ async def stop_first_training():
 # ── Dataset Upload & Analysis ──
 
 UPLOAD_DIR = Path("log") / "uploads"
+
+# ── Immutable dataset snapshot (Studio S1.2) ──
+LATEST_DATASET_PATH = Path("log") / "latest_dataset.json"
+DATASET_SNAPSHOT_ROOT = Path("log") / "dataset_snapshots"
+
+
+def _read_latest_dataset() -> dict | None:
+    """Read latest_dataset.json without rewriting it."""
+    if not LATEST_DATASET_PATH.exists():
+        return None
+    try:
+        with open(LATEST_DATASET_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON atomically: same-dir temp, flush, fsync, os.replace.
+
+    On failure the temp file is intentionally left in place.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_name, path)
+
+
+def _parse_split_params(body: dict) -> tuple[float, int]:
+    """Strictly parse split request params (reject coercions of ambiguous types)."""
+    val_ratio_raw = body.get("val_ratio", 0.2)
+    seed_raw = body.get("seed", 42)
+    if isinstance(val_ratio_raw, bool) or not isinstance(val_ratio_raw, (int, float)):
+        raise SnapshotValidationError("val_ratio 必须是 (0,1) 内的数字")
+    val_ratio = float(val_ratio_raw)
+    if not (0.0 < val_ratio < 1.0):
+        raise SnapshotValidationError("val_ratio 必须是 (0,1) 内的数字")
+    if type(seed_raw) is not int:
+        raise SnapshotValidationError("seed 必须是整数")
+    return val_ratio, seed_raw
+
+
+def _load_class_names(source_path: Path, ds_info: dict) -> dict[int, str] | None:
+    """Derive the real class-name mapping from a registered data.yaml (no inventing)."""
+    candidates: list[Path] = []
+    registered = ds_info.get("data_yaml_path")
+    if registered:
+        candidates.append(Path(registered))
+    if source_path.is_dir():
+        candidates.extend(source_path.rglob("data.yaml"))
+        candidates.extend(source_path.rglob("data.yml"))
+    for yaml_path in candidates:
+        if not yaml_path.is_file():
+            continue
+        try:
+            with open(yaml_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            names = data.get("names") or {}
+            if names:
+                return {int(k): v for k, v in names.items()}
+        except (OSError, ValueError, yaml.YAMLError, TypeError):
+            continue
+    return None
+
+
+def _snapshot_error_response(exc: SnapshotError) -> JSONResponse:
+    """Map a snapshot domain error to a structured HTTP response."""
+    return JSONResponse({"error": str(exc), "error_code": exc.error_code}, status_code=exc.status_code)
+
+
+def _snapshot_created_at(snapshot) -> str | None:
+    try:
+        with open(snapshot.manifest_path, encoding="utf-8") as f:
+            return json.load(f).get("created_at")
+    except (OSError, ValueError):
+        return None
+
+
+def _snapshot_to_latest_info(existing: dict, snapshot) -> dict:
+    """Merge snapshot facts into the latest_dataset.json payload."""
+    info = dict(existing)
+    info.update({
+        "source_dataset_path": str(snapshot.source_root),
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_path": str(snapshot.snapshot_path),
+        "manifest_path": str(snapshot.manifest_path),
+        "data_yaml_path": str(snapshot.data_yaml_path),
+        "snapshot_schema_version": snapshot.schema_version,
+        "snapshot_manifest_digest": snapshot.manifest_digest,
+        "snapshot_created_at": _snapshot_created_at(snapshot),
+        "train_count": snapshot.train_count,
+        "val_count": snapshot.val_count,
+        "background_count": snapshot.background_count,
+        "split": True,
+    })
+    return info
+
+
+def _latest_snapshot_valid(ld: dict) -> bool:
+    """Return True only when the registered snapshot validates end-to-end."""
+    snapshot_id = ld.get("snapshot_id")
+    snapshot_path = ld.get("snapshot_path")
+    if not snapshot_id or not snapshot_path or not os.path.isdir(snapshot_path):
+        return False
+    try:
+        validated = validate_dataset_snapshot(Path(snapshot_path))
+        return validated.snapshot_id == snapshot_id
+    except SnapshotError:
+        return False
+
+
+def _resolve_validated_snapshot_data_yaml(latest_info: dict) -> Path:
+    """Return the absolute snapshot data.yaml path, or raise when invalid."""
+    snapshot_id = latest_info.get("snapshot_id")
+    snapshot_path = latest_info.get("snapshot_path")
+    data_yaml_path = latest_info.get("data_yaml_path")
+    manifest_digest = latest_info.get("snapshot_manifest_digest")
+    if not snapshot_id or not snapshot_path or not data_yaml_path:
+        raise SnapshotValidationError("数据集没有已注册的不可变快照")
+    snap_dir = Path(snapshot_path)
+    if not snap_dir.is_dir():
+        raise SnapshotValidationError(f"快照目录不存在: {snapshot_path}")
+    validated = validate_dataset_snapshot(snap_dir)
+    if validated.snapshot_id != snapshot_id:
+        raise SnapshotValidationError("快照身份不一致")
+    if manifest_digest and validated.manifest_digest != manifest_digest:
+        raise SnapshotValidationError("快照 manifest 摘要不一致")
+    data_yaml = Path(data_yaml_path)
+    try:
+        data_yaml.relative_to(snap_dir)
+    except ValueError as exc:
+        raise SnapshotValidationError("data.yaml 必须位于快照目录内") from exc
+    if not data_yaml.is_file():
+        raise SnapshotValidationError(f"快照 data.yaml 不存在: {data_yaml_path}")
+    return data_yaml.resolve()
 
 
 @app.post("/api/dataset/upload")
@@ -1290,187 +1917,97 @@ async def update_dataset_config(request: Request):
 @app.get("/api/dataset/latest")
 async def get_latest_dataset():
     """Get info about the most recently uploaded dataset."""
-    latest_ds_path = Path("log") / "latest_dataset.json"
-    if not latest_ds_path.exists():
+    if not LATEST_DATASET_PATH.exists():
         return JSONResponse({"dataset": None})
-    with open(latest_ds_path, encoding="utf-8") as f:
+    with open(LATEST_DATASET_PATH, encoding="utf-8") as f:
         info = json.load(f)
     # Check if dataset path still exists
-    ds_path = info.get("dataset_path", "")
+    ds_path = info.get("source_dataset_path") or info.get("dataset_path", "")
     info["path_exists"] = os.path.isdir(ds_path) if ds_path else False
+    info["snapshot_valid"] = _latest_snapshot_valid(info)
     return JSONResponse({"dataset": info})
 
 
 @app.post("/api/dataset/split")
 async def split_dataset(request: Request):
-    """Split uploaded dataset into train/val sets.
+    """Create an immutable dataset snapshot (Studio S1.2).
+
+    The original dataset directory is never moved, renamed, or rewritten. The
+    snapshot is materialized, verified, and atomically published by the
+    dataset_snapshot service; only after success is ``latest_dataset.json``
+    atomically updated.
 
     JSON body:
-      - val_ratio: float (0.0-1.0, default 0.2)
-      - seed: int (random seed, default 42)
+      - val_ratio: float in (0, 1), default 0.2
+      - seed: int, default 42
     """
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
-    val_ratio = float(body.get("val_ratio", 0.2))
-    seed = int(body.get("seed", 42))
+    try:
+        val_ratio, seed = _parse_split_params(body)
+    except SnapshotValidationError as exc:
+        return _snapshot_error_response(exc)
 
-    # Find latest dataset
-    latest_ds_path = Path("log") / "latest_dataset.json"
-    if not latest_ds_path.exists():
-        return JSONResponse({"error": "没有已上传的数据集，请先上传数据集"}, status_code=400)
-    with open(latest_ds_path, encoding="utf-8") as f:
-        ds_info = json.load(f)
+    ds_info = _read_latest_dataset()
+    if not ds_info:
+        return JSONResponse(
+            {"error": "没有已上传的数据集，请先上传数据集", "error_code": "SNAPSHOT_VALIDATION_FAILED"},
+            status_code=400,
+        )
+    source_path = Path(ds_info.get("source_dataset_path") or ds_info.get("dataset_path") or "")
+    if not source_path or not source_path.is_dir():
+        return JSONResponse(
+            {"error": f"数据集目录不存在: {source_path}", "error_code": "SNAPSHOT_VALIDATION_FAILED"},
+            status_code=400,
+        )
 
-    dataset_dir = ds_info.get("dataset_path", "")
-    if not dataset_dir or not os.path.isdir(dataset_dir):
-        return JSONResponse({"error": f"数据集目录不存在: {dataset_dir}"}, status_code=400)
+    class_names = _load_class_names(source_path, ds_info)
+    if not class_names:
+        return JSONResponse(
+            {"error": "无法从数据集确定类别映射 names，请确保 data.yaml 提供 names 字段",
+             "error_code": "SNAPSHOT_VALIDATION_FAILED"},
+            status_code=400,
+        )
 
     try:
-        import random
-        import glob as _glob
+        snapshot = await asyncio.to_thread(
+            create_dataset_snapshot,
+            source_path,
+            DATASET_SNAPSHOT_ROOT,
+            val_ratio,
+            seed,
+            class_names,
+        )
+    except SnapshotValidationError as exc:
+        return _snapshot_error_response(exc)
+    except SnapshotConflictError as exc:
+        return _snapshot_error_response(exc)
+    except SnapshotInsufficientSpaceError as exc:
+        return _snapshot_error_response(exc)
+    except SnapshotIOError as exc:
+        return _snapshot_error_response(exc)
 
-        dataset_path = Path(dataset_dir)
+    # Register latest only after the snapshot is fully published and verified.
+    try:
+        _write_json_atomic(LATEST_DATASET_PATH, _snapshot_to_latest_info(ds_info, snapshot))
+    except OSError as exc:
+        return JSONResponse(
+            {"error": f"数据集快照已创建但登记失败: {exc}", "error_code": "SNAPSHOT_IO_FAILED"},
+            status_code=500,
+        )
 
-        # Check if already split (has images/train + images/val)
-        has_train = (dataset_path / "images" / "train").exists()
-        has_val = (dataset_path / "images" / "val").exists()
-        if has_train and has_val:
-            # Already split, just ensure data.yaml exists
-            return await _ensure_data_yaml(dataset_path, ds_info)
-
-        # Collect all image files recursively
-        img_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
-        all_images = []
-        for ext in img_extensions:
-            all_images.extend(dataset_path.rglob(ext))
-
-        if not all_images:
-            return JSONResponse({"error": "数据集中未找到图片文件"}, status_code=400)
-
-        # Filter out images already in images/train or images/val
-        all_images = [p for p in all_images if "images" not in p.parts]
-
-        if not all_images:
-            return JSONResponse({"error": "所有图片已在 images/ 目录下，无需再次划分"}, status_code=400)
-
-        # Shuffle and split
-        random.seed(seed)
-        random.shuffle(all_images)
-        split_idx = max(1, int(len(all_images) * (1 - val_ratio)))
-        train_images = all_images[:split_idx]
-        val_images = all_images[split_idx:]
-
-        # Create directories
-        train_img_dir = dataset_path / "images" / "train"
-        val_img_dir = dataset_path / "images" / "val"
-        train_lbl_dir = dataset_path / "labels" / "train"
-        val_lbl_dir = dataset_path / "labels" / "val"
-        train_img_dir.mkdir(parents=True, exist_ok=True)
-        val_img_dir.mkdir(parents=True, exist_ok=True)
-        train_lbl_dir.mkdir(parents=True, exist_ok=True)
-        val_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-        moved_train = 0
-        moved_val = 0
-        skipped_labels = 0
-
-        for img_path in train_images:
-            dest = train_img_dir / img_path.name
-            # Handle duplicate filenames by adding a suffix
-            if dest.exists():
-                dest = train_img_dir / f"train_{img_path.stem}_{moved_train}{img_path.suffix}"
-            shutil.move(str(img_path), str(dest))
-            # Move corresponding label
-            label_src = img_path.with_suffix(".txt")
-            if label_src.exists():
-                label_dest = train_lbl_dir / label_src.name
-                if label_dest.exists():
-                    label_dest = train_lbl_dir / f"train_{label_src.stem}_{moved_train}{label_src.suffix}"
-                shutil.move(str(label_src), str(label_dest))
-            else:
-                skipped_labels += 1
-            moved_train += 1
-
-        for img_path in val_images:
-            dest = val_img_dir / img_path.name
-            if dest.exists():
-                dest = val_img_dir / f"val_{img_path.stem}_{moved_val}{img_path.suffix}"
-            shutil.move(str(img_path), str(dest))
-            # Move corresponding label
-            label_src = img_path.with_suffix(".txt")
-            if label_src.exists():
-                label_dest = val_lbl_dir / label_src.name
-                if label_dest.exists():
-                    label_dest = val_lbl_dir / f"val_{label_src.stem}_{moved_val}{label_src.suffix}"
-                shutil.move(str(label_src), str(label_dest))
-            else:
-                skipped_labels += 1
-            moved_val += 1
-
-        # Ensure data.yaml exists
-        yaml_result = await _ensure_data_yaml(dataset_path, ds_info)
-
-        # Update latest_dataset.json
-        ds_info["split"] = True
-        ds_info["train_count"] = moved_train
-        ds_info["val_count"] = moved_val
-        with open(latest_ds_path, "w", encoding="utf-8") as f:
-            json.dump(ds_info, f, ensure_ascii=False, indent=2)
-
-        return JSONResponse({
-            "status": "success",
-            "train_count": moved_train,
-            "val_count": moved_val,
-            "skipped_labels": skipped_labels,
-            "data_yaml_path": yaml_result.get("data_yaml_path"),
-        })
-
-    except Exception as e:
-        return JSONResponse({"error": f"数据集划分失败: {str(e)}"}, status_code=500)
-
-
-async def _ensure_data_yaml(dataset_path: Path, ds_info: dict) -> dict:
-    """Ensure data.yaml exists with correct train/val paths for the dataset."""
-    # Look for existing data.yaml
-    yaml_files = list(dataset_path.rglob("data.yaml")) + list(dataset_path.rglob("data.yml"))
-    existing_yaml = yaml_files[0] if yaml_files else dataset_path / "data.yaml"
-
-    if yaml_files:
-        with open(existing_yaml, encoding="utf-8") as f:
-            data_cfg = yaml.safe_load(f) or {}
-    else:
-        data_cfg = {}
-
-    # Detect number of classes from labels directory
-    nc = data_cfg.get("nc", 1)
-    names = data_cfg.get("names", {0: "object"})
-    # Try to count classes from label files
-    label_files = list(dataset_path.rglob("*.txt"))
-    if label_files:
-        max_cls = 0
-        for lf in label_files:
-            try:
-                first_num = lf.read_text().strip().split()[0]
-                max_cls = max(max_cls, int(first_num))
-            except (ValueError, IndexError):
-                pass
-        if max_cls > 0:
-            nc = max_cls + 1
-            if len(names) < nc:
-                for i in range(len(names), nc):
-                    names[i] = f"class_{i}"
-
-    # Use relative paths for portability
-    data_cfg.update({
-        "train": "images/train",
-        "val": "images/val",
-        "nc": nc,
-        "names": names,
+    _invalidate_cache("load_data")
+    return JSONResponse({
+        "status": "success",
+        "reused": snapshot.reused,
+        "snapshot_id": snapshot.snapshot_id,
+        "snapshot_path": str(snapshot.snapshot_path),
+        "manifest_path": str(snapshot.manifest_path),
+        "data_yaml_path": str(snapshot.data_yaml_path),
+        "train_count": snapshot.train_count,
+        "val_count": snapshot.val_count,
+        "background_count": snapshot.background_count,
+        "total_bytes": snapshot.total_bytes,
     })
-
-    with open(existing_yaml, "w", encoding="utf-8") as f:
-        yaml.dump(data_cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-    return {"data_yaml_path": str(existing_yaml)}
 
 
 # ── Training Upload & Analyze API ──
@@ -1852,7 +2389,16 @@ async def start_first_training(request: Request):
     # Read params from request body or config.yaml
     training_cfg = APP_CONFIG.get("training", {})
     project_cfg = APP_CONFIG.get("project", {})
-    data_yaml = body.get("data_yaml") or project_cfg.get("data_yaml") or training_cfg.get("data_yaml", "")
+    data_yaml = body.get("data_yaml") or ""
+    if not data_yaml:
+        latest = _read_latest_dataset()
+        if latest and latest.get("snapshot_id"):
+            try:
+                data_yaml = str(_resolve_validated_snapshot_data_yaml(latest))
+            except SnapshotError as exc:
+                return _snapshot_error_response(exc)
+        else:
+            data_yaml = project_cfg.get("data_yaml") or training_cfg.get("data_yaml", "")
     model = body.get("model") or project_cfg.get("model") or training_cfg.get("model", "yolov8n.pt")
     epochs = int(body.get("epochs", training_cfg.get("default_epochs", 100)))
     imgsz = int(body.get("imgsz", training_cfg.get("imgsz", 640)))

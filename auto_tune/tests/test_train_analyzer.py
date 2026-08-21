@@ -151,3 +151,122 @@ def test_orchestrator_reports_early_stop_using_run_args(tmp_path):
     assert early["actual_epochs"] == 3
     assert early["planned_epochs"] == 100
     assert early["stopped_early"] is True
+
+
+# --- S1.3 security boundary for the text diagnosis LLM call ------------------
+
+
+class _FakeLLMResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = (
+            payload
+            if payload is not None
+            else {"choices": [{"message": {"content": "ok"}}]}
+        )
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def _yaml_key_config():
+    return {
+        "llm": {
+            "api_key": "yaml-secret-must-not-be-used",
+            "model": "deepseek-v4-flash",
+            "endpoint": "https://api.deepseek.com/v1/chat/completions",
+            "allow_private_endpoint": False,
+        }
+    }
+
+
+def test_llm_uses_resolved_credential_and_ignores_yaml_key(monkeypatch):
+    import auto_tune.modules.train_analyzer.llm_analyzer as llm_module
+
+    captured = {}
+    purposes = []
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _FakeLLMResponse()
+
+    monkeypatch.setattr(
+        llm_module,
+        "resolve_credential",
+        lambda purpose: purposes.append(purpose) or "resolved-secret",
+    )
+    monkeypatch.setattr(
+        llm_module,
+        "validate_endpoint",
+        lambda endpoint, allow_private: "https://resolved.example/v1/chat/completions",
+    )
+    monkeypatch.setattr(llm_module.requests, "post", fake_post)
+
+    result = llm_module.call_deepseek("prompt", _yaml_key_config())
+
+    assert result == "ok"
+    assert purposes == ["text"]
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer resolved-secret"
+    assert captured["kwargs"]["allow_redirects"] is False
+    assert captured["kwargs"]["timeout"] == (10, 120)
+    assert "yaml-secret-must-not-be-used" not in repr(captured)
+
+
+def test_llm_missing_credential_never_calls_network(monkeypatch):
+    import auto_tune.modules.train_analyzer.llm_analyzer as llm_module
+
+    called = []
+    monkeypatch.setattr(llm_module, "resolve_credential", lambda purpose: None)
+    monkeypatch.setattr(
+        llm_module, "validate_endpoint", lambda e, a: called.append("endpoint") or e
+    )
+    monkeypatch.setattr(
+        llm_module.requests, "post", lambda **kwargs: called.append("post") or _FakeLLMResponse()
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm_module.call_deepseek("prompt", _yaml_key_config())
+
+    assert "credential_missing" in str(excinfo.value)
+    assert called == []
+
+
+def test_llm_401_error_is_safe_and_never_leaks_body(monkeypatch):
+    import auto_tune.modules.train_analyzer.llm_analyzer as llm_module
+
+    def fake_post(url, **kwargs):
+        return _FakeLLMResponse(
+            status_code=401,
+            payload={"error": {"message": "resolved-secret provider-private-body"}},
+            text="provider-private-body raw",
+        )
+
+    monkeypatch.setattr(llm_module, "resolve_credential", lambda purpose: "resolved-secret")
+    monkeypatch.setattr(
+        llm_module, "validate_endpoint", lambda e, a: "https://resolved.example/v1"
+    )
+    monkeypatch.setattr(llm_module.requests, "post", fake_post)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm_module.call_deepseek("prompt", _yaml_key_config())
+
+    message = str(excinfo.value)
+    assert "authentication_failed" in message
+    assert "401" in message
+    assert "resolved-secret" not in message
+    assert "provider-private-body" not in message
+
+
+def test_llm_real_endpoint_policy_blocks_private(monkeypatch):
+    import auto_tune.modules.train_analyzer.llm_analyzer as llm_module
+
+    monkeypatch.setattr(llm_module, "resolve_credential", lambda purpose: "resolved-secret")
+    cfg = _yaml_key_config()
+    cfg["llm"]["endpoint"] = "https://127.0.0.1/v1/chat/completions"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm_module.call_deepseek("prompt", cfg)
+
+    assert "endpoint_rejected" in str(excinfo.value)

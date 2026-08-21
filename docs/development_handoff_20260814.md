@@ -2,7 +2,7 @@
 
 ## 1. 当前结论
 
-当前稳定版本为 `v0.2`；A0 审计闭环、统一训练收尾以及 Studio S1.1 训练日志分层均已完成独立验收并进入版本发布。下次开发不得重新实现或破坏这些兼容边界；应从本文件列出的剩余事项中选择一个小批次，先形成规格和测试边界，再交由 Claude Code 实现业务代码，最后由 Codex 独立复验和发布。
+当前已发布稳定版本仍为 `v0.2`；A0 审计闭环、统一训练收尾以及 Studio S1.1 训练日志分层已经发布。Studio S1.2 不可变数据集快照与 Studio S1.3 API 凭据安全已于 2026-08-21 完成 Codex 独立审查与验收，当前均未提交、未推送；按艾卡要求在 S1.3 文档回写完成后统一进入提交检查。下次开发不得重新实现或破坏这些兼容边界。
 
 ## 2. GitHub 与版本状态
 
@@ -14,6 +14,7 @@
 - `v0.1` 合并提交：`d81720c2585e0c30da67a4b0f141f6d83259ec2f`
 - 发布 PR：`#1`，已合并。
 - 发布分支 `agent/v0.1-unified-training` 暂时保留，未执行删除。
+- Studio S1.2 与 S1.3 当前仅存在于本地未提交工作区；不得将其表述为已发布版本，需完成联合提交前检查后再由艾卡决定是否提交和推送。
 
 ## 3. 已完成并验收的范围
 
@@ -46,6 +47,28 @@
 - `.gitignore` 已排除数据集、训练输出、日志、审计运行文件、模型权重、真实配置、密钥和临时 API 测试脚本。
 - `start_server.bat` 已移除本机绝对 Python 路径，改为从脚本目录使用当前环境的 `python`。
 
+### 3.4 Studio S1.2 不可变数据集快照（2026-08-21 已验收，待与 S1.3 一并提交）
+
+- 数据集划分不再移动、改名或改写原始图片和标签，改为完整复制并原子发布到受控快照目录。
+- 快照身份由 Schema、实际 train/val 归属、类别映射和文件 SHA-256 等规范事实确定；相同输入可复用。
+- 覆盖标签格式、路径逃逸、reparse point、空间预检、复制复核、并发锁、manifest/data.yaml 严格校验和损坏拒绝。
+- `latest_dataset.json` 只在快照发布并验证成功后原子登记；旧记录继续可读但不会被误标为有效快照。
+- 普通训练和非 dry-run 自动调优绑定已校验快照 `data.yaml`；调优使用请求级配置副本，不修改共享 `APP_CONFIG`。
+- 验收证据：S1.2 定向测试 110 passed；完整套件 285 passed、2 条既有 PCA warning、0 skipped；从项目工作目录使用快照完成真实 1 epoch YOLOv8 Detect；Chromium 验证快照区块、无快照状态、表单与非法参数反馈。
+- 已知非阻断风险：Ultralytics 会在快照 `labels` 目录生成 `train.cache`/`val.cache`；manifest 管理的图片和标签保持不变，后续可评估将缓存迁移到运行目录。
+
+### 3.5 Studio S1.3 API 凭据安全（2026-08-21 已验收，待联合提交）
+
+- 文本诊断和调参决策默认使用 DeepSeek，视觉分析默认使用通义千问；客户可配置受 Endpoint 策略约束的 OpenAI-compatible 服务。
+- Windows 默认使用当前用户的 Windows Credential Manager；环境变量为只读最高优先级来源，运行时解析值不进入 `APP_CONFIG`、YAML、URL、响应、日志、历史或审计。
+- 支持填写、测试、替换、删除和明确确认后的旧明文迁移；已有安全凭据或环境变量生效时，迁移以 409 保守拒绝，不覆盖任何凭据。
+- 自定义公网端点强制 HTTPS；本机/内网 HTTP(S) 只有在高级开关明确开启后可用，且所有调用禁止自动重定向。
+- 配置读取、供应商错误、API、SSE、自由文本审计和模板服务端渲染均补齐脱敏/XSS 防线。
+- 旧 DeepSeek/通义千问 Key 已由艾卡完成轮换，新 Key 经 Studio 保存、连接测试和真实大模型分析验证成功；`config.yaml` 旧字段和 5 个历史明文测试文件已清理。
+- 验收证据：S1.3 九文件套件 180 passed；完整套件 396 passed、2 条既有 PCA warning、0 skipped；一次性模拟供应商验证 302 不跟随、错误正文和假密钥不泄漏；Windows 随机测试 target 完成跨进程读写删除；Chromium 验证两张配置卡、密码框不预填、迁移提示、内网 HTTP 警告和无控制台错误。
+- 已知非阻断风险：DNS 在校验后与实际连接之间仍存在理论 rebinding 窗口；当前通过调用前即时复核、禁止重定向和默认拒绝私网降低风险，连接层固定已校验 IP 留后续独立加固。
+- 跨平台边界：S1.3 的 Linux仅支持环境变量；Docker Secret文件和 Linux Secret Service尚未实现，已列入 S1.3.1/Linux适配，不得把操作手册中的目标方案表述为当前可用。
+
 ## 4. 验证基线
 
 当前完整自动化测试基线：
@@ -54,7 +77,7 @@
 python -m pytest auto_tune/tests -q -p no:cacheprovider
 ```
 
-最近结果（2026-08-20，S1.1 验收）：`205 passed, 2 warnings, 0 skipped`。
+最近结果（2026-08-21，S1.3 验收）：`396 passed, 2 warnings, 0 skipped`。
 
 两条 warning 来自 sklearn PCA 在测试常量数据上的除零数值警告，不是本批回归。下次改动后必须至少运行相关测试；准备发布时必须重新运行完整套件，不能只引用本次结果。
 
@@ -64,10 +87,9 @@ python -m pytest auto_tune/tests -q -p no:cacheprovider
 
 下次开始时先由艾卡确认一个批次，不要同时展开多个方向。建议优先级如下：
 
-1. Studio S1.2：数据集划分改为不可变快照，不移动原始文件。
-2. Studio S1.3：API 密钥迁移到环境变量，并制定已暴露密钥轮换步骤。
-3. Studio S1.4：补充目录选择、上传总量、成员数量和解压后容量限制。
-4. 完成上述可靠性事项后，按 2026-08-20 研发执行版进入 SQLite、多数据集与三项任务闭环；YOLO11/YOLO26 当前暂缓，不作为近期完成标准。
+1. Studio S1.2 与 S1.3 已完成验收，先执行联合提交前清单和敏感信息复扫；未经艾卡确认仍不提交、不推送。
+2. Studio S1.4：补充目录选择、上传总量、成员数量和解压后容量限制。
+3. 完成上述可靠性事项后，按当前研发执行版进入 SQLite、多数据集与三项任务闭环；YOLO11/YOLO26 当前暂缓，不作为近期完成标准。
 
 ### 5.1 Studio S1.1 已验收能力（2026-08-20）
 
@@ -110,10 +132,10 @@ python -m pytest auto_tune/tests -q -p no:cacheprovider
 - 当前交接状态：`docs/development_handoff_20260814.md`
 - 产品与阶段路线：`docs/roadmap_20260814.md`
 - 后续任务顺序和验收：`docs/implementation_plan_20260814.md`
-- 操作说明：`docs/操作说明_操作工手册.md`
-- 技术 Leader 评估：`docs/Auto-Tune后续研发路线与实施评估_技术Leader版_20260814.docx`
+- 当前操作说明：`docs/操作说明_操作工手册_20260821.md`
+- 研发执行版：`docs/Auto-Tune后续研发路线与实施评估_研发执行版_20260821.docx`（当前权威可编辑版本；后续不再同步生成 PDF）
 - Linux 迁移准备：`auto_tune/docs/linux-migration-plan.md`
 
-为避免修改由 Claude Code 维护的 `CLAUDE.md`，暂时保留它直接引用的 `docs/方案审查_20260814.md`、`docs/后续研发计划_20260814.md` 和 `docs/superpowers/plans/2026-08-14-hyperparameter-tuning-reliability.md`。这三份文件仅作为兼容归档，不是当前状态真源。下次向 Claude Code 安排业务开发任务时，应同时要求它自行更新 `CLAUDE.md` 的版本状态与文档入口；Codex 随后审核其内容和链接，审核通过后再删除这三份兼容归档。
+旧操作手册、技术 Leader 评估和早期方案文件已移入根目录 `历史文档/`，仅用于追溯，不作为当前研发或操作依据。Claude Code 后续业务任务必须读取当前交接、路线、实施计划和对应批次规格，不得引用历史文档替代当前真源。
 
 如上述文件发生冲突，以本交接记录中的已完成事实和 GitHub 最新 Release 为当前状态依据；对未来范围，以艾卡在新任务中的最新批准为准。
