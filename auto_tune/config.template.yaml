@@ -36,6 +36,15 @@ probe:
   probe_epochs: 10
   auto_continue_threshold_mAP50: 0.05
   max_retries: 3
+# 目录输入安全（Studio S1.4）：正式目录入口在递归处理前执行统一预检。
+# max_directory_bytes 单位为字节（默认 500 GiB）。
+# allowed_roots 为空表示允许本机任意绝对路径；非空时输入必须位于某个规范化根内。
+# allow_unc_paths 默认关闭，本批不把 UNC/网络共享作为正式范围。
+input_safety:
+  max_directory_members: 200000
+  max_directory_bytes: 536870912000
+  allowed_roots: []
+  allow_unc_paths: false
 dataset_analyzer:
   blur_threshold: 30
   under_exposure_pixel_threshold: 30

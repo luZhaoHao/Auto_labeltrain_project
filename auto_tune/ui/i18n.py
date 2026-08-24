@@ -168,6 +168,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "Enter the path to a YOLO train directory (must contain results.csv and args.yaml)":
             "输入 YOLO 训练目录的路径（需包含 results.csv 和 args.yaml）",
         "Select this folder": "选择此文件夹",
+        "Folder browsing failed": "目录浏览失败",
 
         # Intelligent Analysis page
         "Intelligent Analysis (Page)": "智能分析",

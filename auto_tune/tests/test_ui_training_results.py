@@ -871,4 +871,37 @@ def test_snapshot_ui_error_text_uses_textcontent():
     html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
     # splitDataset must render server errors through textContent (safe text), not innerHTML.
     assert "statusEl.textContent = '快照创建失败: '" in html
+
+
+# ── Studio S1.4: directory-input safety feedback in the UI ──
+
+
+def test_s14_folder_analyze_errors_restore_buttons_and_use_textcontent():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    # Both dataset and training folder analysis restore the button on success and
+    # failure, and render server errors through textContent (never innerHTML).
+    assert "btn.disabled = false" in html
+    assert "statusEl.textContent = '错误: ' + (result.error || 'Unknown')" in html
+    assert "if (result.error_code)" in html
+    assert "if (resp.error_code)" in html
+    assert "statusEl.textContent = '{{ _(\"Error\") }}: ' + err.message" not in html
+    assert "statusEl.innerHTML" not in html
+
+
+def test_s14_browse_error_surfaces_stable_error_not_empty_dir():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    # browse-folder must surface stable server errors (data.error + error_code)
+    # instead of silently rendering an empty directory listing.
+    assert "if (data.error)" in html
+    assert "error_code" in html
+    assert ".textContent" in html
+
+
+def test_s14_page_has_no_zip_upload_control():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    # The S1.4 page must not reintroduce ZIP/JSON upload widgets.
+    assert 'type="file"' not in html
+    assert "dropZone" not in html
+    assert "uploadDataset" not in html
+    assert "uploadTraining" not in html
     assert "splitStatus.innerHTML" not in html

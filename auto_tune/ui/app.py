@@ -75,6 +75,14 @@ from auto_tune.modules.dataset_snapshot.service import (
     create_dataset_snapshot,
     validate_dataset_snapshot,
 )
+from auto_tune.modules.input_safety import (
+    InputSafetyError,
+    InputSafetyPolicy,
+    list_safe_subdirectories,
+    load_input_safety_policy,
+    scan_directory_bounded,
+    validate_directory_path,
+)
 
 
 def _finalize_and_build_event(
@@ -1632,156 +1640,95 @@ def _resolve_validated_snapshot_data_yaml(latest_info: dict) -> Path:
 
 @app.post("/api/dataset/upload")
 async def upload_dataset(file: UploadFile = File(...)):
-    """Upload a ZIP dataset, run analysis, return results."""
-    _invalidate_cache("load_data")
+    """(Legacy) ZIP dataset upload disabled — use folder selection (Studio S1.4).
 
-    if not file.filename or not file.filename.endswith(".zip"):
-        return JSONResponse({"error": "Only ZIP files are supported"}, status_code=400)
-
-    # Save uploaded file
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    upload_id = f"ds_{int(time.time())}"
-    extract_path = UPLOAD_DIR / upload_id
-    extract_path.mkdir(parents=True)
-
-    zip_path = extract_path / file.filename
-    try:
-        content = await file.read()
-        zip_path.write_bytes(content)
-
-        # Extract
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            _safe_extract_zip(zf, extract_path)
-        zip_path.unlink()  # remove zip after extraction
-
-        # Find dataset root: look for data.yaml or images/ directory
-        dataset_dir = str(extract_path)
-        data_yaml = None
-
-        # Try to find data.yaml
-        yaml_paths = list(extract_path.rglob("data.yaml")) + list(extract_path.rglob("data.yml"))
-        if yaml_paths:
-            import yaml
-            with open(yaml_paths[0], encoding="utf-8") as f:
-                data_yaml = yaml.safe_load(f)
-            dataset_dir = str(yaml_paths[0].parent)
-        else:
-            # Check if images/train exists
-            train_img = extract_path / "images" / "train"
-            if train_img.exists():
-                dataset_dir = str(extract_path)
-                data_yaml = {"names": {0: "object"}}
-            else:
-                # Check flat structure
-                jpg_files = list(extract_path.glob("*.jpg")) + list(extract_path.glob("*.png"))
-                if jpg_files:
-                    dataset_dir = str(extract_path)
-                    data_yaml = {"names": {0: "object"}}
-                else:
-                    return JSONResponse({
-                        "error": "Cannot find data.yaml or images in the ZIP. "
-                                 "Please ensure your ZIP contains a YOLO-format dataset."
-                    }, status_code=400)
-
-        # Run analysis
-        from auto_tune.modules.dataset_analyzer.analyzer import analyze_dataset
-
-        ds_config = APP_CONFIG.get("dataset_analyzer", {})
-        result = analyze_dataset(dataset_dir, data_yaml, ds_config)
-
-        # Add dataset path if not present
-        result.setdefault("dataset_path", dataset_dir)
-
-        # Save report to log directory
-        report_path = Path("log") / f"dataset_report_{upload_id}.json"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-
-        # Track latest dataset in a status file (do not delete extracted files)
-        latest_info = {
-            "upload_id": upload_id,
-            "dataset_path": dataset_dir,
-            "has_data_yaml": bool(yaml_paths),
-            "upload_time": time.time(),
-            "split": False,
-            "data_yaml_path": str(yaml_paths[0]) if yaml_paths else None,
-        }
-        latest_ds_path = Path("log") / "latest_dataset.json"
-        latest_ds_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(latest_ds_path, "w", encoding="utf-8") as f:
-            json.dump(latest_info, f, ensure_ascii=False, indent=2)
-
-        return JSONResponse({
-            "status": "success",
-            "dataset_path": dataset_dir,
-            "data_yaml_path": str(yaml_paths[0]) if yaml_paths else None,
-            "report_path": str(report_path),
-            "summary": format_dataset_summary(result),
-        })
-
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        try:
-            err_log = Path("log") / "upload_errors.log"
-            err_log.parent.mkdir(parents=True, exist_ok=True)
-            with open(err_log, "a", encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Upload error:\n{tb}\n")
-        except Exception:
-            pass
-        print(f"[ERROR] Upload failed: {e}\n{tb}", flush=True)
-        return JSONResponse({"error": f"Analysis failed: {str(e)}"}, status_code=500)
+    The request body is never read; the handler responds 410 unconditionally.
+    """
+    return JSONResponse(
+        {"error": "ZIP 上传已停用，请使用目录选择", "error_code": "LEGACY_UPLOAD_DISABLED"},
+        status_code=410,
+    )
 
 
 # ── Folder Browse API ──
 
 
+def _load_input_policy() -> InputSafetyPolicy:
+    """Load the current input_safety policy from the public config."""
+    return load_input_safety_policy(APP_CONFIG)
+
+
+def _input_safety_error_response(exc: InputSafetyError) -> JSONResponse:
+    """Map an input-safety domain error to a stable structured HTTP response."""
+    return JSONResponse({"error": str(exc), "error_code": exc.error_code}, status_code=exc.status_code)
+
+
+def _browse_roots(policy: InputSafetyPolicy) -> JSONResponse:
+    """Root listing for an empty browse path.
+
+    With ``allowed_roots`` configured, only those roots are offered; otherwise
+    available Windows drives are listed, matching the pre-S1.4 behavior.
+    """
+    if policy.allowed_roots:
+        entries = [
+            {"name": p.name or str(p), "path": str(p), "is_dir": True}
+            for p in (Path(root).resolve(strict=False) for root in policy.allowed_roots)
+        ]
+        return JSONResponse({"path": "", "parent": None, "entries": entries})
+    if os.name == "nt":
+        import string
+        drives = []
+        for d in string.ascii_uppercase:
+            dp = f"{d}:\\"
+            if os.path.exists(dp):
+                drives.append({"name": f"({d}:)", "path": dp, "is_dir": True})
+        return JSONResponse({"path": "", "parent": None, "entries": drives})
+    return JSONResponse({"path": "", "parent": None, "entries": []})
+
+
+def _browse_parent(root: Path, policy: InputSafetyPolicy) -> str | None:
+    """Parent for navigation, or ``None`` when moving up would be unsafe/out of bounds."""
+    parent = root.parent
+    if parent == root:
+        return None
+    try:
+        validate_directory_path(parent, policy)
+    except InputSafetyError:
+        return None
+    return str(parent)
+
+
 @app.post("/api/browse-folder")
 async def browse_folder(request: Request):
-    """List subdirectories of a given path for server-side folder browsing."""
+    """List safe subdirectories of a given server path.
+
+    Every entry validates the path and enumerates direct subdirectories through
+    the input-safety module; out-of-bounds, link, and permission errors return
+    stable error responses instead of an empty listing.
+    """
     try:
         data = await request.json()
-        path = data.get("path", "").strip()
-
-        if not path or not os.path.isdir(path):
-            # Return available drives on Windows
-            if os.name == "nt":
-                import string
-                drives = []
-                for d in string.ascii_uppercase:
-                    dp = f"{d}:\\"
-                    if os.path.exists(dp):
-                        drives.append({"name": f"({d}:)", "path": dp, "is_dir": True})
-                return JSONResponse({"path": path, "entries": drives})
-            return JSONResponse({"path": path, "entries": []})
-
-        entries = []
-        try:
-            for item in sorted(os.listdir(path)):
-                item_path = os.path.join(path, item)
-                try:
-                    if os.path.isdir(item_path):
-                        entries.append({"name": item, "path": item_path, "is_dir": True})
-                except OSError:
-                    pass
-        except PermissionError:
-            pass
-
-        # On Windows, drive roots (C:\, D:\) have no parent directory;
-        # use empty string to signal "go up to drives list".
-        if os.name == "nt" and len(path) == 3 and path[1:] == ":\\":
-            parent = ""
-        else:
-            parent = os.path.dirname(path)
-            parent = parent if parent != path else None
+    except Exception:
+        data = {}
+    path = (data.get("path") or "").strip()
+    try:
+        policy = _load_input_policy()
+        if not path:
+            return _browse_roots(policy)
+        root = validate_directory_path(path, policy)
+        subs = list_safe_subdirectories(root, policy)
+        entries = [{"name": p.name, "path": str(p), "is_dir": True} for p in subs]
         return JSONResponse({
-            "path": path,
-            "parent": parent,
+            "path": str(root),
+            "parent": _browse_parent(root, policy),
             "entries": entries,
         })
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    except InputSafetyError as exc:
+        return _input_safety_error_response(exc)
+    except Exception:
+        return JSONResponse(
+            {"error": "浏览目录失败", "error_code": "INPUT_BROWSE_FAILED"}, status_code=500
+        )
 
 
 # ── Dataset Folder Analyze API ──
@@ -1789,21 +1736,30 @@ async def browse_folder(request: Request):
 
 @app.post("/api/dataset/analyze-folder")
 async def analyze_dataset_folder(request: Request):
-    """Analyze a dataset folder directly from a server path (no ZIP upload)."""
+    """Analyze a dataset folder directly from a server path (no ZIP upload).
+
+    The input is validated and bounded-scanned before any ``rglob``, file read,
+    Module A call, or state write; failures never create a report or rewrite
+    ``latest_dataset.json``.
+    """
     _invalidate_cache("load_data")
 
     try:
         data = await request.json()
         folder_path = data.get("path", "").strip()
 
-        if not folder_path or not os.path.isdir(folder_path):
-            return JSONResponse({"error": f"文件夹路径无效或不存在: {folder_path}"}, status_code=400)
+        try:
+            policy = _load_input_policy()
+            root = validate_directory_path(folder_path, policy)
+            scan = scan_directory_bounded(root, policy)
+        except InputSafetyError as exc:
+            return _input_safety_error_response(exc)
 
         # Find data.yaml or detect dataset structure
-        dataset_dir = folder_path
+        dataset_dir = str(root)
         data_yaml = None
 
-        folder = Path(folder_path)
+        folder = root
         yaml_paths = list(folder.rglob("data.yaml")) + list(folder.rglob("data.yml"))
         if yaml_paths:
             import yaml as _yaml
@@ -1857,6 +1813,10 @@ async def analyze_dataset_folder(request: Request):
             "data_yaml_path": str(yaml_paths[0]) if yaml_paths else None,
             "report_path": str(report_path),
             "summary": format_dataset_summary(result),
+            "input_scan": {
+                "member_count": scan.member_count,
+                "total_bytes": scan.total_bytes,
+            },
         })
 
     except Exception as e:
@@ -2020,15 +1980,14 @@ import datetime
 
 @app.post("/api/training/analyze")
 async def upload_training(file: UploadFile = File(...)):
-    """Upload a training report JSON or a ZIP of YOLO train directory for analysis."""
-    if not file.filename:
-        return JSONResponse({"error": "No file provided"}, status_code=400)
+    """(Legacy) training ZIP/JSON upload disabled — use folder selection (Studio S1.4).
 
-    if file.filename.endswith(".zip"):
-        return await _analyze_train_zip(file)
-    if file.filename.endswith(".json"):
-        return await _analyze_train_json(file)
-    return JSONResponse({"error": "Only JSON and ZIP files are supported"}, status_code=400)
+    The request body is never read; the handler responds 410 unconditionally.
+    """
+    return JSONResponse(
+        {"error": "ZIP/JSON 上传已停用，请使用目录选择", "error_code": "LEGACY_UPLOAD_DISABLED"},
+        status_code=410,
+    )
 
 
 async def _analyze_train_json(file: UploadFile) -> JSONResponse:
@@ -2250,16 +2209,24 @@ async def _analyze_train_zip(file: UploadFile) -> JSONResponse:
 
 @app.post("/api/training/analyze-folder")
 async def analyze_training_folder(request: Request):
-    """Analyze a YOLO train directory directly from a server path (no ZIP upload)."""
+    """Analyze a YOLO train directory directly from a server path (no ZIP upload).
+
+    The input is validated and bounded-scanned before any file read, Module B
+    call, report, or history write; failures never create/overwrite anything.
+    """
     try:
         data = await request.json()
         folder_path = data.get("path", "").strip()
 
-        if not folder_path or not os.path.isdir(folder_path):
-            return JSONResponse({"error": f"文件夹路径无效或不存在: {folder_path}"}, status_code=400)
+        try:
+            policy = _load_input_policy()
+            root = validate_directory_path(folder_path, policy)
+            scan = scan_directory_bounded(root, policy)
+        except InputSafetyError as exc:
+            return _input_safety_error_response(exc)
 
         # Check for results.csv and args.yaml
-        run_dir = folder_path
+        run_dir = str(root)
         has_csv = os.path.exists(os.path.join(run_dir, "results.csv"))
         has_args = os.path.exists(os.path.join(run_dir, "args.yaml"))
         if not has_csv or not has_args:
@@ -2369,7 +2336,14 @@ async def analyze_training_folder(request: Request):
             "epochs": run_data["results"].get("total_epochs"),
             "best_epoch": run_data["results"].get("best_epoch"),
         }
-        return JSONResponse({"status": "success", "summary": summary})
+        return JSONResponse({
+            "status": "success",
+            "summary": summary,
+            "input_scan": {
+                "member_count": scan.member_count,
+                "total_bytes": scan.total_bytes,
+            },
+        })
 
     except Exception as e:
         import traceback
