@@ -143,7 +143,7 @@ python -m pytest auto_tune/tests -q -p no:cacheprovider
 - 产品与阶段路线：`docs/roadmap_20260814.md`
 - 后续任务顺序和验收：`docs/implementation_plan_20260814.md`
 - 当前操作说明：`docs/操作说明_操作工手册_20260821.md`
-- 最新研发文档：`docs/Auto-Tune后续研发路线与实施评估_研发执行版_20260821.docx`（当前最新可编辑版本；后续不再同步生成 PDF）
+- 最新研发文档：`docs/Auto-Tune后续研发路线与实施评估_研发执行版_20260824.docx`（当前最新可编辑版本；后续不再同步生成 PDF）
 - Linux 迁移准备：`auto_tune/docs/linux-migration-plan.md`
 
 旧操作手册、技术 Leader 评估和早期方案文件已移入根目录 `历史文档/`，仅用于追溯，不作为当前研发或操作依据。Claude Code 后续业务任务必须读取当前交接、路线、实施计划和对应批次规格，不得引用历史文档替代当前真源。
