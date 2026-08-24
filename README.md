@@ -154,19 +154,23 @@ training:
   workers: 4
 
 llm:
-  api_key: YOUR_DEEPSEEK_API_KEY
   enabled: false
+  provider: deepseek
+  credential_ref: AutoTuneStudio/text/deepseek
 
 vision:
-  api_key: YOUR_QWEN_API_KEY
   enabled: false
+  provider: qwen
+  credential_ref: AutoTuneStudio/vision/qwen
 ```
 
-没有 API Key 时，将 `llm.enabled` 和 `vision.enabled` 设为 `false`。Python 指标分析、普通训练和 `keep_params` 验证不依赖 LLM。
+API Key 不写入 YAML。启动 Studio 后在“AI 服务配置”中保存到 Windows Credential Manager，或使用只读环境变量 `AUTO_TUNE_TEXT_API_KEY` / `AUTO_TUNE_VISION_API_KEY`。没有 Key 时，将 `llm.enabled` 和 `vision.enabled` 设为 `false`；Python 指标分析和普通训练不依赖 LLM。
 
-> `auto_tune/config.yaml` 可能包含密钥和本地路径，已被设计为不提交 GitHub。不要把真实 API Key 写入 README、Issue、日志或截图。
+> `auto_tune/config.yaml` 可能包含本地路径，但不得再包含 API Key，且仍不应提交 GitHub。不要把真实 API Key 写入 README、Issue、日志、脚本或截图。
 
 ## 操作指南
+
+完整的密钥生成、同机升级、换机、轮换和应急处置说明见 [`docs/操作说明_操作工手册_20260821.md`](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C_20260821.md)。
 
 ### 1. 启动界面
 
@@ -345,7 +349,7 @@ environment.yml                       # Conda 环境
 - [项目路线规划](docs/roadmap_20260814.md)
 - [后续实施计划](docs/implementation_plan_20260814.md)
 - [当前开发交接记录](docs/development_handoff_20260814.md)
-- [操作工手册](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C.md)
+- [操作工手册](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C_20260821.md)
 
 ## GitHub 安全边界
 

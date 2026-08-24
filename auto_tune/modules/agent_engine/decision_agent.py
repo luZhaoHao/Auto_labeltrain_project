@@ -9,6 +9,14 @@ import re
 import requests
 from typing import Any
 
+from auto_tune.modules.security.credentials import resolve_credential
+from auto_tune.modules.security.endpoint_policy import (
+    DEFAULT_DEEPSEEK_ENDPOINT,
+    EndpointPolicyError,
+    validate_endpoint,
+)
+from auto_tune.modules.security.redaction import safe_provider_error
+
 from .parameter_registry import get_tunable_parameter_names
 
 
@@ -196,7 +204,7 @@ def build_decision_prompt(
 
 
 def call_decision_llm(prompt: str, config: dict) -> str:
-    """Call DeepSeek API for decision.
+    """Call DeepSeek API for decision using the resolved text credential.
 
     Args:
         prompt: the decision prompt.
@@ -206,8 +214,18 @@ def call_decision_llm(prompt: str, config: dict) -> str:
         Raw response text.
     """
     llm_cfg = config.get("llm", {})
+    api_key = resolve_credential("text")
+    if not api_key:
+        raise RuntimeError("DeepSeek API error: credential_missing")
+    try:
+        endpoint = validate_endpoint(
+            llm_cfg.get("endpoint", DEFAULT_DEEPSEEK_ENDPOINT),
+            bool(llm_cfg.get("allow_private_endpoint", False)),
+        )
+    except EndpointPolicyError:
+        raise RuntimeError("DeepSeek API error: endpoint_rejected")
     headers = {
-        "Authorization": f"Bearer {llm_cfg.get('api_key', '')}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -219,13 +237,21 @@ def call_decision_llm(prompt: str, config: dict) -> str:
         "temperature": 0.3,
         "max_tokens": 2000,
     }
-    endpoint = llm_cfg.get("endpoint", "https://api.deepseek.com/v1/chat/completions")
 
-    resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+    try:
+        resp = requests.post(
+            endpoint, headers=headers, json=payload, timeout=(10, 120), allow_redirects=False
+        )
+    except requests.exceptions.RequestException:
+        raise RuntimeError("DeepSeek API error: network_failed")
     if resp.status_code == 200:
-        return resp.json()["choices"][0]["message"]["content"]
-    err = resp.json().get("error", {}).get("message", resp.text[:200])
-    raise RuntimeError(f"DeepSeek API error ({resp.status_code}): {err}")
+        try:
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception:
+            raise RuntimeError("DeepSeek API error: incompatible_response")
+    raise RuntimeError(
+        f"DeepSeek API error ({resp.status_code}): {safe_provider_error(resp.status_code)}"
+    )
 
 
 def decide_hyperparameters(

@@ -768,3 +768,107 @@ def test_training_monitor_stop_button_hidden_after_terminal_state():
     assert 'style="display:none;" id="stopTrainingBtn"' in html
     # ...and the page-load handler only reveals it when /api/training/running says running.
     assert "data.running === true" in html
+
+
+# ── Studio S1.2: immutable dataset snapshot UI ──
+
+
+def _render_dataset_page(latest_dataset):
+    from auto_tune.ui.app import _jinja_env
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator("zh")
+    return _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang="zh",
+        active_page="dataset",
+        experiment_history=[],
+        tuning_history=[],
+        dataset=None,
+        training=None,
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=latest_dataset,
+    )
+
+
+def _latest_with_snapshot(valid=True, **overrides):
+    data = {
+        "dataset_path": "e:/data/source",
+        "split": True,
+        "snapshot_id": "a" * 64,
+        "snapshot_path": "e:/log/dataset_snapshots/" + "a" * 64,
+        "manifest_path": "e:/log/dataset_snapshots/" + "a" * 64 + "/manifest.json",
+        "data_yaml_path": "e:/log/dataset_snapshots/" + "a" * 64 + "/data.yaml",
+        "train_count": 80,
+        "val_count": 20,
+        "background_count": 3,
+        "snapshot_valid": valid,
+    }
+    data.update(overrides)
+    return data
+
+
+def test_snapshot_ui_create_button_seed_and_hints():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    assert "创建训练快照" in html
+    assert 'id="splitRatio"' in html
+    assert 'id="splitSeed"' in html
+    assert 'value="42"' in html
+    assert "原始数据不会被移动或修改" in html
+    assert "额外占用磁盘空间" in html
+    # ratio input strictly avoids 0/1
+    assert 'min="0.05"' in html
+    assert 'max="0.5"' in html
+
+
+def test_snapshot_ui_status_shows_valid_snapshot():
+    html = _render_dataset_page(_latest_with_snapshot(valid=True))
+    assert "快照有效" in html
+    assert "80" in html
+    assert "20" in html
+    assert "背景" in html
+
+
+def test_snapshot_ui_corrupted_snapshot_not_ready():
+    html = _render_dataset_page(_latest_with_snapshot(valid=False))
+    assert "快照已损坏" in html
+    assert "数据集已就绪" not in html
+    assert "无法用于训练" in html
+
+
+def test_snapshot_ui_old_latest_not_ready():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    assert "数据集已就绪" not in html
+    assert "未创建快照" in html
+
+
+def test_snapshot_ui_training_modal_uses_snapshot_yaml_when_valid():
+    html = _render_dataset_page(_latest_with_snapshot(valid=True))
+    assert 'value="e:/log/dataset_snapshots/' + "a" * 64 + '/data.yaml"' in html
+
+
+def test_snapshot_ui_corrupted_modal_not_autofilled():
+    html = _render_dataset_page(_latest_with_snapshot(valid=False))
+    assert 'value="e:/log/dataset_snapshots/' + "a" * 64 + '/data.yaml"' not in html
+
+
+def test_snapshot_ui_js_sends_ratio_and_seed_and_disables_button():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    assert "val_ratio: ratioNum" in html
+    assert "seed: seedNum" in html
+    assert "btn.disabled = true" in html
+    assert "btn.disabled = false" in html
+    assert "正在校验并复制" in html
+
+
+def test_snapshot_ui_error_text_uses_textcontent():
+    html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
+    # splitDataset must render server errors through textContent (safe text), not innerHTML.
+    assert "statusEl.textContent = '快照创建失败: '" in html
+    assert "splitStatus.innerHTML" not in html

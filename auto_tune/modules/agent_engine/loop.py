@@ -639,6 +639,11 @@ def run_tuning_loop(
                 return tuning_result
 
             # ── Step 4: Execute ──
+            # Bind the validated snapshot data.yaml (when provided) so auto-tuning
+            # never trains against a stale or external dataset path.
+            data_override = (config.get("training", {}) or {}).get("data_yaml")
+            if data_override and merged.get("data") != data_override:
+                merged["data"] = str(data_override)
             if on_progress:
                 on_progress(iteration, f"执行层：启动训练 {merged.get('model', 'yolov8')}", step="execute")
             train_name = f"autotune_{iteration}_{reference_run or 'latest'}_{tuning_session_id}"
