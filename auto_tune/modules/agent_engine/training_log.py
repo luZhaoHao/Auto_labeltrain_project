@@ -146,6 +146,30 @@ def append_training_log(path: Path, line: str) -> None:
 
 # ── SSE payload ──
 
+
+def process_training_output_line(line: str, train_name: str, log_path, warned_once):
+    """Classify/persist/classify one stdout line into an SSE payload dict.
+
+    Returns ``None`` when a persistence warning was already emitted for
+    ``log_path`` (warn-once per run). Never raises on a broken log file.
+    Used by the background run controllers (S1.5 reconnect fix).
+    """
+    event = classify_training_line(line)
+    try:
+        append_training_log(log_path, event.raw)
+    except OSError:
+        if log_path in warned_once:
+            return None
+        warned_once.add(log_path)
+        return {
+            "status": "running",
+            "event": "log_persistence_error",
+            "level": "warning",
+            "message": "日志保存失败，训练继续运行",
+        }
+    return build_training_sse_payload(event, train_name)
+
+
 def build_training_sse_payload(event: TrainingLogEvent, train_name: str) -> dict:
     """Build the fixed SSE payload dict for a training_log event."""
     return {

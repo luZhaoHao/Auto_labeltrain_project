@@ -83,6 +83,22 @@ from auto_tune.modules.input_safety import (
     scan_directory_bounded,
     validate_directory_path,
 )
+from auto_tune.modules.run_state.models import RunStatePersistenceError
+from auto_tune.modules.run_state.service import (
+    new_run_state,
+    project_public_state,
+    read_run_state,
+    with_terminal,
+    write_run_state,
+)
+from auto_tune.modules.run_state.process_identity import (
+    capture_process_identity,
+    reconcile_persisted_state,
+)
+from auto_tune.modules.run_state.events import EventBroker
+from auto_tune.modules.run_state.manager import _RUN_MANAGER
+from auto_tune.modules.run_state.manual_controller import ManualRunController
+from auto_tune.modules.run_state.tuning_controller import TuningRunController
 
 
 def _finalize_and_build_event(
@@ -92,13 +108,14 @@ def _finalize_and_build_event(
     config: dict,
     log_dir: str,
     started_at: str | None,
+    cancelled: bool = False,
 ) -> dict:
     """Finalize a finished training and build the unified SSE completion event."""
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     training_status = "completed" if returncode == 0 else "failed"
     training_error = None
     if returncode != 0:
-        if _running_training.get("status") == "aborted":
+        if cancelled or _running_training.get("status") == "aborted":
             error_type, message = "user_cancelled", "训练被用户取消"
         else:
             error_type, message = "training_process_failed", f"训练进程退出码 {returncode}"
@@ -142,13 +159,84 @@ def _finalize_and_build_event(
 
 
 def _remove_status_file() -> None:
-    """Delete the training_running.json status file if present (best-effort)."""
-    _sf = os.path.join("log", "training_running.json")
-    if os.path.exists(_sf):
-        try:
-            os.remove(_sf)
-        except OSError:
-            pass
+    """Legacy no-op.
+
+    S1.5 expresses terminal states by persisting them, never by deleting the
+    status file. Kept as a real no-op so any stale call site cannot resurrect
+    the "delete file to stop" behavior.
+    """
+    pass
+
+
+def _persist_run_state(state_file, state) -> None:
+    """Atomically persist a run state; propagates RunStatePersistenceError."""
+    write_run_state(state_file, state)
+
+
+_RUN_STATE_DETAIL_THROTTLE = 10
+
+
+async def _run_sse(broker, controller, after_seq):
+    """Subscribe to a run's event bus and stream events to the client.
+
+    The controller owns the run; this generator only drains the broker and
+    unsubscribes when the connection closes. It never cancels the controller.
+    """
+    import queue as _queue
+
+    q, replay = broker.subscribe(after_seq)
+    try:
+        if broker.replay_truncated(after_seq):
+            # The ring buffer already evicted some events after after_seq.
+            # This is a transport/control warning, NOT a terminal event: it must
+            # never look like the run finished, so it carries no terminal status
+            # and no "terminal" phase, and it is exempt from the per-run_id
+            # event_seq sequence (no event_seq — the frontend skips seq tracking
+            # for it and handles it before any terminal check).
+            yield _sse_chunk([{
+                "status": "running", "level": "warning",
+                "message": "部分历史日志不可重放，当前运行仍在继续",
+                "run_id": broker.run_id, "phase": "replaying",
+                "event": "replay_truncated", "replay_truncated": True,
+            }])
+        for ev in replay:
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+        while True:
+            try:
+                while True:
+                    ev = q.get_nowait()
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            except _queue.Empty:
+                pass
+            if controller is not None and controller.is_done():
+                # Terminal events are already published to the buffer; drain any
+                # leftovers so a reconnecting client always sees them.
+                try:
+                    while True:
+                        ev = q.get_nowait()
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                except _queue.Empty:
+                    pass
+                break
+            await asyncio.sleep(0.15)
+    finally:
+        broker.unsubscribe(q)
+
+
+def _manual_finalize_cb(controller, returncode):
+    """Build the unified completion event for a finished manual training run."""
+    event = _finalize_and_build_event(
+        returncode,
+        controller.train_dir,
+        controller.train_name,
+        APP_CONFIG,
+        "log",
+        controller.started_iso,
+        cancelled=controller._stop_applied,
+    )
+    event["run_id"] = controller.run_id
+    event["phase"] = "terminal"
+    return event
 
 
 def _sse_chunk(payloads) -> str:
@@ -226,7 +314,7 @@ class _SseBatch:
 
 from .components.dataset_panel import get_dataset_report, format_dataset_summary
 from .components.train_panel import get_training_report
-from .components.tuning_panel import get_tuning_history, get_tuning_status
+from .components.tuning_panel import get_tuning_history
 from .components.experiment_panel import get_experiment_history
 from .i18n import make_translator, translate
 
@@ -267,6 +355,10 @@ _tuning_cancel_event = threading.Event()
 
 # Reference to current TrainingProcess for stop endpoint
 _current_tuning_train_proc = None
+
+# Whether the auto-tuning loop is still owned by this worker's memory (used to
+# decide controller_owned when reconciling the persisted tuning run state).
+_tuning_loop_active = False
 
 
 def _update_config(section: str, data: dict) -> tuple[bool, str]:
@@ -1055,7 +1147,26 @@ async def api_experiments_history():
 
 @app.get("/api/tuning/status")
 async def api_tuning_status():
-    return JSONResponse({"status": get_tuning_status()})
+    """Reconcile auto-tuning state into the unified public projection.
+
+    A live in-memory tuning controller keeps ``running``; a persisted running
+    record without one is conservatively downgraded and never reported as
+    running.
+    """
+    _sf = os.path.join("log", "tuning_running.json")
+
+    controller = _RUN_MANAGER.active_tuning()
+    if controller is not None:
+        return JSONResponse(project_public_state(controller.run_state))
+
+    _state = read_run_state(_sf, run_kind="tuning")
+    _reconciled = reconcile_persisted_state(_state, controller_owned=False)
+    if _reconciled is not None and _reconciled != _state:
+        try:
+            _persist_run_state(_sf, _reconciled)
+        except RunStatePersistenceError:
+            pass
+    return JSONResponse(project_public_state(_reconciled))
 
 
 # ── S1.3 AI settings / credentials / migration API ──
@@ -1272,182 +1383,71 @@ async def start_tuning(request: Request):
             status_code=400,
         )
 
+    # Concurrency gate: a second active tuning run is rejected with 409.
+    if _RUN_MANAGER.active_tuning() is not None:
+        return JSONResponse(
+            {"error": "已有活动调优运行，请先停止或等待完成",
+             "error_code": "RUN_ALREADY_ACTIVE"},
+            status_code=409,
+        )
+
     global _tuning_cancel_event, _current_tuning_train_proc
     _tuning_cancel_event.clear()
     _current_tuning_train_proc = None
 
-    # Write tuning running status file so /api/tuning/status returns "running"
+    # Create the unified tuning run identity and persist it before anything
+    # starts; the first write must succeed or the loop never launches.
+    run_state = new_run_state("tuning")
     _tuning_status_file = os.path.join("log", "tuning_running.json")
     try:
-        with open(_tuning_status_file, "w", encoding="utf-8") as _tsf:
-            json.dump({"status": "running"}, _tsf)
-    except Exception:
-        pass
+        _persist_run_state(_tuning_status_file, run_state)
+    except RunStatePersistenceError as exc:
+        return JSONResponse(
+            {"error": f"运行状态写入失败，未启动调优: {exc}",
+             "error_code": "RUN_STATE_PERSIST_FAILED"},
+            status_code=500,
+        )
 
-    async def event_stream():
-        import queue as _queue
-        import asyncio as _asyncio
+    from auto_tune.modules.agent_engine.loop import run_tuning_loop
 
-        # Use a thread-safe queue so on_progress (running in thread pool)
-        # can deliver messages to the async generator in real time.
-        # Bounded (constraint 9/11c): under slow-client backpressure transient
-        # progress is dropped; terminal events are emitted by the generator
-        # itself, never through on_progress, so they can never be dropped.
-        msg_queue: _queue.Queue[str] = _queue.Queue(maxsize=500)
-        last_iteration = 0
+    def loop_runner(on_progress, on_state, cancel_event):
+        cfg = APP_CONFIG
+        if snapshot_data_yaml is not None:
+            cfg = dict(APP_CONFIG)
+            training = dict(APP_CONFIG.get("training", {}) or {})
+            training["data_yaml"] = str(snapshot_data_yaml)
+            cfg["training"] = training
+        return run_tuning_loop(
+            config=cfg,
+            reference_run=reference_run,
+            max_retries=max_retries,
+            log_dir="log",
+            skip_execute=skip_execute,
+            auto_analyze=auto_analyze,
+            auto_loop=auto_loop,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+            keep_params=keep_params,
+            eval_mode=eval_mode,
+            on_state=on_state,
+        )
 
-        def _enqueue(payload: dict) -> None:
-            _enqueue_bounded(msg_queue, payload)
-
-        def on_progress(iteration, message, step=None, params=None, **kwargs):
-            nonlocal last_iteration
-            if iteration != last_iteration:
-                last_iteration = iteration
-                _enqueue({
-                    "status": "running",
-                    "message": f"--- Iter {iteration} ---",
-                    "level": "info",
-                    "iteration": iteration,
-                    "step": "iteration_start",
-                })
-            data = {
-                "status": "running",
-                "message": message,
-                "level": kwargs.get("level", "info"),
-                "iteration": iteration,
-            }
-            if step:
-                data["step"] = step
-            if params:
-                data["params"] = params
-            for _k in ("event", "log_kind", "detail", "epoch", "total_epochs", "train_name"):
-                if _k in kwargs and kwargs[_k] is not None:
-                    data[_k] = kwargs[_k]
-            _enqueue(data)
-
-        from auto_tune.modules.agent_engine.loop import run_tuning_loop
-
-        def run():
-            # Inject the validated snapshot data.yaml into a config copy; never
-            # mutate the shared APP_CONFIG.
-            cfg = APP_CONFIG
-            if snapshot_data_yaml is not None:
-                cfg = dict(APP_CONFIG)
-                training = dict(APP_CONFIG.get("training", {}) or {})
-                training["data_yaml"] = str(snapshot_data_yaml)
-                cfg["training"] = training
-            return run_tuning_loop(
-                config=cfg,
-                reference_run=reference_run,
-                max_retries=max_retries,
-                log_dir="log",
-                skip_execute=skip_execute,
-                auto_analyze=auto_analyze,
-                auto_loop=auto_loop,
-                on_progress=on_progress,
-                cancel_event=_tuning_cancel_event,
-                keep_params=keep_params,
-                eval_mode=eval_mode,
-            )
-
-        loop = _asyncio.get_event_loop()
-        future = loop.run_in_executor(None, run)
-
-        result = None
-        error = None
-
-        # Immediate feedback so the user sees "Starting..." right away
-        yield f"data: {json.dumps({'status': 'running', 'message': 'Starting tuning...', 'level': 'info', 'iteration': 0})}\n\n"
-
-        # Yield messages in real time while the tuning loop runs in a thread.
-        # NOTE: We use get_nowait() + await sleep() instead of get(timeout=0.5)
-        # because blocking the event loop with get(timeout=...) prevents it from
-        # processing the call_soon_threadsafe callback that resolves future.done().
-        while True:
-            # Non-blocking drain of all available messages
-            try:
-                while True:
-                    msg = msg_queue.get_nowait()
-                    yield f"data: {msg}\n\n"
-            except _queue.Empty:
-                pass
-
-            if future.done():
-                try:
-                    result = future.result()
-                except Exception as e:
-                    error = str(e)
-                break
-
-            # Check for cancellation signal
-            if _tuning_cancel_event.is_set():
-                # Give the thread a moment to clean up, then break
-                if future.done():
-                    try:
-                        result = future.result()
-                    except Exception as e:
-                        error = str(e)
-                else:
-                    error = "用户取消"
-                break
-
-            # Yield control to event loop so it can process callbacks
-            # (critical: without this, future.done() never becomes True
-            #  because the event loop is blocked by the async generator)
-            await _asyncio.sleep(0.15)
-
-        try:
-            _invalidate_cache("load_data")
-
-            if error:
-                if "用户取消" in str(error):
-                    msg = json.dumps({"status": "cancelled", "message": "训练已取消", "level": "warn"})
-                else:
-                    msg = json.dumps({"status": "error", "message": f"Tuning failed: {error}", "level": "error"})
-                yield f"data: {msg}\n\n"
-            elif result is None:
-                msg = json.dumps({"status": "error", "message": "Tuning returned no result", "level": "error"})
-                yield f"data: {msg}\n\n"
-            else:
-                final = result.get("final_result", {}) or {}
-                msg = json.dumps({
-                    "status": "done",
-                    "message": "Tuning complete",
-                    "level": "success",
-                    "result": {
-                        "train_name": final.get("train_name"),
-                        "changes": final.get("changes"),
-                        "best_iteration": result.get("best_iteration"),
-                        "best_train_name": result.get("best_train_name"),
-                        "best_metrics": result.get("best_metrics"),
-                        "eval_mode": result.get("eval_mode", eval_mode),
-                    },
-                })
-                yield f"data: {msg}\n\n"
-
-            # Drain any remaining messages that arrived between future completion and yield
-            while True:
-                try:
-                    msg = msg_queue.get_nowait()
-                    yield f"data: {msg}\n\n"
-                except _queue.Empty:
-                    break
-        except Exception as _e:
-            # Ensure the client always gets a terminal event, even on error
-            try:
-                yield f"data: {json.dumps({'status': 'error', 'message': f'Stream error: {_e}', 'level': 'error'})}\n\n"
-            except Exception:
-                pass
-        finally:
-            # Clean up tuning running status file when stream ends
-            try:
-                if os.path.exists(_tuning_status_file):
-                    os.remove(_tuning_status_file)
-            except Exception:
-                pass
+    # Create + register + start the background controller. SSE is only a
+    # subscriber; the controller persists the terminal state by itself.
+    broker = EventBroker(run_state.run_id)
+    controller = TuningRunController(
+        run_state=run_state,
+        state_file=_tuning_status_file,
+        broker=broker,
+        manager=_RUN_MANAGER,
+        loop_runner=loop_runner,
+    )
+    _RUN_MANAGER.register(controller)
+    controller.start()
+    _invalidate_cache("load_data")
 
     return StreamingResponse(
-        event_stream(),
+        _run_sse(broker, controller, 0),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1459,39 +1459,102 @@ async def start_tuning(request: Request):
 
 @app.post("/tuning/stop")
 async def stop_tuning():
-    """Stop the currently running tuning loop."""
-    global _tuning_cancel_event
-    _tuning_cancel_event.set()
-    # Clean up tuning running status file
+    """Stop the active auto-tuning run.
+
+    Only ``starting``/``running`` runs can be stopped; a terminal state is
+    never rewritten to cancelled. The controller marks ``stopping``, cancels
+    the loop thread, waits for it to finish, then the controller persists
+    ``cancelled/terminal``. A failed wait returns an error, never a fake
+    success.
+    """
     sf = os.path.join("log", "tuning_running.json")
-    if os.path.exists(sf):
-        try:
-            os.remove(sf)
-        except Exception:
-            pass
-    return JSONResponse({"status": "stopped"})
+    controller = _RUN_MANAGER.active_tuning()
+    if controller is not None:
+        ok = controller.request_stop()
+        if not ok:
+            return JSONResponse(
+                {"error": "调优任务无法停止", "error_code": "STOP_FAILED"},
+                status_code=500,
+            )
+        done = await asyncio.to_thread(controller.wait_done, 30)
+        if not done:
+            return JSONResponse(
+                {"error": "等待调优任务退出超时", "error_code": "STOP_TIMEOUT"},
+                status_code=500,
+            )
+        state = read_run_state(sf, run_kind="tuning")
+        return JSONResponse({
+            "status": "stopped",
+            "running": False,
+            "status_message": state.status if state else "cancelled",
+        })
+
+    # No live controller: never rewrite an existing terminal state.
+    _state = read_run_state(sf, run_kind="tuning")
+    if _state is None:
+        return JSONResponse({"error": "没有活动调优运行", "error_code": "NO_ACTIVE_RUN"}, status_code=404)
+    if _state.status in ("starting", "running"):
+        reconciled = reconcile_persisted_state(_state, controller_owned=False)
+        if reconciled is not None and reconciled != _state:
+            try:
+                _persist_run_state(sf, reconciled)
+            except RunStatePersistenceError:
+                pass
+        return JSONResponse(
+            {"error": "运行控制已中断，无法停止原进程", "error_code": "CONTROLLER_LOST"},
+            status_code=409,
+        )
+    return JSONResponse({"status": "stopped", "running": False, "status_message": _state.status})
 
 
 @app.post("/api/training/stop")
 async def stop_first_training():
-    """Stop the currently running first-time training."""
-    if _running_training.get("proc"):
-        proc = _running_training["proc"]
-        try:
-            if proc.returncode is None:
-                proc.terminate()
-        except Exception:
-            pass
-        _running_training["status"] = "aborted"
-        _running_training["proc"] = None
-    # Clean up status file
+    """Stop the active ordinary training run.
+
+    Only ``starting``/``running`` runs can be stopped. The controller marks
+    ``stopping``, terminates the subprocess, waits for it to exit, then the
+    controller persists ``cancelled/terminal``. A failed termination or
+    timeout returns an error, never a fake success.
+    """
     sf = os.path.join("log", "training_running.json")
-    if os.path.exists(sf):
+    controller = _RUN_MANAGER.active_manual()
+    if controller is not None:
+        ok = controller.request_stop()
+        if not ok:
+            return JSONResponse(
+                {"error": "终止训练进程失败", "error_code": "STOP_FAILED"},
+                status_code=500,
+            )
         try:
-            os.remove(sf)
-        except Exception:
-            pass
-    return JSONResponse({"status": "stopped"})
+            await controller.wait_done(timeout=20)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"error": "等待训练进程退出超时", "error_code": "STOP_TIMEOUT"},
+                status_code=500,
+            )
+        state = read_run_state(sf, run_kind="manual")
+        return JSONResponse({
+            "status": "stopped",
+            "running": False,
+            "status_message": state.status if state else "cancelled",
+        })
+
+    # No live controller: never rewrite an existing terminal state.
+    _state = read_run_state(sf, run_kind="manual")
+    if _state is None:
+        return JSONResponse({"error": "没有活动训练运行", "error_code": "NO_ACTIVE_RUN"}, status_code=404)
+    if _state.status in ("starting", "running"):
+        reconciled = reconcile_persisted_state(_state, controller_owned=False)
+        if reconciled is not None and reconciled != _state:
+            try:
+                _persist_run_state(sf, reconciled)
+            except RunStatePersistenceError:
+                pass
+        return JSONResponse(
+            {"error": "运行控制已中断，无法停止原进程", "error_code": "CONTROLLER_LOST"},
+            status_code=409,
+        )
+    return JSONResponse({"status": "stopped", "running": False, "status_message": _state.status})
 
 
 # ── Dataset Upload & Analysis ──
@@ -2356,9 +2419,25 @@ async def analyze_training_folder(request: Request):
 
 @app.post("/api/training/start")
 async def start_first_training(request: Request):
-    """Start a first-time YOLO training with SSE progress streaming."""
+    """Start a first-time YOLO training.
+
+    The subprocess, stdout consumption, log writes, state updates, finalizer,
+    and terminal-state persistence all run in a background ManualRunController.
+    This endpoint only creates and starts the controller, then returns an SSE
+    subscription. Disconnecting the SSE client never cancels the controller.
+    """
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
     import os as _os
+
+    from auto_tune.modules.agent_engine.executor import find_detect_dir
+
+    # Concurrency gate: a second active manual run is rejected with 409.
+    if _RUN_MANAGER.active_manual() is not None:
+        return JSONResponse(
+            {"error": "已有活动训练运行，请先停止或等待完成",
+             "error_code": "RUN_ALREADY_ACTIVE"},
+            status_code=409,
+        )
 
     # Read params from request body or config.yaml
     training_cfg = APP_CONFIG.get("training", {})
@@ -2386,146 +2465,81 @@ async def start_first_training(request: Request):
             status_code=400,
         )
 
-    async def event_stream():
-        nonlocal data_yaml, model, epochs, imgsz, batch, workers, patience
+    # Determine directories + next train name synchronously so the very first
+    # run-state write can be validated before any SSE stream or subprocess.
+    import re as _re
+    detect_dir = find_detect_dir()
+    _os.makedirs(detect_dir, exist_ok=True)
+    max_n = 0
+    for _d in _os.listdir(detect_dir):
+        if _os.path.isdir(_os.path.join(detect_dir, _d)):
+            _m = _re.match(r"^train(\d+)$", _d)
+            if _m:
+                max_n = max(max_n, int(_m.group(1)))
+    train_name = f"train{max_n + 1}"
+    train_dir = _os.path.join(detect_dir, train_name)
+    _os.makedirs(train_dir, exist_ok=True)
 
-        # Import executor helpers
-        from auto_tune.modules.agent_engine.executor import find_detect_dir
+    # The very first state write must succeed or training never starts.
+    run_state = new_run_state("manual", run_name=train_name)
+    _state_file = os.path.join("log", "training_running.json")
+    try:
+        _persist_run_state(_state_file, run_state)
+    except RunStatePersistenceError as exc:
+        return JSONResponse(
+            {"error": f"运行状态写入失败，未启动训练: {exc}",
+             "error_code": "RUN_STATE_PERSIST_FAILED"},
+            status_code=500,
+        )
 
-        cfg = {}
-        try:
-            import yaml as _yaml
-            import json as _json
-            import os as _os2
+    # Build params + args.yaml + the exact command once.
+    import yaml as _yaml
+    params = {
+        "model": model,
+        "data": _os.path.abspath(data_yaml),
+        "epochs": epochs,
+        "imgsz": imgsz,
+        "batch": batch,
+        "workers": workers,
+        "patience": patience,
+        "name": train_name,
+        "project": _os.path.abspath(detect_dir),
+        "exist_ok": "True",
+        "plots": True,
+        "save": True,
+        "device": "0",
+    }
+    with open(_os.path.join(train_dir, "args.yaml"), "w", encoding="utf-8") as _f:
+        _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    from auto_tune.modules.agent_engine.executor import resolve_yolo_executable
+    cmd = [resolve_yolo_executable(), "train"]
+    for _k, _v in params.items():
+        cmd.append(f"{_k}={_v}")
 
-            # Determine directories
-            detect_dir = find_detect_dir()
-            # Find next train name (regular train dirs)
-            _os2.makedirs(detect_dir, exist_ok=True)
-            max_n = 0
-            for _d in _os2.listdir(detect_dir):
-                if _os2.path.isdir(_os2.path.join(detect_dir, _d)):
-                    import re as _re
-                    _m = _re.match(r"^train(\d+)$", _d)
-                    if _m:
-                        max_n = max(max_n, int(_m.group(1)))
-            train_name = f"train{max_n + 1}"
-            train_dir = _os2.path.join(detect_dir, train_name)
-            _os2.makedirs(train_dir, exist_ok=True)
-
-            # Build params
-            params = {
-                "model": model,
-                "data": _os2.path.abspath(data_yaml),
-                "epochs": epochs,
-                "imgsz": imgsz,
-                "batch": batch,
-                "workers": workers,
-                "patience": patience,
-                "name": train_name,
-                "project": _os2.path.abspath(detect_dir),
-                "exist_ok": "True",
-                "plots": True,
-                "save": True,
-                "device": "0",
-            }
-
-            # Write args.yaml for reference
-            with open(_os2.path.join(train_dir, "args.yaml"), "w", encoding="utf-8") as _f:
-                _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-            # Build yolo command
-            from auto_tune.modules.agent_engine.executor import resolve_yolo_executable
-            cmd = [resolve_yolo_executable(), "train"]
-            for _k, _v in params.items():
-                cmd.append(f"{_k}={_v}")
-
-            yield f"data: {_json.dumps({'status': 'running', 'message': f'启动训练: {train_name}', 'level': 'info', 'train_name': train_name})}\n\n"
-            yield f"data: {_json.dumps({'status': 'running', 'message': f'数据集: {data_yaml}', 'level': 'info'})}\n\n"
-            yield f"data: {_json.dumps({'status': 'running', 'message': f'模型: {model}  |  轮次: {epochs}  |  batch: {batch}  |  imgsz: {imgsz}', 'level': 'info'})}\n\n"
-
-            # Capture started_at before launch, then launch subprocess
-            start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                limit=1024 * 128,
-            )
-
-            # Track globally
-            _running_training.clear()
-            _running_training.update({
-                "train_name": train_name,
-                "train_dir": train_dir,
-                "proc": proc,
-                "start_time": time.time(),
-                "start_iso": start_iso,
-                "status": "running",
-            })
-            # Also write a status file so it survives reload
-            status_f = _os2.path.join("log", "training_running.json")
-            with open(status_f, "w", encoding="utf-8") as _sf:
-                _json.dump({
-                    "train_name": train_name,
-                    "status": "running",
-                    "start_time": time.time(),
-                }, _sf)
-
-            # Open the run's full-log file (new run dir => empty file is safe)
-            _log_path = os.path.join(train_dir, "training.log")
-            with open(_log_path, "w", encoding="utf-8") as _lf:
-                _lf.write("")
-
-            # Single consumer: this coroutine reads the merged stdout/stderr,
-            # persists every line to training.log and emits bounded SSE batches.
-            _warned_once = set()
-            _epoch_keys = set()
-            _batcher = _SseBatch()
-            while True:
-                _line_b = await proc.stdout.readline()
-                if not _line_b:
-                    break
-                _line = _line_b.decode("utf-8", errors="replace").rstrip()
-                if not _line:
-                    continue
-                _payload = _process_training_output_line(_line, train_name, _log_path, _warned_once)
-                if _payload is None:
-                    continue
-                # Dedup default summary for the same epoch/validation row: the
-                # detail still reaches the log and full panel, only message drops.
-                if _payload.get("event") == "training_log" and _payload.get("log_kind") in ("epoch", "validation"):
-                    _key = (_payload.get("log_kind"), _payload.get("epoch"), _payload.get("message"))
-                    if _key in _epoch_keys:
-                        _payload["message"] = None
-                    else:
-                        _epoch_keys.add(_key)
-                _batcher.add(_payload)
-                if _batcher.should_flush():
-                    yield _batcher.take()
-            if _batcher.pending:
-                yield _batcher.take()
-
-            await proc.wait()
-
-            # Preserve an aborted state set by /api/training/stop; otherwise
-            # record the real terminal state of the subprocess.
-            if _running_training.get("status") != "aborted":
-                _running_training["status"] = "completed" if proc.returncode == 0 else "failed"
-            # The status file must not stay "running" in any terminal state.
-            _remove_status_file()
-            event = _finalize_and_build_event(
-                proc.returncode, train_dir, train_name, APP_CONFIG, "log", _running_training.get("start_iso")
-            )
-            yield f"data: {_json.dumps(event, ensure_ascii=False, default=str)}\n\n"
-
-        except Exception as _exc:
-            yield f"data: {_json.dumps({'status': 'error', 'message': f'异常: {_exc}', 'level': 'error'})}\n\n"
-        finally:
-            _invalidate_cache("load_data")
+    # Create + register + start the background controller. SSE is only a
+    # subscriber: disconnecting it never cancels the controller.
+    broker = EventBroker(run_state.run_id)
+    controller = ManualRunController(
+        run_state=run_state,
+        state_file=_state_file,
+        cmd=cmd,
+        params=params,
+        train_name=train_name,
+        train_dir=train_dir,
+        data_yaml=data_yaml,
+        model=model,
+        epochs=epochs,
+        log_path=os.path.join(train_dir, "training.log"),
+        finalize_cb=_manual_finalize_cb,
+        broker=broker,
+        manager=_RUN_MANAGER,
+    )
+    _RUN_MANAGER.register(controller)
+    controller.start()
+    _invalidate_cache("load_data")
 
     return StreamingResponse(
-        event_stream(),
+        _run_sse(broker, controller, 0),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2537,43 +2551,94 @@ async def start_first_training(request: Request):
 
 @app.get("/api/training/running")
 async def training_running_status():
-    """Check if a first-time training is currently running.
+    """Reconcile ordinary-training state into the unified public projection.
 
-    Reconciles the in-memory process first: if it finished, the terminal
-    status (completed/failed) is recorded and the status file is cleaned up so
-    it can never stay "running". Terminal in-memory states take precedence over
-    the status file; the file only reports running=True to survive a server
-    restart that happened mid-training (in-memory state was lost).
+    A live in-memory controller (which owns the subprocess and the event bus)
+    is authoritative. A persisted running record without a live controller is
+    conservatively downgraded (interrupted/unknown) and never reported as
+    still running.
     """
-    if _running_training.get("proc") and _running_training["status"] == "running":
-        _proc = _running_training["proc"]
-        _ret = _proc.poll()
-        if _ret is None:
-            return JSONResponse({
-                "running": True,
-                "train_name": _running_training.get("train_name"),
-                "status": "running",
-                "elapsed": time.time() - _running_training.get("start_time", time.time()),
-            })
-        _running_training["status"] = "completed" if _ret == 0 else "failed"
-        _remove_status_file()
-
-    _status = _running_training.get("status")
-    if _status in ("completed", "failed", "aborted"):
-        return JSONResponse({"running": False, "status": _status})
-
-    # Status file fallback (survives server restart).
     _sf = os.path.join("log", "training_running.json")
-    if os.path.exists(_sf):
-        try:
-            with open(_sf, encoding="utf-8") as _f:
-                data = json.load(_f)
-            if data.get("status") == "running":
-                return JSONResponse({"running": True, **data})
-        except Exception:
-            pass
 
-    return JSONResponse({"running": False, "status": "idle"})
+    controller = _RUN_MANAGER.active_manual()
+    if controller is not None:
+        return JSONResponse(project_public_state(controller.run_state))
+
+    # Persisted record reconciliation (covers restart, legacy, corrupt files).
+    _state = read_run_state(_sf, run_kind="manual")
+    _reconciled = reconcile_persisted_state(_state, controller_owned=False)
+    if _reconciled is not None and _reconciled != _state:
+        try:
+            _persist_run_state(_sf, _reconciled)
+        except RunStatePersistenceError:
+            pass
+    return JSONResponse(project_public_state(_reconciled))
+
+
+@app.get("/api/runs/{run_id}/stream")
+async def run_stream(run_id: str, after_seq: int = Query(0)):
+    """Resubscribe to an active run's event stream after a page refresh.
+
+    While the controller is alive in this process, the client replays buffered
+    events ``> after_seq`` and then receives live events. A controller that
+    just finished is briefly retained so a disconnected client can still replay
+    the real buffered events (including the terminal and finalizer results).
+    Once evicted from retention (or after a server restart, where a running
+    record is reconciled to ``interrupted`` and the process is never
+    re-adopted), only the persisted terminal is returned, flagged
+    ``replay_truncated``. A stopped run cannot reconnect as an active stream.
+    """
+    controller = _RUN_MANAGER.get(run_id)
+    if controller is not None:
+        return StreamingResponse(
+            _run_sse(controller.broker, controller, after_seq),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    run_kind = None
+    if run_id.startswith("manual:"):
+        run_kind = "manual"
+    elif run_id.startswith("tuning:"):
+        run_kind = "tuning"
+    if run_kind is None:
+        return JSONResponse({"error": "未知运行", "error_code": "UNKNOWN_RUN"}, status_code=404)
+
+    _sf = os.path.join("log", "training_running.json" if run_kind == "manual" else "tuning_running.json")
+    state = read_run_state(_sf, run_kind=run_kind)
+    if state is None or state.run_id != run_id:
+        return JSONResponse({"error": "未知运行", "error_code": "UNKNOWN_RUN"}, status_code=404)
+
+    if state.status in ("starting", "running"):
+        # Server restart lost the controller: never re-adopt the process.
+        reconciled = reconcile_persisted_state(state, controller_owned=False)
+        if reconciled is not None and reconciled != state:
+            try:
+                _persist_run_state(_sf, reconciled)
+            except RunStatePersistenceError:
+                pass
+        state = reconciled
+
+    async def terminal_stream():
+        # No controller/broker is available to replay missed events, so the
+        # persisted terminal is the best we can offer; say so honestly.
+        seq = (state.last_event.seq + 1) if state.last_event is not None else 1
+        ev = {
+            "status": state.status,
+            "run_id": run_id,
+            "phase": state.phase,
+            "message": state.terminal_reason or state.status,
+            "event_seq": seq,
+            "terminal_reason": state.terminal_reason,
+            "replay_truncated": True,
+        }
+        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        terminal_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Run ──

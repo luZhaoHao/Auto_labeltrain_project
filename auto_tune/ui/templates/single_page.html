@@ -1187,6 +1187,7 @@
   <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training Monitor") }}</div>
   <span class="badge badge-green" id="statusBadge" style="font-size:13px; padding:4px 14px;">{{ _("Idle") }}</span>
 </div>
+<div class="dim" id="runStateNote" style="display:none; margin-bottom:8px; font-size:13px; color:#92400E;"></div>
 
 {% set latest_run = None %}
 {% set latest_metrics = None %}
@@ -1577,31 +1578,154 @@ function switchPage(idx) {
     pages[i].classList.toggle('active', i === idx);
     tabs[i].classList.toggle('active', i === idx);
   }
-  // When switching to training monitor (page 3), check if any training is running
+  // When switching to training monitor (page 3), refresh the unified run state
+  // and re-attach to an active run's event stream if one is running.
   if (idx === 3) {
-    var stopBtn = document.getElementById('stopTrainingBtn');
-    if (stopBtn && stopBtn.style.display !== 'inline-flex') {
-      // Check auto-tuning status
-      fetch('/api/tuning/status')
-        .then(function(r){ return r.json(); })
-        .then(function(data){
-          if (data && data.status === 'running') {
-            stopBtn.style.display = 'inline-flex';
-          }
-        })
-        .catch(function(){});
-      // Also check first-time training status
-      fetch('/api/training/running')
-        .then(function(r){ return r.json(); })
-        .then(function(data){
-          if (data && data.running === true) {
-            stopBtn.style.display = 'inline-flex';
-          }
-        })
-        .catch(function(){});
+    refreshRunState().then(_subscribeActiveRun);
+  }
+}
+
+// ── S1.5 unified run-state rendering ──
+var _activeRunId = null;
+var _lastEventSeq = -1;
+
+function _badgeForStatus(status) {
+  switch (status) {
+    case 'running': return ['{{ _("Running") }}', 'badge badge-yellow'];
+    case 'completed': return ['{{ _("Completed") }}', 'badge badge-green'];
+    case 'failed': return ['{{ _("Failed") }}', 'badge badge-red'];
+    case 'cancelled': return ['{{ _("Cancelled") }}', 'badge badge-yellow'];
+    case 'interrupted': return ['{{ _("Interrupted") }}', 'badge'];
+    case 'unknown': return ['{{ _("Unknown") }}', 'badge'];
+    default: return ['{{ _("Unknown") }}', 'badge'];
+  }
+}
+
+function renderRunState(state) {
+  var badge = document.getElementById('statusBadge');
+  if (!badge) return;
+  var pair = _badgeForStatus(state && state.status);
+  badge.textContent = pair[0];
+  badge.className = pair[1];
+  var stopBtn = document.getElementById('stopTrainingBtn');
+  if (stopBtn) {
+    stopBtn.style.display = (state && state.running === true) ? 'inline-flex' : 'none';
+  }
+  var note = document.getElementById('runStateNote');
+  if (note) {
+    if (state && state.status === 'interrupted') {
+      note.textContent = '{{ _("运行控制已中断，无法确认或继续原进程") }}';
+      note.style.display = 'block';
+    } else if (state && state.status === 'unknown') {
+      note.textContent = '{{ _("状态无法确认") }}';
+      note.style.display = 'block';
+    } else {
+      note.textContent = '';
+      note.style.display = 'none';
     }
   }
 }
+
+function _latestUpdatedAt(a, b) {
+  // An active running state always wins over a historical terminal state,
+  // even when a terminal record carries a newer updated_at.
+  if (a && a.running === true) return a;
+  if (b && b.running === true) return b;
+  var ta = a && a.updated_at ? a.updated_at : '';
+  var tb = b && b.updated_at ? b.updated_at : '';
+  if (ta && tb) return ta >= tb ? a : b;
+  if (ta) return a;
+  if (tb) return b;
+  return b || a;
+}
+
+function refreshRunState() {
+  return Promise.all([
+    fetch('/api/training/running').then(function(r){ return r.json(); }).catch(function(){ return null; }),
+    fetch('/api/tuning/status').then(function(r){ return r.json(); }).catch(function(){ return null; })
+  ]).then(function(res) {
+    var state = _latestUpdatedAt(res[0], res[1]);
+    renderRunState(state);
+    return state;
+  });
+}
+
+var _reconnectAbort = null;
+
+function _subscribeActiveRun(state) {
+  // After a refresh / page switch, re-attach to the active run's event stream
+  // using its run_id + last_event.seq. A stopped or terminal run never
+  // reconnects as an active stream.
+  if (!state || state.running !== true || !state.run_id) return;
+  var afterSeq = (state.last_event && state.last_event.seq != null) ? state.last_event.seq : 0;
+  if (_reconnectAbort) { _reconnectAbort.abort(); _reconnectAbort = null; }
+  _activeRunId = state.run_id;
+  _lastEventSeq = afterSeq;
+  var renderer = makeLogRenderer(
+    document.getElementById('monitorLog'),
+    document.getElementById('monitorFullLog'),
+    MAX_DEFAULT_LOG_LINES,
+    MAX_FULL_LOG_LINES
+  );
+  var abort = new AbortController();
+  _reconnectAbort = abort;
+  fetch('/api/runs/' + encodeURIComponent(state.run_id) + '/stream?after_seq=' + afterSeq, { signal: abort.signal })
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.body.getReader();
+    })
+    .then(function(reader) {
+      var consumer = makeSseConsumer();
+      var stopBtn = document.getElementById('stopTrainingBtn');
+      function read() {
+        return reader.read().then(function(result) {
+          if (result.done) { renderer.flushAll(); return; }
+          consumer(result.value, function(data) {
+            if (!_sseInCurrentRun(data)) return;
+            if (data.event === 'replay_truncated') {
+              // Transport warning only: the run is still going. Never treated
+              // as terminal, never hides the stop button, never refreshes state.
+              renderer.pushDefault(data.message || '部分历史日志不可重放，当前运行仍在继续', 'warn');
+              return;
+            }
+            if (data.event === 'training_log') {
+              if (data.message != null) renderer.pushDefault(data.message, cssClassFor(data));
+              if (data.detail != null) renderer.pushFull(data.detail, cssClassFor(data));
+            } else if (data.event === 'log_persistence_error') {
+              renderer.pushDefault(data.message, 'warn');
+            } else if (_isTerminal(data)) {
+              if (stopBtn) stopBtn.style.display = 'none';
+              refreshRunState();
+            } else if (data.message) {
+              renderer.pushDefault(data.message, cssClassFor(data));
+            }
+          });
+          return read();
+        });
+      }
+      return read();
+    })
+    .catch(function(err) { if (err.name !== 'AbortError') { /* ignore */ } });
+}
+
+function _sseInCurrentRun(data) {
+  if (!data.run_id) return true;  // legacy events without identity stay visible
+  if (_activeRunId === null) _activeRunId = data.run_id;
+  if (data.run_id !== _activeRunId) return false;  // old connection polluting a new run
+  if (data.event_seq != null) {
+    if (data.event_seq <= _lastEventSeq) return false;  // duplicate/out-of-order event
+    _lastEventSeq = data.event_seq;
+  }
+  return true;
+}
+
+function _isTerminal(data) {
+  var s = data.status;
+  return s === 'done' || s === 'error' || s === 'cancelled' ||
+         s === 'completed' || s === 'failed' || s === 'interrupted';
+}
+
+refreshRunState().then(_subscribeActiveRun);
 
 // ── Project editing ──
 function toggleProjectEdit() {
@@ -2414,6 +2538,8 @@ function makeSseConsumer() {
     }
 
     tuningAbortController = new AbortController();
+    _activeRunId = null;
+    _lastEventSeq = -1;
     try {
       var response = await fetch('/tuning/start', {
         method: 'POST',
@@ -2437,6 +2563,12 @@ function makeSseConsumer() {
         var r = await reader.read();
         if (r.done) break;
         consumer(r.value, function(data) {
+          if (!_sseInCurrentRun(data)) return;  // ignore stale / duplicate events
+          if (data.event === 'replay_truncated') {
+            // Transport warning only: never a terminal status for tuning.
+            appendLog(data.message || '部分历史日志不可重放，当前运行仍在继续', 'warning');
+            return;
+          }
           if (handleTuningSse(data)) return;  // training-log lines handled by renderer
           appendLog(data.message, data.level || 'info');
           // Update pipeline visualization
@@ -2450,11 +2582,17 @@ function makeSseConsumer() {
             showParamChanges(data.params);
           }
             if (data.status === 'cancelled') {
-              tuningStatus.innerHTML = '[{{ _("已取消") }}] {{ _("Training stopped") }}';
-            } else if (data.status === 'error') {
+              tuningStatus.textContent = '[{{ _("已取消") }}] {{ _("Training stopped") }}';
+              if (stopBtn) stopBtn.style.display = 'none';
+              refreshRunState();
+            } else if (data.status === 'error' || data.status === 'failed') {
               tuningStatus.textContent = '[{{ _("失败") }}] ' + data.message;
-            } else if (data.status === 'done') {
-              tuningStatus.innerHTML = '[{{ _("完成") }}] {{ _("Tuning complete") }}';
+              if (stopBtn) stopBtn.style.display = 'none';
+              refreshRunState();
+            } else if (data.status === 'done' || data.status === 'completed') {
+              tuningStatus.textContent = '[{{ _("完成") }}] {{ _("Tuning complete") }}';
+              if (stopBtn) stopBtn.style.display = 'none';
+              refreshRunState();
               // Render best result card
               var result = data.result || {};
               if (result.best_iteration != null) {
@@ -2495,9 +2633,17 @@ function makeSseConsumer() {
     } catch (err) {
       if (err.name === 'AbortError') {
         appendLog('{{ _("Training stopped by user") }}', 'warn');
-        tuningStatus.innerHTML = '[{{ _("已取消") }}] {{ _("Training stopped — ") }} <button class="btn btn-outline btn-sm" onclick="location.reload()" style="margin-left:8px;">{{ _("Refresh") }}</button>';
+        tuningStatus.textContent = '[{{ _("已取消") }}] {{ _("Training stopped — ") }}';
+        var _refreshBtn = document.createElement('button');
+        _refreshBtn.className = 'btn btn-outline btn-sm';
+        _refreshBtn.style.marginLeft = '8px';
+        _refreshBtn.textContent = '{{ _("Refresh") }}';
+        _refreshBtn.onclick = function() { location.reload(); };
+        tuningStatus.appendChild(_refreshBtn);
+        refreshRunState();
       } else {
         appendLog('{{ _("Connection error") }}: ' + err.message, 'error');
+        refreshRunState();
       }
     } finally {
       tuningRenderer.flushAll();
@@ -2657,8 +2803,17 @@ function startTraining() {
   if (startBtn) startBtn.style.display = 'none';
   if (stopBtn) stopBtn.style.display = 'inline-flex';
   trainingAbortController = new AbortController();
+  _activeRunId = null;
+  _lastEventSeq = -1;
 
   function onTrainingEvent(data) {
+    if (!_sseInCurrentRun(data)) return;  // ignore stale / duplicate events
+    if (data.event === 'replay_truncated') {
+      // Transport warning only: the run is still going. Never treated as
+      // terminal, never hides the stop button, never refreshes state.
+      renderer.pushDefault(data.message || '部分历史日志不可重放，当前运行仍在继续', 'warn');
+      return;
+    }
     if (data.event === 'training_log') {
       if (data.message != null) renderer.pushDefault(data.message, cssClassFor(data));
       if (data.detail != null) renderer.pushFull(data.detail, cssClassFor(data));
@@ -2668,12 +2823,14 @@ function startTraining() {
       renderer.pushDefault(data.message, 'warn');
       return;
     }
-    if (data.status === 'error') {
+    if (data.status === 'error' || data.status === 'failed') {
       renderer.pushDefault('[ERROR] ' + data.message, 'destructive');
       if (badge) { badge.textContent = 'Failed'; badge.className = 'badge badge-red'; }
+      if (stopBtn) stopBtn.style.display = 'none';
+      refreshRunState();
       return;
     }
-    if (data.status === 'done') {
+    if (data.status === 'done' || data.status === 'completed') {
       var warn = data.level === 'warning';
       renderer.pushDefault('[DONE] ' + data.message, warn ? 'warn' : 'success');
       if (badge) { badge.textContent = warn ? 'Warning' : 'Completed'; badge.className = warn ? 'badge badge-yellow' : 'badge badge-green'; }
@@ -2694,6 +2851,8 @@ function startTraining() {
         reportLink.href = '/api/training/report-by-name?name=' + encodeURIComponent(result.run_name || '');
         reportLink.style.display = '';
       }
+      if (stopBtn) stopBtn.style.display = 'none';
+      refreshRunState();
       return;
     }
     // Legacy lifecycle messages (server-start banner, dataset/model lines, etc.)

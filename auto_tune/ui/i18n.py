@@ -247,6 +247,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "收起完整日志": "收起完整日志",
         "日志保存失败": "日志保存失败",
 
+        # S1.5 unified run-state (six states)
+        "Interrupted": "已中断",
+        "Unknown": "未知",
+        "运行控制已中断，无法确认或继续原进程": "运行控制已中断，无法确认或继续原进程",
+        "状态无法确认": "状态无法确认",
+
         # Probe
         "Probe Complete": "探查完成",
         "epochs": "轮",
@@ -400,6 +406,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "展开完整日志": "Expand Full Log",
         "收起完整日志": "Collapse Full Log",
         "日志保存失败": "Log save failed",
+        "Interrupted": "Interrupted",
+        "Unknown": "Unknown",
+        "运行控制已中断，无法确认或继续原进程": "Run control was interrupted; the original process cannot be confirmed or resumed.",
+        "状态无法确认": "Status cannot be confirmed",
     },
 }
 

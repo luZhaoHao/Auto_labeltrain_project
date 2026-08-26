@@ -5,6 +5,7 @@ import json
 import pytest
 
 from auto_tune.modules.train_analyzer.experiment_history import ExperimentHistoryStore
+from auto_tune.modules.run_state.service import new_run_state, update_run_state
 from auto_tune.ui.app import _finalize_and_build_event
 from auto_tune.ui.components.experiment_panel import get_experiment_history
 
@@ -582,44 +583,46 @@ class _FakeProc:
         return self._ret
 
 
-@pytest.mark.parametrize("ret,expected", [(0, "completed"), (1, "failed")])
-def test_training_running_terminal_from_finished_proc(tmp_path, monkeypatch, ret, expected):
-    """A finished subprocess (returncode 0/1) must be reported and the stale
-    training_running.json status file must be cleaned up."""
+@pytest.mark.parametrize("expected", ["completed", "failed"])
+def test_training_running_terminal_from_finished_proc(tmp_path, monkeypatch, expected):
+    """A terminal persisted state is reported and never reported as running."""
     from fastapi.testclient import TestClient
     from auto_tune.ui import app as app_mod
 
     log_dir = _training_running_log_dir(monkeypatch, tmp_path)
-    (log_dir / "training_running.json").write_text(
-        json.dumps({"train_name": "train1", "status": "running"}), encoding="utf-8")
+    state_file = log_dir / "training_running.json"
+    state = new_run_state("manual", run_name="train1")
+    update_run_state(state_file, state, status=expected, phase="terminal")
 
     app_mod._running_training.clear()
-    app_mod._running_training.update({
-        "proc": _FakeProc(ret), "status": "running", "train_name": "train1", "start_time": 0,
-    })
     try:
         client = TestClient(app_mod.app)
         data = client.get("/api/training/running").json()
 
-        assert data == {"running": False, "status": expected}
-        # training_running.json must not remain "running" after a terminal state.
-        assert not (log_dir / "training_running.json").exists()
+        assert data["running"] is False
+        assert data["status"] == expected
+        assert data["run_id"] == state.run_id
     finally:
         app_mod._running_training.clear()
 
 
 def test_training_running_aborted_reported(tmp_path, monkeypatch):
-    """The aborted terminal state (set by /api/training/stop) is reported."""
+    """The cancelled terminal state is reported as cancelled."""
     from fastapi.testclient import TestClient
     from auto_tune.ui import app as app_mod
 
     log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    state_file = log_dir / "training_running.json"
+    state = new_run_state("manual", run_name="train1")
+    update_run_state(state_file, state, status="cancelled", phase="terminal")
+
     app_mod._running_training.clear()
-    app_mod._running_training.update({"status": "aborted", "proc": None})
     try:
         client = TestClient(app_mod.app)
-        assert client.get("/api/training/running").json() == {"running": False, "status": "aborted"}
-        assert not (log_dir / "training_running.json").exists()
+        data = client.get("/api/training/running").json()
+        assert data["running"] is False
+        assert data["status"] == "cancelled"
+        assert data["phase"] == "terminal"
     finally:
         app_mod._running_training.clear()
 
@@ -632,7 +635,10 @@ def test_training_running_idle_when_nothing_pending(tmp_path, monkeypatch):
     app_mod._running_training.clear()
     try:
         client = TestClient(app_mod.app)
-        assert client.get("/api/training/running").json() == {"running": False, "status": "idle"}
+        data = client.get("/api/training/running").json()
+        assert data["running"] is False
+        assert data["status"] == "unknown"
+        assert data["run_id"] is None
     finally:
         app_mod._running_training.clear()
 
@@ -640,24 +646,37 @@ def test_training_running_idle_when_nothing_pending(tmp_path, monkeypatch):
 def test_training_running_true_while_proc_alive(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from auto_tune.ui import app as app_mod
+    from auto_tune.modules.run_state.events import EventBroker
+    import auto_tune.modules.run_state.manual_controller as mc
 
-    _training_running_log_dir(monkeypatch, tmp_path)
-    app_mod._running_training.clear()
-    app_mod._running_training.update({
-        "proc": _FakeProc(None), "status": "running", "train_name": "train9", "start_time": 1,
-    })
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    state_file = log_dir / "training_running.json"
+    run_state = new_run_state("manual", run_name="train9")
+    run_state = update_run_state(
+        state_file, run_state, status="running", phase="training", pid=1234,
+    )
+    broker = EventBroker(run_state.run_id)
+    controller = mc.ManualRunController(
+        run_state=run_state, state_file=str(state_file), cmd=["yolo"],
+        params={}, train_name="train9", train_dir=str(tmp_path),
+        data_yaml=str(tmp_path / "data.yaml"), model="yolov8n.pt", epochs=1,
+        log_path=str(tmp_path / "training.log"), finalize_cb=None,
+        broker=broker, manager=app_mod._RUN_MANAGER,
+    )
+    app_mod._RUN_MANAGER.register(controller)
     try:
         client = TestClient(app_mod.app)
         data = client.get("/api/training/running").json()
         assert data["running"] is True
         assert data["status"] == "running"
-        assert data["train_name"] == "train9"
+        assert data["run_id"] == run_state.run_id
     finally:
-        app_mod._running_training.clear()
+        app_mod._RUN_MANAGER.unregister(controller.run_id)
 
 
-def test_training_running_true_from_status_file_survives_restart(tmp_path, monkeypatch):
-    """A stale running file (server restarted mid-training) still reports running."""
+def test_legacy_running_file_not_reported_as_running(tmp_path, monkeypatch):
+    """A legacy 'running' file without verifiable identity must downgrade to
+    unknown — it can never be reported as still running."""
     from fastapi.testclient import TestClient
     from auto_tune.ui import app as app_mod
 
@@ -668,15 +687,19 @@ def test_training_running_true_from_status_file_survives_restart(tmp_path, monke
     try:
         client = TestClient(app_mod.app)
         data = client.get("/api/training/running").json()
-        assert data["running"] is True
-        assert data["train_name"] == "trainX"
+        assert data["running"] is False
+        assert data["status"] == "unknown"
+        assert data["terminal_reason"] == "legacy_identity_unverifiable"
+        # The legacy file itself is never rewritten.
+        assert json.loads((log_dir / "training_running.json").read_text("utf-8")) == {
+            "train_name": "trainX", "status": "running"}
     finally:
         app_mod._running_training.clear()
 
 
-def test_training_start_failed_cleans_status_file(tmp_path, monkeypatch):
-    """Simulate ordinary training exiting non-zero: the SSE stream records
-    status=failed and removes training_running.json (no stale 'running')."""
+def test_training_start_failed_writes_failed_terminal(tmp_path, monkeypatch):
+    """Simulate ordinary training exiting non-zero: the terminal state is
+    persisted as failed/terminal (never left 'running', never deleted)."""
     import asyncio
     from fastapi.testclient import TestClient
     from auto_tune.ui import app as app_mod
@@ -689,6 +712,7 @@ def test_training_start_failed_cleans_status_file(tmp_path, monkeypatch):
 
     class FakeProc:
         returncode = 1
+        pid = 99999
         stdout = FakeStdout()
 
         async def wait(self):
@@ -725,10 +749,13 @@ def test_training_start_failed_cleans_status_file(tmp_path, monkeypatch):
             "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
         })
         assert resp.status_code == 200
-        assert "训练失败" in resp.text
-        # The status file written at launch must be removed on failure.
-        assert not (log_dir / "training_running.json").exists()
-        assert app_mod._running_training["status"] == "failed"
+        # The terminal state is persisted as failed/terminal (never deleted).
+        persisted = json.loads((log_dir / "training_running.json").read_text("utf-8"))
+        assert persisted["status"] == "failed"
+        assert persisted["phase"] == "terminal"
+        api = client.get("/api/training/running").json()
+        assert api["status"] == "failed"
+        assert api["running"] is False
     finally:
         app_mod._running_training.clear()
 
@@ -766,8 +793,8 @@ def test_training_monitor_stop_button_hidden_after_terminal_state():
     # Stop button is hidden by default...
     assert 'id="stopTrainingBtn"' in html
     assert 'style="display:none;" id="stopTrainingBtn"' in html
-    # ...and the page-load handler only reveals it when /api/training/running says running.
-    assert "data.running === true" in html
+    # ...and the unified renderer only reveals it when state.running is true.
+    assert "state.running === true" in html
 
 
 # ── Studio S1.2: immutable dataset snapshot UI ──

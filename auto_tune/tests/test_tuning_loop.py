@@ -866,3 +866,93 @@ def test_history_feedback_contains_real_metric_delta():
     assert feedback["after_metrics"]["mAP50"] == 0.72
     assert feedback["metric_delta"] == {"mAP50": 0.02, "mAP50_95": 0.02}
     assert feedback["probe_verdict"] == "continue"
+
+
+# ── S1.5: explicit run-state callback ──
+
+
+def test_loop_on_state_reports_phases_dry_run(tmp_path, monkeypatch):
+    states = []
+
+    def on_state(phase, event_type, message, process_identity=None):
+        states.append(phase)
+
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.build_perception",
+        lambda **kwargs: {"dataset": {"total_images": 10}},
+    )
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.decide_hyperparameters",
+        lambda *args, **kwargs: _valid_decision(),
+    )
+
+    run_tuning_loop(
+        {"probe": {"max_retries": 1}},
+        reference_run=None,
+        log_dir=str(tmp_path),
+        skip_execute=True,
+        on_state=on_state,
+    )
+
+    assert "preparing" in states
+    assert "analyzing" in states
+    assert "finalizing" in states
+
+
+def test_loop_on_state_binds_process_identity(tmp_path, monkeypatch):
+    import os as _os
+
+    from auto_tune.modules.run_state.models import ProcessIdentity
+
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status,
+                      session_id=None, audit_path=None, started_at=None,
+                      finished_at=None, tuning_context=None):
+        return {
+            "run_id": f"tuning:{session_id}:{run_name}",
+            "run_name": run_name,
+            "source": "tuning",
+            "status": "completed",
+            "analysis_status": "completed",
+            "metrics": {"mAP50": 0.06, "mAP50_95": 0.02, "precision": 0.01, "recall": 0.60},
+            "epochs": {"configured": 100, "completed": 3, "best": 2},
+            "artifacts": {"report_path": str(tmp_path / "x_report.json")},
+            "analysis_error": None,
+            "history_error": None,
+            "error": None,
+        }
+
+    _finalizer_loop_setup(tmp_path, monkeypatch, fake_finalize)
+
+    class FakeProcWithPid:
+        def __init__(self):
+            self.pid = _os.getpid()
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.launch_training",
+        lambda *a, **k: FakeProcWithPid(),
+    )
+
+    executing = []
+
+    def on_state(phase, event_type, message, process_identity=None):
+        if event_type == "executing":
+            executing.append(process_identity)
+
+    run_tuning_loop(
+        {"probe": {"max_retries": 1}},
+        reference_run="train38",
+        log_dir=str(tmp_path),
+        auto_analyze=True,
+        on_state=on_state,
+    )
+
+    assert executing and executing[0] is not None
+    assert isinstance(executing[0], ProcessIdentity)
+    assert executing[0].pid == _os.getpid()
+    assert executing[0].process_create_token

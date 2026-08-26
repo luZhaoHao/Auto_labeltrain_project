@@ -346,6 +346,17 @@ class TrainingProcess:
         self._output_tail = ""
 
     @property
+    def pid(self) -> int | None:
+        """Read-only access to the underlying subprocess PID (None when gone)."""
+        proc = self.proc
+        if proc is None:
+            return None
+        try:
+            return proc.pid
+        except AttributeError:
+            return None
+
+    @property
     def elapsed(self) -> float:
         """Seconds since start."""
         return time.time() - self.start_time

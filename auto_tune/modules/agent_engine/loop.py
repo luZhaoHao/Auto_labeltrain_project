@@ -33,6 +33,7 @@ from auto_tune.modules.agent_engine.training_log import (
     append_training_log,
     classify_training_line,
 )
+from auto_tune.modules.run_state.process_identity import capture_process_identity
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,19 @@ def _forward_output_line(log_path, iteration, on_progress, line):
             epoch=event.epoch,
             total_epochs=event.total_epochs,
         )
+
+
+def _emit_state(on_state, phase, event_type, message, process_identity=None):
+    """Report a run-state fact through the optional callback; never raises.
+
+    The loop only reports facts; the UI layer owns the status file.
+    """
+    if on_state is None:
+        return
+    try:
+        on_state(phase, event_type, message, process_identity)
+    except Exception:
+        logger.exception("on_state callback failed")
 
 
 def _start_output_forwarder(train_proc, log_path, iteration, on_progress):
@@ -423,6 +437,7 @@ def run_tuning_loop(
     cancel_event = None,
     keep_params: bool = False,
     eval_mode: str = "comprehensive",
+    on_state: callable = None,
 ) -> dict:
     """Run the complete auto-tuning loop.
 
@@ -491,6 +506,8 @@ def run_tuning_loop(
         "failure": None,
     }
 
+    _emit_state(on_state, "preparing", "tuning_start", "调优会话开始")
+
     for iteration in range(1, max_retries + 1):
         # Check cancellation before each iteration
         if cancel_event and cancel_event.is_set():
@@ -504,6 +521,7 @@ def run_tuning_loop(
         audit.start_iteration(iteration)
         if on_progress:
             on_progress(iteration, f"迭代 {iteration}/{max_retries} 开始")
+        _emit_state(on_state, "analyzing", "iteration_start", f"迭代 {iteration}/{max_retries} 开始")
 
         try:
             # ── Step 1: Perception ──
@@ -633,6 +651,7 @@ def run_tuning_loop(
                 }
                 if on_progress:
                     on_progress(iteration, "跳过执行（dry-run 模式）")
+                _emit_state(on_state, "finalizing", "dry_run", "dry-run 计划已生成")
                 audit.complete_iteration(iteration)
                 audit.finalize("completed")
                 history.to_json(os.path.join(log_dir, "tuning_history.json"))
@@ -663,6 +682,7 @@ def run_tuning_loop(
             # Write merged config
             args_path = write_training_config(base_args, merged, output_dir)
             iter_result.train_name = train_name
+            _emit_state(on_state, "training", "launching", f"启动训练 {train_name}")
 
             # Build the exact command once, audit it, then launch it.
             try:
@@ -699,6 +719,13 @@ def run_tuning_loop(
                 return tuning_result
             train_proc = TrainingProcess(train_name, output_dir, proc)
             training_start_time = time.time()
+            _train_pid = train_proc.pid
+            _proc_identity = capture_process_identity(_train_pid) if _train_pid is not None else None
+            _emit_state(
+                on_state, "training", "executing",
+                f"训练进程已启动 (PID {_train_pid})",
+                process_identity=_proc_identity,
+            )
 
             # S1.1: forward subprocess output into unified training.log + SSE.
             _train_log_path = os.path.join(output_dir, "training.log")
@@ -808,6 +835,8 @@ def run_tuning_loop(
                             mAP = metrics.get("metrics/mAP50(B)", "?")
                             if on_progress:
                                 on_progress(iteration, f"训练进度: Epoch {epoch}/{merged.get('epochs', '?')}, mAP50={mAP}")
+                            _emit_state(on_state, "training", "progress",
+                                        f"训练进度: Epoch {epoch}/{merged.get('epochs', '?')}, mAP50={mAP}")
                     time.sleep(10)
 
                 _output_forwarder.join(timeout=2)
@@ -831,6 +860,7 @@ def run_tuning_loop(
                 # ── Run shared finalizer: Module B analysis + KPI + unified history ──
                 if on_progress:
                     on_progress(iteration, "训练完成，开始 Module B 分析...")
+                _emit_state(on_state, "analyzing", "analyzing", "训练完成，开始 Module B 分析...")
                 finalizer_result = finalize_training_run(
                     output_dir,
                     train_name,
@@ -923,6 +953,7 @@ def run_tuning_loop(
                     else:
                         on_progress(iteration, f"⚠️ 训练 {train_name} 完成，Module B 分析失败")
                 # ── Compute best iteration from all completed iterations ──
+                _emit_state(on_state, "finalizing", "finalizing", "调优收尾")
                 _compute_best(tuning_result, eval_mode)
                 audit.complete_iteration(iteration)
                 audit.finalize("completed")
@@ -954,6 +985,7 @@ def run_tuning_loop(
                 on_progress(iteration, f"✅ 训练 {train_name} 已通过探针期，继续进行完整训练")
 
             # ── Compute best iteration from all completed iterations ──
+            _emit_state(on_state, "finalizing", "finalizing", "调优收尾")
             _compute_best(tuning_result, eval_mode)
             audit.complete_iteration(iteration)
             audit.finalize("completed")
