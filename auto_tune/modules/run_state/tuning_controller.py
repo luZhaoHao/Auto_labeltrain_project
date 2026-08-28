@@ -212,11 +212,28 @@ class TuningRunController:
                     else:
                         terminal_status = "completed" if not result_error else "failed"
                         terminal_msg = result_error or "调优完成"
+                projected = {}
+                if isinstance(result, dict):
+                    # Redacted projection: only relative names, metrics and
+                    # stable statuses reach the page — never an absolute path.
+                    projected = {
+                        "best_iteration": result.get("best_iteration"),
+                        "best_train_name": result.get("best_train_name"),
+                        "best_metrics": result.get("best_metrics"),
+                        "best_score": result.get("best_score"),
+                        "eval_mode": result.get("eval_mode"),
+                        "final_summary_status": result.get("final_summary_status"),
+                        "llm_summary_status": result.get("llm_summary_status"),
+                        "summary_persistence_status": result.get("summary_persistence_status"),
+                        # Public-safe projection only (short ids / names).
+                        "reference_dataset": result.get("reference_dataset"),
+                    }
                 stamped = self.broker.publish({
                     "status": terminal_status, "phase": "terminal",
                     "message": terminal_msg,
                     "run_id": self.run_id,
                     "event_type": "tuning_terminal",
+                    "result": projected,
                 })
                 self.run_state = with_terminal(
                     self.run_state,

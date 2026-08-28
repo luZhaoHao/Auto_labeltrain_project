@@ -18,7 +18,12 @@ import datetime
 import threading
 from typing import Any
 
-from .perception import build_perception, find_module_b_report
+from .perception import (
+    build_perception,
+    find_module_b_report,
+    perception_blocking_error,
+)
+from . import final_summary as final_summary_mod
 from .decision_agent import decide_hyperparameters
 from .guardrails import sanitize_tuning_parameters, merge_params
 from .executor import (
@@ -122,6 +127,19 @@ def sanitize_and_merge_tuning_params(
     if not guard_result.valid:
         return None, guard_result
     return merge_params(base_args, guard_result.params), guard_result
+
+
+def _reference_dataset_public(reference_dataset) -> dict | None:
+    """Public-safe projection of the frozen resolution (no absolute paths)."""
+    if reference_dataset is None:
+        return None
+    snapshot_id = getattr(reference_dataset, "snapshot_id", "") or ""
+    return {
+        "reference_run": getattr(reference_dataset, "reference_run", None),
+        "dataset_display_name": getattr(reference_dataset, "dataset_display_name", None),
+        "snapshot_short_id": snapshot_id[:8] if snapshot_id else None,
+        "resolution_source": getattr(reference_dataset, "resolution_source", None),
+    }
 
 
 def _failure(stage: str, error_type: str, message: str, fatal: bool = True) -> dict:
@@ -231,6 +249,9 @@ def _abort_tuning(
     write is attempted (the audit file cannot be updated); the error is still
     reported in the return value. Best-iteration data is never overwritten.
     """
+    # Persist the final summary for rounds that already completed before this
+    # fatal failure, without changing the failure fact.
+    _best_effort_final_summary(tuning_result, audit)
     iter_result.error = failure["message"]
     history.add_attempt(iter_result.to_dict())
     tuning_result["iterations"].append(iter_result.to_dict())
@@ -327,6 +348,7 @@ class TuningResult:
         self.result_precision: float | None = None
         self.result_recall: float | None = None
         self.result_best_epoch: int | None = None
+        self.result_analysis_status: str | None = None
 
     def get_composite_score(self, mode: str = "comprehensive") -> float:
         """Compute composite score based on evaluation mode.
@@ -354,8 +376,8 @@ class TuningResult:
             "iteration": self.iteration,
             "timestamp": self.timestamp,
             "perception": {
-                "dataset_total_images": self.perception.get("dataset", {}).get("total_images", 0),
-                "training_best_mAP50": self.perception.get("training", {}).get("best_mAP50", 0),
+                "dataset_total_images": self.perception.get("dataset", {}).get("total_images"),
+                "training_best_mAP50": self.perception.get("training", {}).get("best_mAP50"),
             },
             "decision": {
                 "diagnosis": self.decision.get("diagnosis", ""),
@@ -382,32 +404,18 @@ class TuningResult:
             "result_precision": self.result_precision,
             "result_recall": self.result_recall,
             "result_best_epoch": self.result_best_epoch,
+            "result_analysis_status": self.result_analysis_status,
             "error": self.error,
         }
 
 
 def _compute_best(tuning_result: dict, eval_mode: str = "comprehensive"):
     """Compute best iteration from all completed iterations in tuning_result."""
-    successful = [
-        it for it in tuning_result.get("iterations", [])
-        if not it.get("error") and it.get("train_name") and it["train_name"] != "dry_run"
-        and it.get("result_mAP50") is not None
-    ]
+    successful = final_summary_mod.successful_iterations(tuning_result)
     if not successful:
         return
 
-    def _composite_score(it: dict) -> float:
-        if eval_mode == "quick":
-            m1 = it.get("result_mAP50") or 0
-            m2 = it.get("result_mAP50_95") or 0
-            return m1 * 0.6 + m2 * 0.4
-        m1 = it.get("result_mAP50") or 0
-        m2 = it.get("result_mAP50_95") or 0
-        p = it.get("result_precision") or 0
-        r = it.get("result_recall") or 0
-        return m1 * 0.35 + m2 * 0.25 + p * 0.20 + r * 0.20
-
-    best_it = max(successful, key=_composite_score)
+    best_it = max(successful, key=lambda it: final_summary_mod.composite_score(it, eval_mode))
     tuning_result["best_iteration"] = best_it.get("iteration")
     tuning_result["best_train_name"] = best_it.get("train_name")
     tuning_result["best_metrics"] = {
@@ -416,6 +424,7 @@ def _compute_best(tuning_result: dict, eval_mode: str = "comprehensive"):
         "precision": best_it.get("result_precision"),
         "recall": best_it.get("result_recall"),
     }
+    tuning_result["best_score"] = final_summary_mod.composite_score(best_it, eval_mode)
     if not tuning_result.get("final_result"):
         tuning_result["final_result"] = {
             "train_name": best_it.get("train_name"),
@@ -423,6 +432,139 @@ def _compute_best(tuning_result: dict, eval_mode: str = "comprehensive"):
             "decision": (best_it.get("decision") or {}).get("diagnosis"),
             "changes": (best_it.get("decision") or {}).get("hyperparameter_changes", {}),
         }
+
+
+def _session_short_id(tuning_session_id: str) -> str:
+    """Deterministic short session identity derived from the tuning session.
+
+    Never regenerated per round; the same value is reused for the whole session
+    so auto-loop run names stay short and stable.
+    """
+    import hashlib
+    return hashlib.sha1(str(tuning_session_id).encode("utf-8")).hexdigest()[:8]
+
+
+def _make_train_name(session_short_id: str, iteration: int) -> str:
+    """Fixed-width, path-safe auto-loop run name. The reference run lives in the
+    audit field, never inside the directory name, so names cannot grow or nest."""
+    return f"autotune_{session_short_id}_iter{int(iteration):02d}"
+
+
+def _finalize_final_summary(
+    tuning_result: dict,
+    audit: TuningAuditSession,
+    config: dict,
+    detect_dir: str,
+    eval_mode: str,
+    session_id: str,
+    reference_run: str | None,
+) -> None:
+    """Build the deterministic final summary, call the LLM at most once, and
+    atomically write tuning_final_summary.txt into the best tuning run dir.
+
+    Every failure inside is mapped to a stable status; the training fact and the
+    audit terminal state are never changed by a summary failure. This function
+    never raises: any unexpected error is mapped to ``failed`` so the tuning
+    interface can never crash because of final-summary generation.
+    """
+    try:
+        summary = final_summary_mod.build_deterministic_summary(
+            tuning_result, eval_mode, session_id, reference_run,
+        )
+    except Exception:
+        logger.exception("final summary build failed")
+        summary = None
+        _mark_final_summary_failed(tuning_result, audit)
+        return
+
+    if summary is None:
+        tuning_result["final_summary"] = None
+        tuning_result["final_summary_status"] = "skipped"
+        tuning_result["final_summary_path"] = None
+        tuning_result["llm_summary_status"] = final_summary_mod.LLM_SUMMARY_SKIPPED
+        tuning_result["summary_persistence_status"] = final_summary_mod.SUMMARY_PERSISTENCE_SKIPPED
+        try:
+            audit.set_final_summary(status="skipped", summary=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        llm_result = final_summary_mod.call_final_summary_llm(summary, config)
+        tuning_result["llm_summary_status"] = llm_result["status"]
+        if llm_result.get("error_code"):
+            tuning_result["llm_summary_error_code"] = llm_result["error_code"]
+
+        text = final_summary_mod.render_final_summary_text(summary, llm_result.get("text"))
+        best_train_dir = None
+        if summary.get("best_train_name"):
+            best_train_dir = os.path.join(detect_dir, summary["best_train_name"])
+        if best_train_dir:
+            write_result = final_summary_mod.write_final_summary_txt(summary, best_train_dir, text)
+        else:
+            write_result = {
+                "status": final_summary_mod.SUMMARY_PERSISTENCE_SKIPPED,
+                "path": None,
+                "error_code": None,
+            }
+        tuning_result["summary_persistence_status"] = write_result["status"]
+        tuning_result["final_summary_path"] = write_result.get("path")
+        tuning_result["final_summary"] = summary
+        # The deliverable is only "generated" when the TXT actually landed; a
+        # failed persistence marks the whole final-summary status failed.
+        final_summary_status = (
+            "generated"
+            if write_result["status"] != final_summary_mod.SUMMARY_PERSISTENCE_FAILED
+            else "failed"
+        )
+        tuning_result["final_summary_status"] = final_summary_status
+
+        try:
+            audit.set_final_summary(status=final_summary_status, summary=summary)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("final summary persistence failed")
+        _mark_final_summary_failed(tuning_result, audit)
+
+
+def _mark_final_summary_failed(tuning_result: dict, audit: TuningAuditSession) -> None:
+    """Map any unexpected final-summary failure to a stable, non-fatal state."""
+    tuning_result["final_summary"] = None
+    tuning_result["final_summary_status"] = "failed"
+    tuning_result["final_summary_path"] = None
+    tuning_result["llm_summary_status"] = final_summary_mod.LLM_SUMMARY_FAILED
+    tuning_result["summary_persistence_status"] = final_summary_mod.SUMMARY_PERSISTENCE_FAILED
+    try:
+        audit.set_final_summary(status="failed", summary=None)
+    except Exception:
+        pass
+
+
+def _best_effort_final_summary(tuning_result: dict, audit: TuningAuditSession) -> None:
+    """Persist the final summary for rounds that completed before an early exit
+    (fatal failure / cancellation).
+
+    Best-effort and non-fatal: it never changes the exit fact and never raises.
+    When no measurable round succeeded it does nothing, leaving the statuses at
+    their ``skipped`` initial value.
+    """
+    if not final_summary_mod.successful_iterations(tuning_result):
+        return
+    eval_mode = tuning_result.get("eval_mode", "comprehensive")
+    _compute_best(tuning_result, eval_mode)
+    try:
+        _finalize_final_summary(
+            tuning_result,
+            audit,
+            tuning_result.get("_config") or {},
+            tuning_result.get("detect_dir"),
+            eval_mode,
+            tuning_result.get("session_id"),
+            tuning_result.get("reference_run"),
+        )
+    except Exception:
+        logger.exception("best-effort final summary failed")
 
 
 def run_tuning_loop(
@@ -438,6 +580,9 @@ def run_tuning_loop(
     keep_params: bool = False,
     eval_mode: str = "comprehensive",
     on_state: callable = None,
+    runtime_run_id: str | None = None,
+    local_index_service=None,
+    reference_dataset=None,
 ) -> dict:
     """Run the complete auto-tuning loop.
 
@@ -451,6 +596,9 @@ def run_tuning_loop(
         log_dir: directory for log output.
         skip_execute: if True, stop at merged_params (for testing).
         on_progress: optional callback(iteration, message) for UI updates.
+        reference_dataset: frozen ReferenceDatasetResolution bound to
+            reference_run; when provided its data_yaml_path is the single
+            training dataset for every iteration (never latest_dataset).
 
     Returns:
         Dict with final results including all iteration details.
@@ -470,7 +618,24 @@ def run_tuning_loop(
     detect_dir = find_detect_dir()
     tuning_session_id = str(int(time.time() * 1000))  # unique per tuning session
 
-    audit = TuningAuditSession(tuning_session_id, log_dir, reference_run, max_retries)
+    # Internal audit identity: the frozen resolution's full dataset_id,
+    # snapshot_id and source are stored for reconciliation. Public projections
+    # only show names / short ids.
+    reference_dataset_audit = None
+    if reference_dataset is not None:
+        reference_dataset_audit = {
+            "reference_run": getattr(reference_dataset, "reference_run", None),
+            "dataset_id": getattr(reference_dataset, "dataset_id", None),
+            "snapshot_id": getattr(reference_dataset, "snapshot_id", None),
+            "data_yaml_path": str(getattr(reference_dataset, "data_yaml_path", "")),
+            "resolution_source": getattr(reference_dataset, "resolution_source", None),
+            "dataset_display_name": getattr(reference_dataset, "dataset_display_name", None),
+        }
+
+    audit = TuningAuditSession(
+        tuning_session_id, log_dir, reference_run, max_retries,
+        reference_dataset=reference_dataset_audit,
+    )
     try:
         audit.flush()
     except Exception as exc:
@@ -504,6 +669,17 @@ def run_tuning_loop(
         "session_id": tuning_session_id,
         "audit_path": audit.path,
         "failure": None,
+        "final_summary": None,
+        "final_summary_status": "skipped",
+        "final_summary_path": None,
+        "llm_summary_status": "skipped",
+        "summary_persistence_status": "skipped",
+        # Public-safe projection of the frozen reference dataset resolution.
+        # Absolute data_yaml_path is never included here.
+        "reference_dataset": _reference_dataset_public(reference_dataset),
+        # Internal only: never serialized to clients; used by best-effort
+        # finalization on early-exit paths.
+        "_config": config,
     }
 
     _emit_state(on_state, "preparing", "tuning_start", "调优会话开始")
@@ -512,6 +688,7 @@ def run_tuning_loop(
         # Check cancellation before each iteration
         if cancel_event and cancel_event.is_set():
             logger.info("[AutoTune] Cancelled before iteration %d", iteration)
+            _best_effort_final_summary(tuning_result, audit)
             tuning_result["error"] = "用户取消"
             audit.finalize("cancelled")
             history.to_json(os.path.join(log_dir, "tuning_history.json"))
@@ -527,8 +704,45 @@ def run_tuning_loop(
             # ── Step 1: Perception ──
             if on_progress:
                 on_progress(iteration, "感知层：聚合数据集和训练分析数据", step="perception")
-            perception = build_perception(log_dir=log_dir)
+            perception = build_perception(log_dir=log_dir, reference_run=reference_run)
             iter_result.perception = perception
+
+            # Persist a redacted perception summary before the gate so a blocked
+            # round still records the facts it did have.
+            ds_src = {}
+            perception_status = "provided"
+            if isinstance(perception.get("sources"), dict):
+                ds_src = perception["sources"].get("dataset_report") or {}
+                perception_status = ds_src.get("status", "unknown")
+            tr_src = {}
+            if isinstance(perception.get("sources"), dict):
+                tr_src = perception["sources"].get("training_report") or {}
+            try:
+                audit.update_iteration(iteration, perception={
+                    "status": perception_status,
+                    "dataset_report_basename": ds_src.get("basename"),
+                    "dataset_total_images": perception.get("dataset", {}).get("total_images"),
+                    "training_report_basename": tr_src.get("basename"),
+                    "reference_run": reference_run,
+                    "training_best_mAP50": perception.get("training", {}).get("best_mAP50"),
+                })
+            except Exception as exc:
+                failure = _persist_iteration_failure(
+                    audit, iteration, "audit", "audit_persistence_error",
+                    f"审计写入失败: {exc}",
+                )
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
+            # Perception availability gate: never call the LLM / start YOLO on
+            # unusable facts, and never fall back to keep_params.
+            blocking_code, blocking_msg = perception_blocking_error(perception)
+            if blocking_code:
+                failure = _persist_iteration_failure(
+                    audit, iteration, "perception", blocking_code, blocking_msg,
+                )
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
 
             # ── Step 2: Decision ──
             if keep_params:
@@ -658,14 +872,17 @@ def run_tuning_loop(
                 return tuning_result
 
             # ── Step 4: Execute ──
-            # Bind the validated snapshot data.yaml (when provided) so auto-tuning
-            # never trains against a stale or external dataset path.
-            data_override = (config.get("training", {}) or {}).get("data_yaml")
-            if data_override and merged.get("data") != data_override:
-                merged["data"] = str(data_override)
+            # Bind the frozen reference dataset identity (when resolved) so
+            # auto-tuning always trains against the reference run's own verified
+            # snapshot and never consults the global latest_dataset. When no
+            # resolution was frozen (dry-run plan only) the reference args.yaml
+            # data is left untouched and the plan stays not-executable.
+            if reference_dataset is not None:
+                merged["data"] = str(reference_dataset.data_yaml_path)
             if on_progress:
                 on_progress(iteration, f"执行层：启动训练 {merged.get('model', 'yolov8')}", step="execute")
-            train_name = f"autotune_{iteration}_{reference_run or 'latest'}_{tuning_session_id}"
+            session_short_id = _session_short_id(tuning_session_id)
+            train_name = _make_train_name(session_short_id, iteration)
             output_dir = os.path.join(detect_dir, train_name)
 
             # ── Preflight before creating the output directory ──
@@ -792,6 +1009,7 @@ def run_tuning_loop(
                     if cancel_event and cancel_event.is_set():
                         train_proc.terminate()
                         logger.info("[AutoTune] Cancelled during training wait")
+                        _best_effort_final_summary(tuning_result, audit)
                         iter_result.error = "用户取消训练"
                         history.add_attempt(iter_result.to_dict())
                         tuning_result["iterations"].append(iter_result.to_dict())
@@ -886,12 +1104,16 @@ def run_tuning_loop(
                             "clamped": dict(getattr(guard_result, "clamped", {}) or {}),
                         },
                     },
+                    runtime_run_id=runtime_run_id,
+                    local_index_service=local_index_service,
+                    dataset_id=reference_dataset.dataset_id if reference_dataset is not None else None,
                 )
                 finalizer_metrics = finalizer_result.get("metrics", {})
                 iter_result.result_mAP50 = finalizer_metrics.get("mAP50")
                 iter_result.result_mAP50_95 = finalizer_metrics.get("mAP50_95")
                 iter_result.result_precision = finalizer_metrics.get("precision")
                 iter_result.result_recall = finalizer_metrics.get("recall")
+                iter_result.result_analysis_status = finalizer_result.get("analysis_status")
                 _epochs_info = finalizer_result.get("epochs") or {}
                 iter_result.result_best_epoch = _epochs_info.get("best") if isinstance(_epochs_info, dict) else None
 
@@ -955,6 +1177,10 @@ def run_tuning_loop(
                 # ── Compute best iteration from all completed iterations ──
                 _emit_state(on_state, "finalizing", "finalizing", "调优收尾")
                 _compute_best(tuning_result, eval_mode)
+                _finalize_final_summary(
+                    tuning_result, audit, config, detect_dir, eval_mode,
+                    tuning_session_id, tuning_result.get("reference_run"),
+                )
                 audit.complete_iteration(iteration)
                 audit.finalize("completed")
                 history.to_json(os.path.join(log_dir, "tuning_history.json"))
@@ -987,6 +1213,10 @@ def run_tuning_loop(
             # ── Compute best iteration from all completed iterations ──
             _emit_state(on_state, "finalizing", "finalizing", "调优收尾")
             _compute_best(tuning_result, eval_mode)
+            _finalize_final_summary(
+                tuning_result, audit, config, detect_dir, eval_mode,
+                tuning_session_id, tuning_result.get("reference_run"),
+            )
             audit.complete_iteration(iteration)
             audit.finalize("completed")
             # Save history
@@ -1004,6 +1234,10 @@ def run_tuning_loop(
 
     # All retries exhausted — check if we have any successful iterations
     _compute_best(tuning_result, eval_mode)
+    _finalize_final_summary(
+        tuning_result, audit, config, detect_dir, eval_mode,
+        tuning_session_id, tuning_result.get("reference_run"),
+    )
     if tuning_result.get("best_iteration") is not None:
         audit.finalize("completed")
         if on_progress:

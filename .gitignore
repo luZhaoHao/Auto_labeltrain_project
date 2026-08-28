@@ -22,6 +22,13 @@ build/
 /runs/
 /log/
 
+# SQLite local index + backups (rebuildable query projection; never committed)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.bak
+
 # Packaging output
 build_output/
 *.tar.gz

@@ -496,7 +496,7 @@
       <div class="card-icon" style="background:#EFF6FF;">
         <svg viewBox="0 0 24 24" stroke="var(--primary)" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </div>
-      <div class="card-title">{{ _("Auto-Tuning") }}</div>
+      <div class="card-title">{{ _("Auto tuning") }}</div>
       {% if tuning_history %}
       <div class="card-value">{{ tuning_history|length }}</div>
       <div class="card-desc">{{ _("total iterations") }}</div>
@@ -810,6 +810,40 @@
   {% endif %}
 </div>
 {% endif %}
+
+{# ─── Local Index Summary (Studio S2 Core) ─── #}
+{% if dataset_index %}
+<div class="card" style="margin-top:12px;">
+  <div class="card-title" style="margin-bottom:8px;">
+    {{ _("Local index") }} — {{ _("Datasets") }} ({{ dataset_index|length }})
+  </div>
+  <div style="overflow-x:auto;">
+    <table style="font-size:13px;">
+      <tr>
+        <th>{{ _("Name") }}</th>
+        <th>{{ _("Validation") }}</th>
+        <th>{{ _("Last used") }}</th>
+      </tr>
+      {% for ds in dataset_index %}
+      <tr>
+        <td>{{ ds.display_name|e }}</td>
+        <td>{{ ds.validation_status|e }}</td>
+        <td>{{ (ds.last_used_at or "")[:16] }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% if dataset_index %}
+<div class="card" style="margin-top:16px; padding:16px 20px;">
+  <div class="card-title" style="margin-bottom:10px;">{{ _("Dataset Association") }}</div>
+  <div id="datasetAssociationBody">
+    <div style="font-size:13px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+  </div>
+</div>
+{% endif %}
 </div>
 
 {# ─── Page 2: Intelligent Analysis ─── #}
@@ -827,6 +861,11 @@
     <input type="text" id="trainingPathInput" placeholder="{{ _('Enter train directory path...') }}" style="flex:1; min-width:200px; padding:10px 14px; border:1px solid var(--border); border-radius:var(--radius); font-size:14px; font-family:inherit;">
     <button type="button" onclick="browseFolder('trainingPathInput')" style="padding:10px 16px; background:var(--secondary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Browse...") }}</button>
     <button type="button" id="trainingAnalyzeBtn" onclick="analyzeTrainingFolder()" style="padding:10px 20px; background:var(--primary); color:white; border:none; border-radius:var(--radius); cursor:pointer; font-size:13px; font-family:inherit; white-space:nowrap;">{{ _("Analyze") }}</button>
+  </div>
+  {# Bugfix P3: recent training shortcut — filled into trainingPathInput on click #}
+  <div id="recentTrainingSection" style="margin-top:14px;">
+    <div class="card-title" style="font-size:13px; margin-bottom:6px;">{{ _("Recent training") }}</div>
+    <div id="recentTrainingList" style="display:flex; flex-direction:column; gap:6px; font-size:13px;"></div>
   </div>
   {# Browse panels replaced by shared modal dialog #}
   <div id="trainingUploadStatus" style="display:none; margin-top:8px; font-size:13px;"></div>
@@ -951,7 +990,12 @@
 </div>
 {% endif %}
 
-{% if latest_suggestion %}
+{% set sug_error = latest_suggestion and latest_suggestion.error %}
+{% set sug_keep = latest_suggestion and not latest_suggestion.error and latest_suggestion.action == 'keep_params' %}
+{% set merged = ([latest_suggestion.hyperparameter_changes, latest_suggestion.training_overrides] | merge_suggestion_changes) if (latest_suggestion and not latest_suggestion.error) else [] %}
+{% set has_changes = merged and merged|length > 0 %}
+
+{% if latest_suggestion and not sug_error %}
 <div class="row">
   <div class="col">
     <div class="callout callout-yellow" style="height:100%;">
@@ -968,23 +1012,39 @@
         <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         {{ _("Rationale") }}
       </div>
-      <div>{{ latest_suggestion.rationale }}</div>
+      <div>{% if latest_suggestion.action == 'keep_params' %}{{ _("Keep Original Parameters") }}{% else %}{{ latest_suggestion.rationale }}{% endif %}</div>
     </div>
   </div>
 </div>
 {% endif %}
 
-{% set has_changes = latest_suggestion and latest_suggestion.hyperparameter_changes and latest_suggestion.hyperparameter_changes|length > 0 %}
+{% if sug_error %}
+<div class="callout" style="background:var(--destructive-bg); border:1px solid #FECACA; margin-bottom:16px;">
+  <div class="callout-label" style="color:var(--destructive);">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    {{ _("Suggestion generation failed") }}
+  </div>
+  <div style="font-size:13px;">{{ latest_suggestion.error }}</div>
+</div>
+{% endif %}
 
 <div class="suggestion-card" style="margin-bottom:16px;">
   <div class="suggestion-header">
     <h3>{{ _("Hyperparameter Changes") }}</h3>
     {% if has_changes %}
-    <span class="badge badge-blue">{{ _("Agent suggests") }} {{ latest_suggestion.hyperparameter_changes|length }} {{ _("change(s)") }}</span>
+    <span class="badge badge-blue">{{ _("Agent suggests") }} {{ merged|length }} {{ _("change(s)") }}</span>
     {% endif %}
   </div>
 
-  {% if has_changes %}
+  {% if sug_error %}
+  <div style="padding:20px; text-align:center; color:var(--destructive); font-size:13px;">
+    {{ _("Suggestion generation failed") }}
+  </div>
+  {% elif sug_keep %}
+  <div style="padding:20px; text-align:center; color:var(--text-secondary); font-size:13px;">
+    {{ _("Keep Original Parameters") }}
+  </div>
+  {% elif has_changes %}
   <table class="param-table">
     <tr>
       <th style="width:110px;">{{ _("Parameter") }}</th>
@@ -993,8 +1053,7 @@
       <th style="width:110px;">{{ _("Suggested") }}</th>
       <th>{{ _("Reason") }}</th>
     </tr>
-    {% for key, value in latest_suggestion.hyperparameter_changes.items() %}
-    {% if key not in ('diagnosis', 'action') %}
+    {% for key, value, kind in merged %}
     <tr>
       <td class="param-name">{{ key }}</td>
       <td class="param-old">{{ current_args.get(key, "—") if current_args else "—" }}</td>
@@ -1011,10 +1070,9 @@
         {% endif %}
       </td>
       <td style="font-size:12px; color:var(--text-secondary);">
-        {% if loop.index == 1 %}{{ _("Suggested by tuning agent") }}{% else %}—{% endif %}
+        {% if kind == 'training' %}{{ _("Training override") }}{% else %}{{ _("Hyperparameter change") }}{% endif %}
       </td>
     </tr>
-    {% endif %}
     {% endfor %}
   </table>
   {% else %}
@@ -1106,6 +1164,17 @@
         <span class="pipeline-step" data-step="execute">4. {{ _("执行") }}</span>
         <span class="pipeline-arrow">→</span>
         <span class="pipeline-step" data-step="probe">5. {{ _("探针") }}</span>
+      </div>
+      <div id="referenceDatasetInfo" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px; font-size:13px;">
+        <div style="font-weight:600; margin-bottom:6px;">{{ _("参考数据集已绑定") }}</div>
+        <div><span class="text-muted">{{ _("参考训练") }}:</span> <strong id="refDsRun"></strong></div>
+        <div><span class="text-muted">{{ _("关联数据集") }}:</span> <span id="refDsName"></span></div>
+        <div><span class="text-muted">{{ _("快照") }}:</span> <span id="refDsSnapshot"></span></div>
+        <div><span class="text-muted">{{ _("解析来源") }}:</span> <span id="refDsSource"></span></div>
+      </div>
+      <div id="referenceDatasetError" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--warning-bg); border:1px solid var(--warning); border-radius:8px; font-size:13px;">
+        <div style="font-weight:600; margin-bottom:4px;">{{ _("参考数据集未解析，计划不可执行") }}</div>
+        <div id="referenceDatasetErrorText" class="text-muted"></div>
       </div>
       <div class="param-changes hidden" id="paramChanges">
         <div style="font-weight:600; margin-bottom:4px; color:var(--accent);">{{ _("参数变更") }}:</div>
@@ -1254,7 +1323,7 @@
     <div class="card" style="padding:16px;">
       <div class="card-title" style="margin-bottom:8px; display:flex; align-items:center; gap:8px;">
         <svg viewBox="0 0 24 24" style="width:14px; height:14px; stroke:currentColor; stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        {{ _("Training Status") }}
+        {{ _("Run status") }}
       </div>
       <div class="console-log" id="monitorLog" style="max-height:200px;">
         {% if latest_run %}
@@ -1363,32 +1432,86 @@
 
 {# ─── Page 4: History ─── #}
 <div class="page {% if active_page == 'history' %}active{% endif %}" id="page4">
+{% set _exp_labels = experiment_labels|default({}) %}
+{% set _exp_fields = _exp_labels.get('fields', {}) if _exp_labels is mapping else {} %}
+{% set _exp_enums = _exp_labels.get('enums', {}) if _exp_labels is mapping else {} %}
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
   <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training History") }}</div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    {% if experiment_history_source == "sqlite" %}
+    <span class="badge badge-green">{{ _("SQLite index") }}</span>
+    {% else %}
+    <span class="badge badge-yellow">{{ _("JSON fallback") }}</span>
+    {% endif %}
+    <button class="btn btn-outline btn-sm" onclick="importLegacyHistory()">{{ _("Import legacy history") }}</button>
+    <span id="legacyImportStatus" style="font-size:12px; display:none;"></span>
+  </div>
 </div>
 
+{% if experiment_index_warning %}
+<div style="margin-bottom:12px; padding:8px 12px; border:1px solid var(--warning); border-radius:6px; font-size:12px; color:var(--warning);">
+  {{ _("Index unavailable") }}: <code>{{ experiment_index_warning.error_code|e }}</code> — {{ _("JSON fallback") }}
+</div>
+{% endif %}
+
 {% if experiment_history and experiment_history|length > 0 %}
-<div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap;">
+<div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
+  <select id="historyDatasetFilter" style="width:auto;" onchange="filterHistory()">
+    <option value="">{{ _("All datasets") }}</option>
+    {% for ds in dataset_index %}
+    <option value="{{ ds.dataset_id|e }}">{{ ds.display_name|e }}</option>
+    {% endfor %}
+  </select>
   <select id="historySourceFilter" style="width:auto;" onchange="filterHistory()">
     <option value="">{{ _("All Sources") }}</option>
-    <option value="manual">{{ _("Manual Training") }}</option>
-    <option value="tuning">{{ _("Auto-Tuning") }}</option>
+    <option value="manual">{{ _exp_enums.get('manual', _('Manual training')) }}</option>
+    <option value="tuning">{{ _exp_enums.get('tuning', _('Auto tuning')) }}</option>
   </select>
   <select id="historyStatusFilter" style="width:auto;" onchange="filterHistory()">
     <option value="">{{ _("All Statuses") }}</option>
-    <option value="completed">{{ _("Completed") }}</option>
-    <option value="failed">{{ _("Failed") }}</option>
-    <option value="cancelled">{{ _("Cancelled") }}</option>
+    <option value="completed">{{ _exp_enums.get('completed', _('Completed')) }}</option>
+    <option value="failed">{{ _exp_enums.get('failed', _('Failed')) }}</option>
+    <option value="cancelled">{{ _exp_enums.get('cancelled', _('Cancelled')) }}</option>
   </select>
+  <input type="text" id="historySearchInput" placeholder="{{ _('Search by name or model') }}" oninput="filterHistory()"
+         style="flex:1; min-width:160px; padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius); font-size:13px; font-family:inherit;">
+  <select id="historySortSelect" style="width:auto;" onchange="filterHistory()">
+    <option value="finished_at">{{ _("Time") }}</option>
+    <option value="name">{{ _("Run name") }}</option>
+    <option value="mAP50">mAP50</option>
+    <option value="mAP50_95">mAP50-95</option>
+  </select>
+  <select id="historyOrderSelect" style="width:auto;" onchange="filterHistory()">
+    <option value="desc">{{ _("Descending") }}</option>
+    <option value="asc">{{ _("Ascending") }}</option>
+  </select>
+  <button type="button" class="btn btn-outline btn-sm" onclick="historyPrevPage()" id="historyPrevBtn">&larr;</button>
+  <span id="historyPageInfo" style="font-size:12px; color:var(--text-secondary);"></span>
+  <button type="button" class="btn btn-outline btn-sm" onclick="historyNextPage()" id="historyNextBtn">&rarr;</button>
+  <button type="button" class="btn btn-primary btn-sm" onclick="openCompareModal()">{{ _("Compare Experiments") }}</button>
 </div>
+<div id="historyDegradedBanner" style="display:none; margin-bottom:12px; padding:8px 12px; border:1px solid var(--warning); border-radius:6px; font-size:12px; color:var(--warning);">
+  {{ _("JSON fallback") }}: {{ _("Search/sort/pagination limited to loaded records") }}
+</div>
+<div id="historyDiagnostics" style="display:none; margin-bottom:12px; padding:10px 14px; border:1px solid var(--border); border-radius:6px; font-size:12px; color:var(--text-secondary);"></div>
+<div id="historyMaintenance" style="margin-bottom:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+  <span class="card-title" style="margin:0; border:none; padding:0;">{{ _("Index Maintenance") }}</span>
+  <button type="button" class="btn btn-outline btn-sm" onclick="runIndexAudit()">{{ _("Run Audit") }}</button>
+  <button type="button" class="btn btn-outline btn-sm" id="rebuildBtn" onclick="confirmIndexRebuild()">{{ _("Rebuild Index") }}</button>
+  <span id="historyMaintenanceStatus" style="font-size:12px; display:none;"></span>
+</div>
+<div id="historyAuditResult" style="display:none; margin-bottom:12px; padding:10px 14px; border:1px solid var(--border); border-radius:6px; font-size:12px; color:var(--text-secondary); white-space:pre-wrap;"></div>
+<div id="historyRebuildResult" style="display:none; margin-bottom:12px; padding:10px 14px; border:1px solid var(--border); border-radius:6px; font-size:12px; color:var(--text-secondary); white-space:pre-wrap;"></div>
 <div class="card" style="padding:0; overflow-x:auto;">
   <table>
+    <thead>
     <tr>
-      <th>{{ _("Source") }}</th>
-      <th>{{ _("Run Name") }}</th>
-      <th>{{ _("Model") }}</th>
-      <th>{{ _("Training Status") }}</th>
-      <th>{{ _("Analysis Status") }}</th>
+      <th style="width:32px;"><input type="checkbox" id="historySelectAll" onclick="toggleSelectAll(this)" title="{{ _('Select 2-5 experiments') }}"></th>
+      <th>{{ _exp_fields.get('source', _('Source')) }}</th>
+      <th>{{ _exp_fields.get('run_name', _('Run name')) }}</th>
+      <th>{{ _exp_fields.get('model_name', _('Model')) }}</th>
+      <th>{{ _exp_fields.get('status', _('Run status')) }}</th>
+      <th>{{ _exp_fields.get('analysis_status', _('Analysis status')) }}</th>
       <th>mAP50</th>
       <th>mAP50-95</th>
       <th>Precision</th>
@@ -1397,23 +1520,29 @@
       <th>{{ _("Time") }}</th>
       <th style="width:60px;">{{ _("View") }}</th>
     </tr>
+    </thead>
+    <tbody id="historyBody">
     {% for exp in experiment_history %}
-    <tr class="history-row" data-source="{{ exp.source }}" data-status="{{ exp.status }}" data-detail="exp_details_{{ loop.index0 }}" style="cursor:pointer;">
-      <td>
-        {% if exp.source == "tuning" %}<span class="badge badge-purple">{{ _("Auto-Tuning") }}</span>
-        {% else %}<span class="badge badge-blue">{{ _("Manual Training") }}</span>{% endif %}
-      </td>
-      <td style="font-weight:600;">{{ exp.run_name or "—" }}</td>
-      <td style="font-size:12px;">{{ (exp.params or {}).get("model", "—") }}</td>
-      <td>
-        {% if exp.status == "completed" %}<span class="badge badge-green">{{ _("Completed") }}</span>
-        {% elif exp.status == "cancelled" %}<span class="badge badge-yellow">{{ _("Cancelled") }}</span>
-        {% else %}<span class="badge badge-red">{{ _("Failed") }}</span>{% endif %}
+    <tr class="history-row" data-source="{{ exp.source }}" data-status="{{ exp.status }}" data-dataset-id="{{ exp.dataset_id or '' }}" data-detail="exp_details_{{ loop.index0 }}"
+        data-name="{{ (exp.run_name or '')|e }}" data-model="{{ ((exp.params or {}).get('model', ''))|e }}"
+        data-map50="{{ exp.metrics.get('mAP50') if exp.metrics and exp.metrics.get('mAP50') is not none else '' }}"
+        data-map50_95="{{ exp.metrics.get('mAP50_95') if exp.metrics and exp.metrics.get('mAP50_95') is not none else '' }}"
+        data-time="{{ exp.finished_at or exp.updated_at or '' }}" style="cursor:pointer;">
+      <td style="text-align:center;">
+        <input type="checkbox" class="compare-check" value="{{ exp.run_id|e }}" onchange="updateCompareSelection()"
+               title="{{ _('Select 2-5 experiments') }}">
       </td>
       <td>
-        {% if exp.analysis_status == "completed" %}<span class="badge badge-green">{{ _("Completed") }}</span>
-        {% elif exp.analysis_status == "failed" %}<span class="badge badge-red">{{ _("Analysis Failed") }}</span>
-        {% else %}<span class="badge badge-yellow">{{ _("Skipped") }}</span>{% endif %}
+        {% if exp.source == "tuning" %}<span class="badge badge-purple">{{ _exp_enums.get('tuning', _('Auto tuning')) }}</span>
+        {% else %}<span class="badge badge-blue">{{ _exp_enums.get('manual', _('Manual training')) }}</span>{% endif %}
+      </td>
+      <td style="font-weight:600;">{{ (exp.run_name or "—")|e }}</td>
+      <td style="font-size:12px;">{{ ((exp.params or {}).get("model", "—"))|e }}</td>
+      <td>
+        {% if exp.status == "completed" %}<span class="badge badge-green">{% elif exp.status == "cancelled" %}<span class="badge badge-yellow">{% elif exp.status in ["failed", "interrupted"] %}<span class="badge badge-red">{% elif exp.status in ["running", "starting"] %}<span class="badge badge-yellow">{% else %}<span class="badge">{% endif %}{{ _exp_enums.get(exp.status, exp.status) }}</span>
+      </td>
+      <td>
+        {% if exp.analysis_status == "completed" %}<span class="badge badge-green">{% elif exp.analysis_status == "failed" %}<span class="badge badge-red">{% else %}<span class="badge badge-yellow">{% endif %}{{ _exp_enums.get(exp.analysis_status or "skipped", exp.analysis_status or "skipped") }}</span>
       </td>
       <td>{{ "%.4f"|format(exp.metrics.get("mAP50")) if exp.metrics and exp.metrics.get("mAP50") is not none else "—" }}</td>
       <td>{{ "%.4f"|format(exp.metrics.get("mAP50_95")) if exp.metrics and exp.metrics.get("mAP50_95") is not none else "—" }}</td>
@@ -1421,16 +1550,17 @@
       <td>{{ "%.4f"|format(exp.metrics.get("recall")) if exp.metrics and exp.metrics.get("recall") is not none else "—" }}</td>
       <td>{% if exp.epochs is mapping %}{{ exp.epochs.get("completed") if exp.epochs.get("completed") is not none else "—" }}{% if exp.epochs.get("best") is not none %} (best {{ exp.epochs.get("best") }}){% endif %}{% else %}—{% endif %}</td>
       <td style="font-size:12px; color:var(--text-secondary);">{{ (exp.finished_at or "")[:16] }}</td>
-      <td>
+      <td style="display:flex; gap:6px; align-items:center;">
         <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); toggleDetails('exp_details_{{ loop.index0 }}')">{{ _("Details") }}</button>
+        <button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); showExperimentDetail('{{ exp.run_id|e }}')">{{ _("Open Detail") }}</button>
       </td>
     </tr>
     <tr id="exp_details_{{ loop.index0 }}" class="history-details" style="display:none;">
-      <td colspan="12" style="padding:16px 24px; background:#F8FAFC;">
+      <td colspan="13" style="padding:16px 24px; background:#F8FAFC;">
         <div style="display:flex; gap:16px; flex-wrap:wrap;">
           <div style="flex:1; min-width:200px;">
             <div class="card-title" style="margin-bottom:4px;">{{ _("Dataset") }}</div>
-            <div style="font-size:13px; color:var(--text-secondary); word-break:break-all;">{{ (exp.params or {}).get("data", "—") }}</div>
+            <div style="font-size:13px; color:var(--text-secondary); word-break:break-all;">{{ (exp.params or {}).get("data", "—")|basename|e }}</div>
           </div>
           <div style="flex:1; min-width:200px;">
             <div class="card-title" style="margin-bottom:4px;">{{ _("Parameters") }}</div>
@@ -1438,7 +1568,7 @@
             <table style="font-size:12px;">
               {% for k in ["model", "data", "epochs", "batch", "imgsz", "optimizer", "lr0", "device"] %}
                 {% if exp.params.get(k) is not none %}
-                <tr><td>{{ k }}</td><td style="word-break:break-all;">{{ exp.params.get(k) }}</td></tr>
+                <tr><td>{{ k }}</td><td style="word-break:break-all;">{{ exp.params.get(k)|basename|e }}</td></tr>
                 {% endif %}
               {% endfor %}
             </table>
@@ -1449,13 +1579,13 @@
           {% set decision = tuning.decision if tuning and tuning.decision is mapping else (exp.decision if exp.decision is mapping else {}) %}
           <div style="flex:1; min-width:200px;">
             <div class="card-title" style="margin-bottom:4px;">{{ _("AI Diagnosis") }}</div>
-            <div style="font-size:13px; color:var(--text-secondary);">{{ decision.diagnosis or "—" }}</div>
+            <div style="font-size:13px; color:var(--text-secondary);">{{ (decision.diagnosis or "—")|e }}</div>
             {% set changes = decision.hyperparameter_changes or {} %}
             {% if changes %}
             <table style="font-size:12px; margin-top:8px;">
               <tr><th>{{ _("Parameter") }}</th><th>{{ _("Value") }}</th></tr>
               {% for k, v in changes.items() %}
-              <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              <tr><td>{{ k }}</td><td>{{ v|e }}</td></tr>
               {% endfor %}
             </table>
             {% else %}
@@ -1472,16 +1602,16 @@
             <span class="badge badge-red">{{ _("Rejected") }}</span>
             {% endif %}
             {% if guard.errors %}
-            <div style="font-size:12px; color:var(--danger); margin-top:6px;">{% for e in guard.errors %}{{ e }}<br>{% endfor %}</div>
+            <div style="font-size:12px; color:var(--danger); margin-top:6px;">{% for e in guard.errors %}{{ e|e }}<br>{% endfor %}</div>
             {% endif %}
             {% if guard.warnings %}
-            <div style="font-size:12px; color:var(--warning); margin-top:6px;">{% for w in guard.warnings %}{{ w }}<br>{% endfor %}</div>
+            <div style="font-size:12px; color:var(--warning); margin-top:6px;">{% for w in guard.warnings %}{{ w|e }}<br>{% endfor %}</div>
             {% endif %}
             {% if guard.clamped %}
             <table style="font-size:12px; margin-top:8px;">
               <tr><th>{{ _("Parameter") }}</th><th>{{ _("Clamped Value") }}</th></tr>
               {% for k, v in guard.clamped.items() %}
-              <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              <tr><td>{{ k }}</td><td>{{ v|e }}</td></tr>
               {% endfor %}
             </table>
             {% endif %}
@@ -1489,21 +1619,22 @@
           </div>
           <div style="flex:1; min-width:150px;">
             <div class="card-title" style="margin-bottom:4px;">{{ _("Audit") }}</div>
-            {% if exp.audit_filename %}
-            <a href="/api/audit/{{ exp.audit_filename }}" target="_blank" class="btn btn-outline btn-sm">{{ _("View Audit Record") }}</a>
+            {% if exp.source == "tuning" and exp.audit_filename %}
+            <button type="button" class="btn btn-outline btn-sm" data-open-audit data-run-id="{{ exp.run_id|e }}">{{ _("View Audit Result") }}</button>
             {% else %}—{% endif %}
           </div>
           {% endif %}
           {% if exp.artifacts and exp.artifacts.report_path %}
           <div style="flex:1; min-width:150px;">
             <div class="card-title" style="margin-bottom:4px;">{{ _("Artifacts") }}</div>
-            <a href="/api/training/report-by-name?name={{ exp.run_name }}" target="_blank" class="btn btn-outline btn-sm">{{ _("View Report") }}</a>
+            <button type="button" class="btn btn-outline btn-sm" data-open-report data-run-id="{{ exp.run_id|e }}">{{ _("View Report") }}</button>
           </div>
           {% endif %}
         </div>
       </td>
     </tr>
     {% endfor %}
+    </tbody>
   </table>
 </div>
 {% else %}
@@ -1567,8 +1698,86 @@
   </div>
 </div>
 
+{# S2.4 experiment comparison modal #}
+<div id="compareModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1000; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--surface); border-radius:12px; max-width:960px; width:100%; max-height:86vh; overflow-y:auto; padding:20px 24px; box-shadow:0 10px 40px rgba(0,0,0,0.25);">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+      <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Compare Experiments") }}</div>
+      <button type="button" onclick="closeCompareModal()" style="padding:6px 14px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); cursor:pointer; font-size:13px; font-family:inherit;">{{ _("Close") }}</button>
+    </div>
+    <div id="compareBody" style="font-size:13px;">
+      <div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+    </div>
+  </div>
+</div>
+
+{# S2.2 experiment detail modal #}
+<div id="expDetailModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1000; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--surface); border-radius:12px; max-width:860px; width:100%; max-height:86vh; overflow-y:auto; padding:20px 24px; box-shadow:0 10px 40px rgba(0,0,0,0.25);">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+      <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Experiment Detail") }}</div>
+      <button type="button" onclick="closeExperimentDetail()" style="padding:6px 14px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); cursor:pointer; font-size:13px; font-family:inherit;">{{ _("Close") }}</button>
+    </div>
+    <div id="expDetailBody" style="font-size:13px;">
+      <div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+    </div>
+  </div>
+</div>
+
+{# P5: read-only training analysis report modal #}
+<div id="reportViewModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1001; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--surface); border-radius:12px; max-width:960px; width:100%; max-height:88vh; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.25);">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid var(--border);">
+      <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Training analysis report") }}</div>
+      <button type="button" onclick="closeReportView()" class="btn btn-outline btn-sm">{{ _("Close") }}</button>
+    </div>
+    <div id="reportViewBody" style="font-size:13px; overflow-y:auto; padding:16px 20px; flex:1;">
+      <div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+    </div>
+  </div>
+</div>
+
+{# P5: read-only auto tuning audit modal #}
+<div id="auditViewModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1001; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--surface); border-radius:12px; max-width:960px; width:100%; max-height:88vh; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.25);">
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 20px; border-bottom:1px solid var(--border);">
+      <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Auto tuning audit") }}</div>
+      <button type="button" onclick="closeAuditView()" class="btn btn-outline btn-sm">{{ _("Close") }}</button>
+    </div>
+    <div id="auditViewBody" style="font-size:13px; overflow-y:auto; padding:16px 20px; flex:1;">
+      <div style="text-align:center; padding:20px; color:var(--text-muted);">{{ _("Loading...") }}</div>
+    </div>
+  </div>
+</div>
+
 <script>
 window._CSRF_TOKEN = {{ csrf_token|default('')|tojson }};
+window._DATASET_IDS = [
+  {% for ds in dataset_index %}{{ ds.dataset_id|tojson }}{% if not loop.last %},{% endif %}{% endfor %}
+];
+// Bugfix P4: shared display vocabulary injected from the same Python module
+// (auto_tune.modules.presentation) that future P5 report generators will use.
+window._EXPERIMENT_LABELS = {{ experiment_labels|default({})|tojson }};
+
+function _experimentFieldLabel(key) {
+  var labels = (typeof window._EXPERIMENT_LABELS === 'object' && window._EXPERIMENT_LABELS) ? window._EXPERIMENT_LABELS : {};
+  var map = labels.fields || {};
+  if (Object.prototype.hasOwnProperty.call(map, key)) return map[key];
+  return (key === null || key === undefined) ? '—' : String(key);
+}
+function _experimentEnumLabel(value) {
+  var labels = (typeof window._EXPERIMENT_LABELS === 'object' && window._EXPERIMENT_LABELS) ? window._EXPERIMENT_LABELS : {};
+  var map = labels.enums || {};
+  if (Object.prototype.hasOwnProperty.call(map, value)) return map[value];
+  return (value === null || value === undefined) ? '—' : String(value);
+}
+function _experimentBooleanLabel(value) {
+  var labels = (typeof window._EXPERIMENT_LABELS === 'object' && window._EXPERIMENT_LABELS) ? window._EXPERIMENT_LABELS : {};
+  var map = labels.booleans || {};
+  if (value === true) return map.true || '{{ _("Yes") }}';
+  if (value === false) return map.false || '{{ _("No") }}';
+  return '—';
+}
 
 // ── Tab switching ──
 function switchPage(idx) {
@@ -1583,6 +1792,9 @@ function switchPage(idx) {
   if (idx === 3) {
     refreshRunState().then(_subscribeActiveRun);
   }
+  // When entering intelligent analysis (page 2), load the recent training
+  // shortcut once per page lifecycle.
+  if (idx === 2) loadRecentTraining();
 }
 
 // ── S1.5 unified run-state rendering ──
@@ -1934,21 +2146,1242 @@ function toggleDetails(id) {
   }
 }
 
-function filterHistory() {
-  var sourceEl = document.getElementById('historySourceFilter');
-  var statusEl = document.getElementById('historyStatusFilter');
-  var source = sourceEl ? sourceEl.value : '';
-  var status = statusEl ? statusEl.value : '';
-  var rows = document.querySelectorAll('#page4 .history-row');
-  rows.forEach(function(row) {
-    var show = (!source || row.getAttribute('data-source') === source) &&
-               (!status || row.getAttribute('data-status') === status);
-    row.style.display = show ? '' : 'none';
-    var detailId = row.getAttribute('data-detail');
-    if (detailId) {
-      var detail = document.getElementById(detailId);
-      if (detail) detail.style.display = 'none';
+// ── S2.2 experiment detail modal (textContent only, never innerHTML) ──
+function closeExperimentDetail() {
+  var modal = document.getElementById('expDetailModal');
+  if (modal) modal.style.display = 'none';
+}
+function _detailRow(label, value) {
+  var tr = document.createElement('tr');
+  var td1 = document.createElement('td');
+  td1.textContent = label;
+  td1.style.padding = '4px 10px 4px 0';
+  td1.style.color = 'var(--text-secondary)';
+  td1.style.whiteSpace = 'nowrap';
+  td1.style.verticalAlign = 'top';
+  var td2 = document.createElement('td');
+  td2.textContent = (value === null || value === undefined) ? '—' : String(value);
+  td2.style.wordBreak = 'break-all';
+  td2.style.padding = '4px 0';
+  tr.appendChild(td1);
+  tr.appendChild(td2);
+  return tr;
+}
+function _detailBlock(title) {
+  var wrap = document.createElement('div');
+  wrap.style.marginBottom = '12px';
+  var head = document.createElement('div');
+  head.className = 'card-title';
+  head.style.marginBottom = '6px';
+  head.textContent = title;
+  var table = document.createElement('table');
+  table.style.fontSize = '12px';
+  table.style.width = '100%';
+  wrap.appendChild(head);
+  wrap.appendChild(table);
+  return {wrap: wrap, table: table};
+}
+function _artifactBadge(status) {
+  var span = document.createElement('span');
+  span.className = 'badge';
+  if (status === 'exists') span.classList.add('badge-green');
+  else if (status === 'missing') span.classList.add('badge-yellow');
+  else span.classList.add('badge-red');
+  span.textContent = _experimentEnumLabel(status);
+  return span;
+}
+function _renderExperimentDetail(d) {
+  var body = document.getElementById('expDetailBody');
+  body.textContent = '';
+  var meta = _detailBlock('{{ _("Run Identity") }}');
+  [['run_id', d.run_id], ['source', d.source, 'enum'], ['run_name', d.run_name],
+   ['status', d.status, 'enum'], ['phase', d.phase, 'enum'], ['model_name', d.model_name],
+   ['task_type', d.task_type, 'enum'], ['analysis_status', d.analysis_status, 'enum'],
+   ['started_at', d.started_at], ['finished_at', d.finished_at],
+   ['updated_at', d.updated_at]]
+    .forEach(function (kv) {
+      meta.table.appendChild(_detailRow(_experimentFieldLabel(kv[0]),
+        kv[2] === 'enum' ? _experimentEnumLabel(kv[1]) : kv[1]));
+    });
+  body.appendChild(meta.wrap);
+
+  if (d.dataset) {
+    var ds = _detailBlock('{{ _("Dataset Association") }}');
+    [['display_name', d.dataset.display_name], ['snapshot_id', d.dataset.snapshot_id],
+     ['validation_status', d.dataset.validation_status, 'enum'],
+     ['data.yaml', d.dataset.data_yaml_name], ['last_used_at', d.dataset.last_used_at]]
+      .forEach(function (kv) {
+        ds.table.appendChild(_detailRow(_experimentFieldLabel(kv[0]),
+          kv[2] === 'enum' ? _experimentEnumLabel(kv[1]) : kv[1]));
+      });
+    body.appendChild(ds.wrap);
+  }
+
+  if (d.params && Object.keys(d.params).length > 0) {
+    var pa = _detailBlock('{{ _("Parameters") }}');
+    Object.keys(d.params).forEach(function (k) {
+      pa.table.appendChild(_detailRow(k, d.params[k]));
+    });
+    body.appendChild(pa.wrap);
+  }
+
+  if (d.metrics && Object.keys(d.metrics).length > 0) {
+    var me = _detailBlock('{{ _("Metrics") }}');
+    Object.keys(d.metrics).forEach(function (k) {
+      me.table.appendChild(_detailRow(k, d.metrics[k]));
+    });
+    body.appendChild(me.wrap);
+  }
+
+  if (d.tuning) {
+    var tu = _detailBlock('{{ _("Tuning Facts") }}');
+    var decision = d.tuning.decision || {};
+    tu.table.appendChild(_detailRow(_experimentFieldLabel('diagnosis'), decision.diagnosis));
+    tu.table.appendChild(_detailRow(_experimentFieldLabel('action'), decision.action));
+    tu.table.appendChild(_detailRow(_experimentFieldLabel('guardrails_valid'),
+      d.tuning.guardrails ? _experimentBooleanLabel(d.tuning.guardrails.valid) : null));
+    var probe = d.tuning.probe_decision || {};
+    tu.table.appendChild(_detailRow(_experimentFieldLabel('probe_verdict'), probe.verdict));
+    if (d.tuning && d.tuning.audit_filename && d.run_id) {
+      var auditBtn = document.createElement('button');
+      auditBtn.type = 'button';
+      auditBtn.className = 'btn btn-outline btn-sm';
+      auditBtn.setAttribute('data-open-audit', '');
+      auditBtn.setAttribute('data-run-id', d.run_id);
+      auditBtn.textContent = '{{ _("View Audit Result") }}';
+      var tr = document.createElement('tr');
+      var td1 = document.createElement('td');
+      td1.textContent = _experimentFieldLabel('audit');
+      td1.style.padding = '4px 10px 4px 0';
+      var td2 = document.createElement('td');
+      td2.appendChild(auditBtn);
+      tr.appendChild(td1); tr.appendChild(td2);
+      tu.table.appendChild(tr);
     }
+    body.appendChild(tu.wrap);
+  }
+
+  if (d.artifacts && d.artifacts.length > 0) {
+    var ar = _detailBlock('{{ _("Training artifacts") }}');
+    var hdr = document.createElement('tr');
+    [_experimentFieldLabel('kind'), _experimentFieldLabel('name'), _experimentFieldLabel('exists_state')]
+      .forEach(function (label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        th.style.textAlign = 'left';
+        th.style.padding = '4px 10px 4px 0';
+        hdr.appendChild(th);
+      });
+    ar.table.appendChild(hdr);
+    d.artifacts.forEach(function (a) {
+      var tr = document.createElement('tr');
+      var td1 = document.createElement('td');
+      td1.textContent = _experimentEnumLabel(a.kind);
+      td1.style.padding = '4px 10px 4px 0';
+      var td2 = document.createElement('td');
+      td2.textContent = a.name || '—';
+      td2.style.wordBreak = 'break-all';
+      var td3 = document.createElement('td');
+      td3.appendChild(_artifactBadge(a.status));
+      tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
+      ar.table.appendChild(tr);
+    });
+    body.appendChild(ar.wrap);
+  }
+}
+function showExperimentDetail(runId) {
+  var modal = document.getElementById('expDetailModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  var body = document.getElementById('expDetailBody');
+  body.textContent = '';
+  var loading = document.createElement('div');
+  loading.style.textAlign = 'center';
+  loading.style.padding = '20px';
+  loading.style.color = 'var(--text-muted)';
+  loading.textContent = '{{ _("Loading...") }}';
+  body.appendChild(loading);
+  fetch('/api/experiments/' + encodeURIComponent(runId))
+    .then(function (resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    })
+    .then(function (data) { _renderExperimentDetail(data); })
+    .catch(function () {
+      body.textContent = '';
+      var err = document.createElement('div');
+      err.style.textAlign = 'center';
+      err.style.padding = '20px';
+      err.style.color = 'var(--destructive)';
+      err.textContent = '{{ _("Failed to load experiment detail.") }}';
+      body.appendChild(err);
+    });
+}
+
+// ── P5 report/audit read-only modals (textContent only, never innerHTML) ──
+function _viewSection(title) {
+  var wrap = document.createElement('div');
+  wrap.style.marginBottom = '14px';
+  var head = document.createElement('div');
+  head.className = 'card-title';
+  head.style.marginBottom = '6px';
+  head.textContent = title;
+  var table = document.createElement('table');
+  table.style.fontSize = '12px';
+  table.style.width = '100%';
+  table.style.borderCollapse = 'collapse';
+  wrap.appendChild(head);
+  wrap.appendChild(table);
+  return {wrap: wrap, table: table};
+}
+function _viewTh(label) {
+  var th = document.createElement('th');
+  th.textContent = label;
+  th.style.textAlign = 'left';
+  th.style.padding = '4px 10px 4px 0';
+  th.style.whiteSpace = 'nowrap';
+  th.style.borderBottom = '1px solid #E2E8F0';
+  return th;
+}
+function _viewRow(label, value) {
+  var tr = document.createElement('tr');
+  var td1 = document.createElement('td');
+  td1.textContent = label;
+  td1.style.padding = '4px 10px 4px 0';
+  td1.style.color = 'var(--text-secondary)';
+  td1.style.whiteSpace = 'nowrap';
+  td1.style.verticalAlign = 'top';
+  var td2 = document.createElement('td');
+  td2.textContent = _viewValue(value);
+  td2.style.wordBreak = 'break-all';
+  td2.style.padding = '4px 0';
+  tr.appendChild(td1);
+  tr.appendChild(td2);
+  return tr;
+}
+function _viewValue(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (typeof value === 'object') return _formatParamObject(value);
+  return String(value);
+}
+function _formatParamObject(obj) {
+  if (obj === null || obj === undefined) return '—';
+  if (typeof obj !== 'object') return String(obj);
+  var keys = Object.keys(obj).filter(function (k) { return String(k).indexOf('_') !== 0; }).sort();
+  var max = 20;
+  var shown = keys.slice(0, max);
+  var parts = [];
+  shown.forEach(function (k) {
+    var v = obj[k];
+    var text;
+    if (typeof v === 'object' && v !== null) {
+      try { text = JSON.stringify(v); } catch (e) { text = '[complex]'; }
+      if (text.length > 60) text = text.slice(0, 60) + '…';
+    } else {
+      text = String(v);
+    }
+    parts.push(k + '=' + text);
+  });
+  if (keys.length > max) parts.push('{{ _("and N more") }}'.replace('N', String(keys.length - max)));
+  return parts.join(' · ');
+}
+function _viewColumnTable(headers, rows) {
+  var table = document.createElement('table');
+  table.style.fontSize = '12px';
+  table.style.width = '100%';
+  table.style.borderCollapse = 'collapse';
+  var htr = document.createElement('tr');
+  headers.forEach(function (h) { htr.appendChild(_viewTh(h)); });
+  table.appendChild(htr);
+  rows.forEach(function (row) {
+    var tr = document.createElement('tr');
+    row.forEach(function (v) {
+      var td = document.createElement('td');
+      td.textContent = _viewValue(v);
+      td.style.padding = '4px 10px 4px 0';
+      td.style.wordBreak = 'break-all';
+      td.style.verticalAlign = 'top';
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+  return table;
+}
+function _viewLoading() {
+  var div = document.createElement('div');
+  div.style.textAlign = 'center';
+  div.style.padding = '20px';
+  div.style.color = 'var(--text-muted)';
+  div.textContent = '{{ _("Loading...") }}';
+  return div;
+}
+function _viewEmpty(text) {
+  var div = document.createElement('div');
+  div.style.textAlign = 'center';
+  div.style.padding = '12px';
+  div.style.color = 'var(--text-muted)';
+  div.textContent = text;
+  return div;
+}
+function _viewError(text) {
+  var div = document.createElement('div');
+  div.style.textAlign = 'center';
+  div.style.padding = '20px';
+  div.style.color = 'var(--destructive)';
+  div.textContent = text;
+  return div;
+}
+function _viewOriginalNote() {
+  var note = document.createElement('div');
+  note.style.fontSize = '11px';
+  note.style.color = 'var(--text-muted)';
+  note.style.marginTop = '4px';
+  note.textContent = '{{ _("Original stored analysis") }}';
+  return note;
+}
+function _reportViewErrorText(code) {
+  var map = {
+    'EXPERIMENT_NOT_FOUND': '{{ _("Experiment not found.") }}',
+    'REPORT_NOT_AVAILABLE': '{{ _("No training analysis report.") }}',
+    'REPORT_INVALID': '{{ _("Invalid report format.") }}',
+    'ARTIFACT_IDENTITY_MISMATCH': '{{ _("Report identity mismatch.") }}',
+    'ARTIFACT_TOO_LARGE': '{{ _("Report content too large.") }}',
+    'ARTIFACT_UNAVAILABLE': '{{ _("Report file unavailable.") }}'
+  };
+  if (code && String(code).indexOf('LOCAL_INDEX') === 0) {
+    return '{{ _("Local index temporarily unavailable.") }}';
+  }
+  return map[code] || ('{{ _("Request error") }} (' + (code || '') + ')');
+}
+function _auditViewErrorText(code) {
+  var map = {
+    'EXPERIMENT_NOT_FOUND': '{{ _("Experiment not found.") }}',
+    'AUDIT_NOT_AVAILABLE': '{{ _("No audit record.") }}',
+    'AUDIT_INVALID': '{{ _("Invalid audit format.") }}',
+    'ARTIFACT_IDENTITY_MISMATCH': '{{ _("Audit identity mismatch.") }}',
+    'ARTIFACT_TOO_LARGE': '{{ _("Audit content too large.") }}',
+    'ARTIFACT_UNAVAILABLE': '{{ _("Audit file unavailable.") }}'
+  };
+  if (code && String(code).indexOf('LOCAL_INDEX') === 0) {
+    return '{{ _("Local index temporarily unavailable.") }}';
+  }
+  return map[code] || ('{{ _("Request error") }} (' + (code || '') + ')');
+}
+function openReportView(runId) {
+  var modal = document.getElementById('reportViewModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  var body = document.getElementById('reportViewBody');
+  body.textContent = '';
+  body.appendChild(_viewLoading());
+  fetch('/api/experiments/' + encodeURIComponent(runId) + '/report-view')
+    .then(function (resp) {
+      return resp.json().then(function (data) { return {ok: resp.ok, data: data}; });
+    })
+    .then(function (r) {
+      if (!r.ok) {
+        body.textContent = '';
+        body.appendChild(_viewError(_reportViewErrorText(r.data && r.data.error_code)));
+        return;
+      }
+      _renderReportView(body, r.data);
+    })
+    .catch(function () {
+      body.textContent = '';
+      body.appendChild(_viewError('{{ _("Request error") }}'));
+    });
+}
+function _renderReportView(body, d) {
+  body.textContent = '';
+  if (!d) {
+    body.appendChild(_viewEmpty('{{ _("No training analysis report.") }}'));
+    return;
+  }
+  var timing = d.timing || {};
+  var epochs = d.epochs || {};
+  var dataset = d.dataset || null;
+
+  var ov = _viewSection('{{ _("Training overview") }}');
+  _viewRow(ov.table, _experimentFieldLabel('run_name'), d.run_name);
+  _viewRow(ov.table, _experimentFieldLabel('model_name'), d.model_name);
+  _viewRow(ov.table, _experimentFieldLabel('task_type'), _experimentEnumLabel(d.task_type));
+  _viewRow(ov.table, _experimentFieldLabel('source'), _experimentEnumLabel(d.source));
+  _viewRow(ov.table, _experimentFieldLabel('status'), _experimentEnumLabel(d.status));
+  _viewRow(ov.table, _experimentFieldLabel('display_name'), dataset ? dataset.display_name : null);
+  _viewRow(ov.table, _experimentFieldLabel('snapshot_id'), dataset ? dataset.snapshot_id : null);
+  _viewRow(ov.table, _experimentFieldLabel('finished_at'), timing.finished_at);
+  body.appendChild(ov.wrap);
+
+  var me = _viewSection('{{ _("Core metrics") }}');
+  var m = d.metrics || {};
+  _viewRow(me.table, 'mAP50', m.mAP50);
+  _viewRow(me.table, 'mAP50-95', m.mAP50_95);
+  _viewRow(me.table, 'Precision', m.precision);
+  _viewRow(me.table, 'Recall', m.recall);
+  _viewRow(me.table, '{{ _("Best epoch") }}', epochs.best);
+  _viewRow(me.table, '{{ _("Completed epochs") }}', epochs.completed);
+  _viewRow(me.table, _experimentFieldLabel('duration'), timing.duration_seconds);
+  body.appendChild(me.wrap);
+
+  var pa = _viewSection('{{ _("Core parameters") }}');
+  var p = d.parameters || {};
+  var paramKeys = ['model', 'epochs', 'batch', 'imgsz', 'optimizer', 'lr0', 'device'];
+  var anyParam = false;
+  paramKeys.forEach(function (k) {
+    if (p[k] !== undefined && p[k] !== null) { _viewRow(pa.table, k, p[k]); anyParam = true; }
+  });
+  if (!anyParam) pa.wrap.appendChild(_viewEmpty('—'));
+  body.appendChild(pa.wrap);
+
+  var is = _viewSection('{{ _("Training issues") }}');
+  var issues = d.issues || [];
+  if (issues.length === 0) {
+    is.wrap.appendChild(_viewEmpty('{{ _("No training issues.") }}'));
+  } else {
+    is.wrap.appendChild(_viewColumnTable([
+      _experimentFieldLabel('issue_type'),
+      _experimentFieldLabel('severity'),
+      _experimentFieldLabel('description')
+    ], issues.map(function (iss) {
+      // Issue type and severity go through the shared enum vocabulary; the
+      // original detail text is preserved verbatim.
+      return [_experimentEnumLabel(iss.issue), _experimentEnumLabel(iss.severity), iss.description];
+    })));
+  }
+  body.appendChild(is.wrap);
+
+  var ai = _viewSection('{{ _("AI analysis") }}');
+  if (d.ai_analysis) {
+    _viewRow(ai.table, _experimentFieldLabel('diagnosis'), d.ai_analysis.diagnosis);
+    _viewRow(ai.table, _experimentFieldLabel('action'), d.ai_analysis.action);
+    _viewRow(ai.table, _experimentFieldLabel('content_origin'), _experimentEnumLabel(d.ai_analysis.content_origin));
+    ai.wrap.appendChild(_viewOriginalNote());
+  } else {
+    ai.wrap.appendChild(_viewEmpty('{{ _("No AI analysis.") }}'));
+  }
+  body.appendChild(ai.wrap);
+
+  var vi = _viewSection('{{ _("Vision analysis") }}');
+  var vision = d.vision_analysis;
+  if (vision && (vision.confusion_matrix || vision.error_crop || vision.error)) {
+    if (vision.error) _viewRow(vi.table, '{{ _("Error") }}', vision.error);
+    if (vision.confusion_matrix) _viewRow(vi.table, '{{ _("Confusion Matrix") }}', vision.confusion_matrix.analysis);
+    if (vision.error_crop) _viewRow(vi.table, '{{ _("Error Crop Analysis") }}', vision.error_crop.analysis);
+    vi.wrap.appendChild(_viewOriginalNote());
+  } else {
+    vi.wrap.appendChild(_viewEmpty('{{ _("No vision analysis available.") }}'));
+  }
+  body.appendChild(vi.wrap);
+
+  var ar = _viewSection('{{ _("Artifact integrity") }}');
+  var arts = d.artifacts || [];
+  if (arts.length === 0) {
+    ar.wrap.appendChild(_viewEmpty('—'));
+  } else {
+    ar.wrap.appendChild(_viewColumnTable([
+      _experimentFieldLabel('kind'),
+      _experimentFieldLabel('name'),
+      _experimentFieldLabel('exists_state')
+    ], arts.map(function (a) {
+      return [_experimentEnumLabel(a.kind), a.name, _experimentEnumLabel(a.exists_state)];
+    })));
+  }
+  body.appendChild(ar.wrap);
+}
+function closeReportView() {
+  var modal = document.getElementById('reportViewModal');
+  if (modal) modal.style.display = 'none';
+}
+function openAuditView(runId) {
+  var modal = document.getElementById('auditViewModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  var body = document.getElementById('auditViewBody');
+  body.textContent = '';
+  body.appendChild(_viewLoading());
+  fetch('/api/experiments/' + encodeURIComponent(runId) + '/audit-view')
+    .then(function (resp) {
+      return resp.json().then(function (data) { return {ok: resp.ok, data: data}; });
+    })
+    .then(function (r) {
+      if (!r.ok) {
+        body.textContent = '';
+        body.appendChild(_viewError(_auditViewErrorText(r.data && r.data.error_code)));
+        return;
+      }
+      _renderAuditView(body, r.data);
+    })
+    .catch(function () {
+      body.textContent = '';
+      body.appendChild(_viewError('{{ _("Request error") }}'));
+    });
+}
+function _renderAuditView(body, d) {
+  body.textContent = '';
+  if (!d) {
+    body.appendChild(_viewEmpty('{{ _("No audit record.") }}'));
+    return;
+  }
+  var sess = d.session || {};
+
+  var ov = _viewSection('{{ _("Session overview") }}');
+  _viewRow(ov.table, _experimentFieldLabel('session_id'), sess.session_id);
+  _viewRow(ov.table, _experimentFieldLabel('reference_run'), sess.reference_run);
+  _viewRow(ov.table, _experimentFieldLabel('display_name'), d.reference_dataset ? d.reference_dataset.display_name : null);
+  _viewRow(ov.table, _experimentFieldLabel('snapshot_id'), d.reference_dataset ? d.reference_dataset.snapshot_id : null);
+  _viewRow(ov.table, _experimentFieldLabel('total_iterations'), sess.total_iterations);
+  _viewRow(ov.table, _experimentFieldLabel('best_iteration'), sess.best_iteration);
+  _viewRow(ov.table, _experimentFieldLabel('status'), _experimentEnumLabel(sess.status));
+  _viewRow(ov.table, _experimentFieldLabel('termination_reason'), sess.termination_reason);
+  body.appendChild(ov.wrap);
+
+  var it = _viewSection('{{ _("Iteration audit") }}');
+  var iterRows = d.iterations || [];
+  if (d.truncated) {
+    var trunc = document.createElement('div');
+    trunc.style.fontSize = '11px';
+    trunc.style.color = 'var(--warning)';
+    trunc.style.marginBottom = '6px';
+    trunc.textContent = '{{ _("Showing the first 50 iterations.") }}';
+    it.wrap.insertBefore(trunc, it.wrap.firstChild.nextSibling);
+  }
+  if (iterRows.length === 0) {
+    it.wrap.appendChild(_viewEmpty('—'));
+  } else {
+    var scrollWrap = document.createElement('div');
+    scrollWrap.style.overflowX = 'auto';
+    scrollWrap.appendChild(_viewColumnTable([
+      '{{ _("Iteration") }}',
+      _experimentFieldLabel('run_name'),
+      _experimentFieldLabel('status'),
+      _experimentFieldLabel('diagnosis'),
+      _experimentFieldLabel('action'),
+      _experimentFieldLabel('suggested_parameters'),
+      _experimentFieldLabel('guarded_parameters'),
+      _experimentFieldLabel('executed_parameters'),
+      'mAP50', 'mAP50-95', 'Precision', 'Recall',
+      _experimentFieldLabel('metric_delta'),
+      _experimentFieldLabel('error_code')
+    ], iterRows.map(function (r) {
+      return [
+        r.iteration,
+        r.run_name,
+        _experimentEnumLabel(r.status),
+        r.diagnosis,
+        r.action,
+        r.suggested_parameters,
+        r.guarded_parameters,
+        r.executed_parameters,
+        r.metrics ? r.metrics.mAP50 : null,
+        r.metrics ? r.metrics.mAP50_95 : null,
+        r.metrics ? r.metrics.precision : null,
+        r.metrics ? r.metrics.recall : null,
+        r.metric_delta,
+        r.error_code
+      ];
+    })));
+    it.wrap.appendChild(scrollWrap);
+  }
+  body.appendChild(it.wrap);
+
+  var br = _viewSection('{{ _("Best result") }}');
+  if (d.best_result) {
+    var bm = d.best_result.metrics || {};
+    _viewRow(br.table, _experimentFieldLabel('best_iteration'), d.best_result.iteration);
+    _viewRow(br.table, _experimentFieldLabel('run_name'), d.best_result.run_name);
+    _viewRow(br.table, 'mAP50', bm.mAP50);
+    _viewRow(br.table, 'mAP50-95', bm.mAP50_95);
+    _viewRow(br.table, 'Precision', bm.precision);
+    _viewRow(br.table, 'Recall', bm.recall);
+  } else {
+    br.wrap.appendChild(_viewEmpty('—'));
+  }
+  body.appendChild(br.wrap);
+
+  var fs = _viewSection('{{ _("Final summary status") }}');
+  if (d.final_summary) {
+    _viewRow(fs.table, '{{ _("Final summary TXT") }}', _experimentEnumLabel(d.final_summary.status));
+    _viewRow(fs.table, '{{ _("AI closing summary") }}', _experimentEnumLabel(d.final_summary.llm_summary_status));
+  } else {
+    fs.wrap.appendChild(_viewEmpty('—'));
+  }
+  body.appendChild(fs.wrap);
+}
+function closeAuditView() {
+  var modal = document.getElementById('auditViewModal');
+  if (modal) modal.style.display = 'none';
+}
+// P5: delegated click for the read-only report/audit modal buttons.
+document.addEventListener('click', function (ev) {
+  var target = ev.target;
+  var reportBtn = target.closest ? target.closest('[data-open-report]') : null;
+  var auditBtn = target.closest ? target.closest('[data-open-audit]') : null;
+  if (reportBtn) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openReportView(reportBtn.getAttribute('data-run-id'));
+  } else if (auditBtn) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openAuditView(auditBtn.getAttribute('data-run-id'));
+  }
+});
+
+// ── S2.2 dataset association summary (textContent only) ──
+function _appendDatasetAssoc(container, summary) {
+  var row = document.createElement('div');
+  row.style.display = 'flex';
+  row.style.gap = '16px';
+  row.style.alignItems = 'center';
+  row.style.padding = '8px 0';
+  row.style.borderBottom = '1px solid var(--border)';
+  row.style.fontSize = '13px';
+  var name = document.createElement('span');
+  name.style.fontWeight = '600';
+  name.style.minWidth = '140px';
+  name.textContent = summary.display_name || summary.dataset_id;
+  var count = document.createElement('span');
+  count.textContent = '{{ _("Experiments count") }}: ' + (summary.experiment_count || 0);
+  count.style.minWidth = '140px';
+  var best = document.createElement('span');
+  best.style.color = 'var(--text-secondary)';
+  best.textContent = summary.best
+    ? ('{{ _("Best") }} ' + summary.best.metric + ' = ' + summary.best.value)
+    : '{{ _("Best") }}: —';
+  row.appendChild(name);
+  row.appendChild(count);
+  row.appendChild(best);
+  container.appendChild(row);
+}
+function loadDatasetAssociations() {
+  var body = document.getElementById('datasetAssociationBody');
+  if (!body) return;
+  body.textContent = '';
+  var ids = window._DATASET_IDS || [];
+  if (ids.length === 0) {
+    body.textContent = '—';
+    return;
+  }
+  ids.forEach(function (datasetId) {
+    fetch('/api/datasets/' + encodeURIComponent(datasetId) + '/experiments?limit=5')
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (summary) {
+        if (summary) _appendDatasetAssoc(body, summary);
+      })
+      .catch(function () { /* keep the card resilient */ });
+  });
+}
+document.addEventListener('DOMContentLoaded', function () {
+  var dsTab = document.querySelector('#page1');
+  if (dsTab && dsTab.classList.contains('active')) loadDatasetAssociations();
+  var agentTab = document.querySelector('#page2');
+  if (agentTab && agentTab.classList.contains('active')) loadRecentTraining();
+  var historyTab = document.querySelector('#page4');
+  if (historyTab && historyTab.classList.contains('active')) {
+    loadHistoryDiagnostics();
+    if (typeof filterHistory === 'function') filterHistory();
+  }
+});
+
+// ── History: server-side query (返修 4). Search/sort/filter/pagination all
+// request GET /api/experiments; the full record set is never loaded for
+// browser-side pagination. JSON-fallback mode is an explicit degraded mode.
+var HISTORY_LIMIT = 25;
+var _HISTORY_DEGRADED = {% if experiment_history_source == 'json_fallback' %}true{% else %}false{% endif %};
+var _HISTORY_FALLBACK_ROWS = {% if experiment_history_source == 'json_fallback' %}{{ experiment_history|tojson }}{% else %}[]{% endif %};
+var _historyState = {dataset: '', source: '', status: '', search: '', sort: 'finished_at', order: 'desc', offset: 0, limit: HISTORY_LIMIT};
+function _historyCmp(a, b) {
+  var an = parseFloat(a), bn = parseFloat(b);
+  if (!isNaN(an) && !isNaN(bn)) return an - bn;
+  return (a < b ? -1 : (a > b ? 1 : 0));
+}
+function _historyQuery() {
+  var s = _historyState;
+  var p = new URLSearchParams();
+  if (s.dataset) p.set('dataset_id', s.dataset);
+  if (s.source) p.set('source', s.source);
+  if (s.status) p.set('status', s.status);
+  if (s.search) p.set('search', s.search);
+  p.set('sort', s.sort);
+  p.set('order', s.order);
+  p.set('limit', String(s.limit));
+  p.set('offset', String(s.offset));
+  return p.toString();
+}
+function _hParam(exp, key) { var p = exp.params || {}; return (key in p) ? p[key] : undefined; }
+function _hEpochs(exp) { return exp.epochs || _hParam(exp, '_epochs') || {}; }
+function _hModel(exp) { return exp.model_name || _hParam(exp, 'model') || ''; }
+function _hTuning(exp) { return exp.tuning || _hParam(exp, '_tuning') || null; }
+function _hDecision(exp) { return exp.decision || _hParam(exp, '_decision') || null; }
+function _hProbe(exp) { return exp.probe_decision || _hParam(exp, '_probe_decision') || null; }
+function _hAuditFile(exp) {
+  if (exp.audit_filename) return exp.audit_filename;
+  var ap = _hParam(exp, '_audit_path') || exp.audit_path;
+  if (ap) return String(ap).split(/[\\/]/).pop();
+  return null;
+}
+function _hReportName(exp) {
+  var arts = exp.artifacts;
+  if (!arts) return null;
+  if (Array.isArray(arts)) {
+    var r = arts.filter(function (a) { return a.kind === 'report'; })[0];
+    return r ? (r.name || null) : null;
+  }
+  return arts.report_path ? String(arts.report_path).split(/[\\/]/).pop() : null;
+}
+function _historyTd(text, style) {
+  var td = document.createElement('td');
+  td.textContent = (text === null || text === undefined || text === '') ? '—' : String(text);
+  if (style) td.style.cssText = style;
+  return td;
+}
+function _historyBadge(text, cls) {
+  var s = document.createElement('span');
+  s.className = 'badge ' + cls;
+  s.textContent = text;
+  return s;
+}
+function _historyStatusBadgeClass(status) {
+  if (status === 'completed') return 'badge-green';
+  if (status === 'failed' || status === 'interrupted') return 'badge-red';
+  if (status === 'cancelled' || status === 'running' || status === 'starting') return 'badge-yellow';
+  return '';
+}
+function _fmtMetric(v) {
+  if (v === null || v === undefined) return '—';
+  return Number(v).toFixed(4);
+}
+function _historyDetailRow(exp) {
+  var params = exp.params || {};
+  var dataName = (params.data || exp.data || '').split(/[\\/]/).pop() || '—';
+  var tuning = _hTuning(exp) || {};
+  var decision = _hDecision(exp) || tuning.decision || {};
+  var auditFile = _hAuditFile(exp);
+  var reportName = _hReportName(exp);
+  var tr = document.createElement('tr');
+  tr.className = 'history-details';
+  var td = document.createElement('td');
+  td.colSpan = 13;
+  td.style.padding = '16px 24px';
+  td.style.background = '#F8FAFC';
+  var wrap = document.createElement('div');
+  wrap.style.display = 'flex';
+  wrap.style.gap = '16px';
+  wrap.style.flexWrap = 'wrap';
+  function block(title, rows) {
+    var div = document.createElement('div');
+    div.style.flex = '1';
+    div.style.minWidth = '200px';
+    var head = document.createElement('div');
+    head.className = 'card-title';
+    head.style.marginBottom = '4px';
+    head.textContent = title;
+    div.appendChild(head);
+    var table = document.createElement('table');
+    table.style.fontSize = '12px';
+    rows.forEach(function (kv) {
+      var r = document.createElement('tr');
+      var k = document.createElement('td');
+      k.textContent = kv[0];
+      k.style.padding = '2px 10px 2px 0';
+      k.style.color = 'var(--text-secondary)';
+      var v = document.createElement('td');
+      v.textContent = (kv[1] === null || kv[1] === undefined) ? '—' : String(kv[1]);
+      v.style.wordBreak = 'break-all';
+      r.appendChild(k); r.appendChild(v);
+      table.appendChild(r);
+    });
+    div.appendChild(table);
+    return div;
+  }
+  wrap.appendChild(block('{{ _("Dataset") }}', [['data.yaml', dataName]]));
+  var paramKeys = ['model', 'data', 'epochs', 'batch', 'imgsz', 'optimizer', 'lr0', 'device'];
+  var pRows = [];
+  paramKeys.forEach(function (k) {
+    if (params[k] !== undefined && params[k] !== null) pRows.push([k, String(params[k]).split(/[\\/]/).pop()]);
+  });
+  wrap.appendChild(block('{{ _("Parameters") }}', pRows));
+  if (exp.source === 'tuning') {
+    wrap.appendChild(block('{{ _("AI Diagnosis") }}', [
+      [_experimentFieldLabel('diagnosis'), decision.diagnosis],
+      [_experimentFieldLabel('action'), decision.action],
+    ]));
+    var guard = tuning.guardrails || null;
+    wrap.appendChild(block('{{ _("Guardrails") }}', [
+      [_experimentFieldLabel('valid'), guard ? _experimentBooleanLabel(guard.valid) : null],
+      [_experimentFieldLabel('warnings'), guard && guard.warnings ? guard.warnings.join('; ') : null],
+      [_experimentFieldLabel('clamped'), guard && guard.clamped ? JSON.stringify(guard.clamped) : null],
+    ]));
+    if (auditFile && exp.source === 'tuning') {
+      var ad = document.createElement('div');
+      ad.style.flex = '1';
+      ad.style.minWidth = '150px';
+      var ah = document.createElement('div');
+      ah.className = 'card-title';
+      ah.style.marginBottom = '4px';
+      ah.textContent = '{{ _("Audit") }}';
+      ad.appendChild(ah);
+      var al = document.createElement('button');
+      al.type = 'button';
+      al.className = 'btn btn-outline btn-sm';
+      al.setAttribute('data-open-audit', '');
+      al.setAttribute('data-run-id', exp.run_id || '');
+      al.textContent = '{{ _("View Audit Result") }}';
+      ad.appendChild(al);
+      wrap.appendChild(ad);
+    }
+  }
+  if (reportName) {
+    var rd = document.createElement('div');
+    rd.style.flex = '1';
+    rd.style.minWidth = '150px';
+    var rh = document.createElement('div');
+    rh.className = 'card-title';
+    rh.style.marginBottom = '4px';
+    rh.textContent = '{{ _("Artifacts") }}';
+    rd.appendChild(rh);
+    var rl = document.createElement('button');
+    rl.type = 'button';
+    rl.className = 'btn btn-outline btn-sm';
+    rl.setAttribute('data-open-report', '');
+    rl.setAttribute('data-run-id', exp.run_id || '');
+    rl.textContent = '{{ _("View Report") }}';
+    rd.appendChild(rl);
+    wrap.appendChild(rd);
+  }
+  td.appendChild(wrap);
+  tr.appendChild(td);
+  return tr;
+}
+function _historyRow(exp) {
+  var params = exp.params || {};
+  var metrics = exp.metrics || {};
+  var epochs = _hEpochs(exp);
+  var runId = exp.run_id || '';
+  var detailId = 'exp_dyn_' + runId.replace(/[^A-Za-z0-9_\-]/g, '_');
+  var row = document.createElement('tr');
+  row.className = 'history-row';
+  row.setAttribute('data-source', exp.source || '');
+  row.setAttribute('data-status', exp.status || '');
+  row.setAttribute('data-dataset-id', exp.dataset_id || '');
+  row.setAttribute('data-detail', detailId);
+  row.setAttribute('data-run-id', runId);
+  row.style.cursor = 'pointer';
+
+  var c0 = document.createElement('td');
+  c0.style.textAlign = 'center';
+  var chk = document.createElement('input');
+  chk.type = 'checkbox';
+  chk.className = 'compare-check';
+  chk.value = runId;
+  chk.onchange = function () { updateCompareSelection(); };
+  c0.appendChild(chk);
+  row.appendChild(c0);
+
+  var c1 = document.createElement('td');
+  if (exp.source === 'tuning') c1.appendChild(_historyBadge(_experimentEnumLabel('tuning'), 'badge-purple'));
+  else c1.appendChild(_historyBadge(_experimentEnumLabel('manual'), 'badge-blue'));
+  row.appendChild(c1);
+
+  var c2 = _historyTd(exp.run_name || '—');
+  c2.style.fontWeight = '600';
+  row.appendChild(c2);
+  row.appendChild(_historyTd(_hModel(exp) || '—', 'font-size:12px;'));
+
+  var c4 = document.createElement('td');
+  c4.appendChild(_historyBadge(_experimentEnumLabel(exp.status), _historyStatusBadgeClass(exp.status)));
+  row.appendChild(c4);
+
+  var c5 = document.createElement('td');
+  var aStatus = exp.analysis_status || 'skipped';
+  if (aStatus === 'completed') c5.appendChild(_historyBadge(_experimentEnumLabel('completed'), 'badge-green'));
+  else if (aStatus === 'failed') c5.appendChild(_historyBadge(_experimentEnumLabel('failed'), 'badge-red'));
+  else c5.appendChild(_historyBadge(_experimentEnumLabel(aStatus), 'badge-yellow'));
+  row.appendChild(c5);
+
+  row.appendChild(_historyTd(_fmtMetric(metrics.mAP50)));
+  row.appendChild(_historyTd(_fmtMetric(metrics.mAP50_95)));
+  row.appendChild(_historyTd(_fmtMetric(metrics.precision)));
+  row.appendChild(_historyTd(_fmtMetric(metrics.recall)));
+  row.appendChild(_historyTd(epochs.completed !== undefined ? String(epochs.completed) : '—'));
+
+  var c11 = _historyTd(String(exp.finished_at || exp.updated_at || '').slice(0, 16), 'font-size:12px;color:var(--text-secondary);');
+  row.appendChild(c11);
+
+  var c12 = document.createElement('td');
+  c12.style.display = 'flex';
+  c12.style.gap = '6px';
+  c12.style.alignItems = 'center';
+  var db = document.createElement('button');
+  db.className = 'btn btn-outline btn-sm';
+  db.textContent = '{{ _("Details") }}';
+  db.onclick = function (ev) { ev.stopPropagation(); toggleDetails(detailId); };
+  c12.appendChild(db);
+  var ob = document.createElement('button');
+  ob.className = 'btn btn-outline btn-sm';
+  ob.textContent = '{{ _("Open Detail") }}';
+  ob.onclick = function (ev) { ev.stopPropagation(); showExperimentDetail(runId); };
+  c12.appendChild(ob);
+  row.appendChild(c12);
+
+  var detail = _historyDetailRow(exp);
+  detail.id = detailId;
+  return {row: row, detail: detail};
+}
+function _renderHistoryTable(items, total) {
+  var body = document.getElementById('historyBody');
+  if (!body) return;
+  body.textContent = '';
+  items.forEach(function (exp) {
+    var pair = _historyRow(exp);
+    body.appendChild(pair.row);
+    body.appendChild(pair.detail);
+  });
+  var totalPages = Math.max(1, Math.ceil(total / _historyState.limit));
+  var page = Math.floor(_historyState.offset / _historyState.limit) + 1;
+  var info = document.getElementById('historyPageInfo');
+  if (info) info.textContent = '{{ _("Page") }} ' + page + ' {{ _("of") }} ' + totalPages + ' (' + total + ')';
+  var prev = document.getElementById('historyPrevBtn');
+  var next = document.getElementById('historyNextBtn');
+  if (prev) prev.disabled = _historyState.offset <= 0;
+  if (next) next.disabled = page >= totalPages;
+  var all = document.getElementById('historySelectAll');
+  if (all) all.checked = false;
+}
+function _loadHistoryDegraded() {
+  var banner = document.getElementById('historyDegradedBanner');
+  if (banner) banner.style.display = 'block';
+  var rows = _HISTORY_FALLBACK_ROWS || [];
+  var dataset = _historyState.dataset, source = _historyState.source, status = _historyState.status;
+  var search = (_historyState.search || '').toLowerCase();
+  var matched = rows.filter(function (e) {
+    if (dataset && e.dataset_id !== dataset) return false;
+    if (source && e.source !== source) return false;
+    if (status && e.status !== status) return false;
+    if (search) {
+      var hay = (((e.run_name || '') + ' ' + _hModel(e) + ' ' + ((e.params && e.params.data) || ''))).toLowerCase();
+      if (hay.indexOf(search) === -1) return false;
+    }
+    return true;
+  });
+  var key = _historyState.sort;
+  matched.sort(function (a, b) {
+    var av, bv;
+    if (key === 'name') { av = a.run_name || ''; bv = b.run_name || ''; }
+    else if (key === 'mAP50') { av = (a.metrics && a.metrics.mAP50) != null ? a.metrics.mAP50 : ''; bv = (b.metrics && b.metrics.mAP50) != null ? b.metrics.mAP50 : ''; }
+    else if (key === 'mAP50_95') { av = (a.metrics && a.metrics.mAP50_95) != null ? a.metrics.mAP50_95 : ''; bv = (b.metrics && b.metrics.mAP50_95) != null ? b.metrics.mAP50_95 : ''; }
+    else { av = a.finished_at || a.updated_at || ''; bv = b.finished_at || b.updated_at || ''; }
+    var cmp = _historyCmp(av, bv);
+    return _historyState.order === 'asc' ? cmp : -cmp;
+  });
+  var pageRows = matched.slice(_historyState.offset, _historyState.offset + _historyState.limit);
+  _renderHistoryTable(pageRows, matched.length);
+}
+function loadHistoryPage() {
+  if (_HISTORY_DEGRADED) { _loadHistoryDegraded(); return; }
+  var body = document.getElementById('historyBody');
+  if (body) body.textContent = '';
+  var info = document.getElementById('historyPageInfo');
+  if (info) info.textContent = '...';
+  fetch('/api/experiments?' + _historyQuery())
+    .then(function (r) { return r.json(); })
+    .then(function (d) { _renderHistoryTable(d.items || [], d.total || 0); })
+    .catch(function () { if (info) info.textContent = '{{ _("Failed to load history") }}'; });
+}
+function filterHistory() {
+  function val(id) { var el = document.getElementById(id); return el ? el.value : ''; }
+  _historyState.dataset = val('historyDatasetFilter');
+  _historyState.source = val('historySourceFilter');
+  _historyState.status = val('historyStatusFilter');
+  _historyState.search = val('historySearchInput');
+  _historyState.sort = val('historySortSelect') || 'finished_at';
+  _historyState.order = val('historyOrderSelect') || 'desc';
+  _historyState.offset = 0;
+  loadHistoryPage();
+}
+function historyPrevPage() { _historyState.offset = Math.max(0, _historyState.offset - _historyState.limit); loadHistoryPage(); }
+function historyNextPage() { _historyState.offset += _historyState.limit; loadHistoryPage(); }
+function _selectedCompareIds() {
+  var ids = [];
+  document.querySelectorAll('.compare-check').forEach(function (box) {
+    if (box.checked) ids.push(box.value);
+  });
+  return ids;
+}
+function updateCompareSelection() {
+  var ids = _selectedCompareIds();
+  var all = document.getElementById('historySelectAll');
+  var boxes = document.querySelectorAll('.compare-check');
+  var allChecked = boxes.length > 0 && ids.length === boxes.length;
+  if (all) all.checked = allChecked;
+  if (ids.length > 5) {
+    // Keep at most 5 selected (deselect the last checked box).
+    var checked = Array.prototype.slice.call(document.querySelectorAll('.compare-check'))
+      .filter(function (b) { return b.checked; });
+    if (checked.length > 5) checked[checked.length - 1].checked = false;
+  }
+}
+function toggleSelectAll(box) {
+  document.querySelectorAll('.compare-check').forEach(function (b) { b.checked = box.checked; });
+  updateCompareSelection();
+}
+function closeCompareModal() {
+  var modal = document.getElementById('compareModal');
+  if (modal) modal.style.display = 'none';
+}
+function _compareTable(headers, rows) {
+  var table = document.createElement('table');
+  table.style.fontSize = '12px';
+  table.style.width = '100%';
+  var htr = document.createElement('tr');
+  headers.forEach(function (h) {
+    var th = document.createElement('th');
+    th.textContent = h;
+    th.style.textAlign = 'left';
+    th.style.padding = '4px 8px 4px 0';
+    htr.appendChild(th);
+  });
+  table.appendChild(htr);
+  rows.forEach(function (cells) {
+    var tr = document.createElement('tr');
+    cells.forEach(function (c) {
+      var td = document.createElement('td');
+      td.textContent = (c === null || c === undefined) ? '—' : String(c);
+      td.style.padding = '4px 8px 4px 0';
+      td.style.wordBreak = 'break-all';
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+  return table;
+}
+function _renderCompare(c) {
+  var body = document.getElementById('compareBody');
+  body.textContent = '';
+  var warn = document.createElement('div');
+  warn.style.marginBottom = '12px';
+  warn.style.fontSize = '12px';
+  warn.style.color = 'var(--warning)';
+  if (!c.comparable) {
+    warn.textContent = '{{ _("Not comparable") }}: ' + (c.warnings || []).join('; ');
+  } else {
+    warn.textContent = '{{ _("Baseline") }}: ' + c.baseline_run_id;
+  }
+  body.appendChild(warn);
+
+  var identityRows = c.identity.map(function (it) {
+    return [it.run_id, it.run_name, _experimentEnumLabel(it.source),
+            _experimentEnumLabel(it.status), it.model_name, _experimentEnumLabel(it.task_type)];
+  });
+  body.appendChild(_compareTable(
+    [_experimentFieldLabel('run_id'), _experimentFieldLabel('run_name'), _experimentFieldLabel('source'),
+     _experimentFieldLabel('status'), _experimentFieldLabel('model_name'), _experimentFieldLabel('task_type')], identityRows));
+
+  if (c.parameters && Object.keys(c.parameters.common || {}).length) {
+    var common = _compareTable(['{{ _("Parameter") }}', '{{ _("Value") }}'],
+      Object.keys(c.parameters.common).map(function (k) { return [k, c.parameters.common[k]]; }));
+    var head = document.createElement('div');
+    head.className = 'card-title';
+    head.style.margin = '10px 0 4px';
+    head.textContent = '{{ _("Common parameters") }}';
+    body.appendChild(head);
+    body.appendChild(common);
+  }
+
+  var metricRows = c.run_ids.map(function (rid) {
+    var cells = [rid];
+    ['mAP50', 'mAP50_95', 'precision', 'recall'].forEach(function (mk) {
+      var v = c.metrics[mk] ? c.metrics[mk][rid] : null;
+      var rel = c.relative && c.relative[mk] ? c.relative[mk][rid] : null;
+      var text = v === null || v === undefined ? '—' : String(v);
+      if (rel !== null && rel !== undefined) {
+        text += ' (' + (rel > 0 ? '+' : '') + (rel * 100).toFixed(0) + '%)';
+      }
+      cells.push(text);
+    });
+    return cells;
+  });
+  body.appendChild(_compareTable(
+    [_experimentFieldLabel('run_id'), 'mAP50', 'mAP50-95', 'precision', 'recall'], metricRows));
+
+  if (c.summary) {
+    var sum = _compareTable(['{{ _("Fact") }}', '{{ _("Run") }}'], [
+      ['{{ _("Highest mAP50") }}', c.summary.highest_mAP50],
+      ['{{ _("Shortest duration") }}', c.summary.shortest_duration],
+      ['{{ _("Most complete artifacts") }}', c.summary.most_complete_artifacts],
+    ]);
+    var sumHead = document.createElement('div');
+    sumHead.className = 'card-title';
+    sumHead.style.margin = '10px 0 4px';
+    sumHead.textContent = '{{ _("Factual summary") }}';
+    body.appendChild(sumHead);
+    body.appendChild(sum);
+  }
+}
+function openCompareModal() {
+  var ids = _selectedCompareIds();
+  if (ids.length < 2 || ids.length > 5) {
+    alert('{{ _("Select 2-5 experiments") }}');
+    return;
+  }
+  var baseline = window.prompt('{{ _("Select baseline run_id (must be one of the selected):") }}', ids[0]);
+  if (!baseline) return;
+  if (ids.indexOf(baseline) === -1) {
+    alert('{{ _("Baseline must be one of the selected run_ids.") }}');
+    return;
+  }
+  var modal = document.getElementById('compareModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  var body = document.getElementById('compareBody');
+  body.textContent = '';
+  var loading = document.createElement('div');
+  loading.style.textAlign = 'center';
+  loading.style.padding = '20px';
+  loading.style.color = 'var(--text-muted)';
+  loading.textContent = '{{ _("Loading...") }}';
+  body.appendChild(loading);
+  fetch('/api/experiments/compare', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': window._CSRF_TOKEN || ''
+    },
+    body: JSON.stringify({run_ids: ids, baseline_run_id: baseline})
+  })
+    .then(function (resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    })
+    .then(function (data) { _renderCompare(data); })
+    .catch(function () {
+      body.textContent = '';
+      var err = document.createElement('div');
+      err.style.textAlign = 'center';
+      err.style.padding = '20px';
+      err.style.color = 'var(--destructive)';
+      err.textContent = '{{ _("Comparison failed.") }}';
+      body.appendChild(err);
+    });
+}
+function loadHistoryDiagnostics() {
+  var el = document.getElementById('historyDiagnostics');
+  if (!el) return;
+  fetch('/api/local-index/diagnostics')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (!d) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.textContent = '{{ _("Schema") }} v' + (d.schema_version === null || d.schema_version === undefined ? '—' : d.schema_version) +
+        ' · ' + '{{ _("Experiments count") }} ' + (d.experiment_count || 0) +
+        ' · ' + '{{ _("Datasets count") }} ' + (d.dataset_count || 0) +
+        ' · ' + '{{ _("Artifacts count") }} ' + (d.artifact_count || 0) +
+        ' · ' + '{{ _("Database") }} ' + (d.database_size_bytes || 0) + ' B' +
+        ' · WAL ' + (d.wal_size_bytes || 0) + ' B' +
+        ' · ' + '{{ _("Backups") }} ' + (d.backup_count || 0) +
+        ' · ' + '{{ _("Quick check") }} ' + (d.quick_check || '—') +
+        (d.error_code ? ' · ' + '{{ _("Error code") }} ' + d.error_code : '');
+    })
+    .catch(function () { el.style.display = 'none'; });
+}
+
+// ── Index maintenance: read-only audit + double-confirmed rebuild (POST+CSRF) ──
+function _maintenanceStatus(text) {
+  var el = document.getElementById('historyMaintenanceStatus');
+  if (el) { el.style.display = text ? 'inline' : 'none'; el.textContent = text || ''; }
+}
+function runIndexAudit() {
+  var el = document.getElementById('historyAuditResult');
+  if (!el) return;
+  _maintenanceStatus('...');
+  fetch('/api/local-index/audit')
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      el.style.display = 'block';
+      var lines = [
+        '{{ _("Audit") }} @ ' + (d.timestamp || '—') + ' · ' + '{{ _("Error code") }} ' + (d.error_code || 'ok') +
+        ' · ' + '{{ _("Scanned") }} ' + (d.scanned || 0) + ' · ' + '{{ _("Issues") }} ' + ((d.issues || []).length),
+      ];
+      (d.issues || []).slice(0, 20).forEach(function (iss) {
+        lines.push(' - [' + iss.code + '] ' + iss.subject);
+      });
+      el.textContent = lines.join('\n');
+      _maintenanceStatus('');
+    })
+    .catch(function () { _maintenanceStatus('{{ _("Audit failed") }}'); });
+}
+var _rebuildArmed = false;
+function confirmIndexRebuild() {
+  var btn = document.getElementById('rebuildBtn');
+  if (!_rebuildArmed) {
+    _rebuildArmed = true;
+    if (btn) btn.textContent = '{{ _("Confirm rebuild? Click again") }}';
+    window.setTimeout(function () {
+      _rebuildArmed = false;
+      if (btn) btn.textContent = '{{ _("Rebuild Index") }}';
+    }, 4000);
+    return;
+  }
+  _rebuildArmed = false;
+  if (btn) btn.textContent = '{{ _("Rebuild Index") }}';
+  var el = document.getElementById('historyRebuildResult');
+  if (!el) return;
+  _maintenanceStatus('...');
+  fetch('/api/local-index/rebuild', {
+    method: 'POST',
+    headers: {'X-CSRF-Token': window._CSRF_TOKEN, 'Content-Type': 'application/json', 'Origin': window.location.origin},
+    body: '{}'
+  }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, data: d}; }); })
+    .then(function (res) {
+      el.style.display = 'block';
+      if (res.ok) {
+        var lines = ['{{ _("Rebuild") }} ok · ' + '{{ _("Datasets count") }} ' + (res.data.datasets || 0) +
+          ' · ' + '{{ _("Experiments count") }} ' + (res.data.experiments || 0) +
+          ' · ' + '{{ _("Artifacts count") }} ' + (res.data.artifacts || 0) +
+          ' · dataset_unresolved ' + (res.data.dataset_unresolved || 0) +
+          ' · snapshot_unresolved ' + (res.data.snapshot_unresolved || 0) +
+          ' · ' + '{{ _("Backups") }} ' + (res.data.backup_created ? '{{ _("Yes") }}' : '{{ _("No") }}')];
+        var issues = res.data.snapshot_issues || {};
+        var parts = [];
+        ['missing', 'corrupt', 'too_large', 'unreadable'].forEach(function (k) {
+          if ((issues[k] || 0) > 0) { parts.push(k + '=' + issues[k]); }
+        });
+        if (issues.exceeded) { parts.push('exceeded'); }
+        if (parts.length) {
+          lines.push('{{ _("Snapshot manifest warning") }}: ' + parts.join(', '));
+        }
+        el.textContent = lines.join('\n');
+        _maintenanceStatus('');
+        loadHistoryDiagnostics();
+        loadHistoryPage();
+      } else {
+        el.textContent = '{{ _("Rebuild failed") }}: ' + (res.data && res.data.error_code ? res.data.error_code : '{{ _("Error") }}');
+        _maintenanceStatus('');
+      }
+    })
+    .catch(function () { _maintenanceStatus('{{ _("Rebuild failed") }}: {{ _("Request error") }}'); });
+}
+
+function importLegacyHistory() {
+  var el = document.getElementById('legacyImportStatus');
+  el.style.display = 'inline';
+  el.textContent = '...';
+  fetch('/api/local-index/import-legacy', {
+    method: 'POST',
+    headers: {'X-CSRF-Token': window._CSRF_TOKEN, 'Content-Type': 'application/json', 'Origin': window.location.origin},
+    body: '{}'
+  }).then(function(r) {
+    return r.json().then(function(d) { return {ok: r.ok, data: d}; });
+  }).then(function(res) {
+    if (res.ok && res.data) {
+      el.textContent = '{{ _("Imported") }} ' + res.data.imported + ', {{ _("Skipped") }} ' + res.data.skipped + ', {{ _("Failed") }} ' + res.data.failed;
+    } else {
+      var code = (res.data && res.data.error_code) ? res.data.error_code : '{{ _("Error") }}';
+      el.textContent = '{{ _("Import failed") }}: ' + code;
+    }
+    if (res.ok) { window.setTimeout(function(){ window.location.reload(); }, 400); }
+  }).catch(function() {
+    el.textContent = '{{ _("Import failed") }}: {{ _("Request error") }}';
   });
 }
 
@@ -2556,6 +3989,44 @@ function makeSseConsumer() {
         signal: tuningAbortController.signal,
       });
 
+      if (!response.ok) {
+        // A resolution/validation failure is a stable JSON error before any
+        // controller exists; never fake a running state.
+        var errBody = {};
+        try { errBody = await response.json(); } catch (e) { errBody = {}; }
+        var errMsg = errBody.error || errBody.error_code || '{{ _("启动失败") }}';
+        appendLog('[' + (errBody.error_code || 'ERROR') + '] ' + errMsg, 'error');
+        tuningStatus.textContent = '[{{ _("失败") }}] ' + errMsg;
+        if (stopBtn) stopBtn.style.display = 'none';
+        startBtn.style.display = 'inline-flex';
+        refreshRunState();
+        return;
+      }
+
+      var _planNotExecutable = false;
+
+      function showReferenceDatasetInfo(data) {
+        var info = document.getElementById('referenceDatasetInfo');
+        var err = document.getElementById('referenceDatasetError');
+        if (!info || !err) return;
+        info.classList.add('hidden');
+        err.classList.add('hidden');
+        if (data.executable && data.reference_dataset) {
+          var rd = data.reference_dataset;
+          var resLabel = (rd.resolution_source === 'sqlite') ? '{{ _("SQLite") }}' : '{{ _("参考运行快照") }}';
+          document.getElementById('refDsRun').textContent = rd.reference_run || '—';
+          document.getElementById('refDsName').textContent = rd.dataset_display_name || rd.snapshot_short_id || '—';
+          document.getElementById('refDsSnapshot').textContent = rd.snapshot_short_id || '—';
+          document.getElementById('refDsSource').textContent = resLabel;
+          info.classList.remove('hidden');
+        } else if (!data.executable) {
+          _planNotExecutable = true;
+          document.getElementById('referenceDatasetErrorText').textContent =
+            (data.error_code ? '[' + data.error_code + '] ' : '') + (data.error || '{{ _("计划不可执行") }}');
+          err.classList.remove('hidden');
+        }
+      }
+
       var reader = response.body.getReader();
       var consumer = makeSseConsumer();
 
@@ -2564,6 +4035,11 @@ function makeSseConsumer() {
         if (r.done) break;
         consumer(r.value, function(data) {
           if (!_sseInCurrentRun(data)) return;  // ignore stale / duplicate events
+          if (data.event === 'reference_dataset') {
+            appendLog(data.message, data.executable ? 'info' : 'warning');
+            showReferenceDatasetInfo(data);
+            return;
+          }
           if (data.event === 'replay_truncated') {
             // Transport warning only: never a terminal status for tuning.
             appendLog(data.message || '部分历史日志不可重放，当前运行仍在继续', 'warning');
@@ -2620,13 +4096,23 @@ function makeSseConsumer() {
                     '<div><span class="text-muted">Precision:</span> <strong>' + (metrics.precision != null ? metrics.precision.toFixed(4) : '-') + '</strong></div>' +
                     '<div><span class="text-muted">Recall:</span> <strong>' + (metrics.recall != null ? metrics.recall.toFixed(4) : '-') + '</strong></div>' +
                   '</div>' +
+                  '<div style="font-size:13px; margin-bottom:8px;">' +
+                    '<span class="text-muted">{{ _("Final summary TXT") }}:</span> ' + (result.final_summary_status === 'generated' ? '{{ _("TXT saved") }}' : (result.final_summary_status === 'failed' ? '{{ _("TXT save failed") }}' : '{{ _("Not generated") }}')) +
+                    '<span style="margin-left:14px;" class="text-muted">{{ _("AI closing summary") }}:</span> ' + (result.llm_summary_status === 'ok' ? '{{ _("AI summary available") }}' : (result.llm_summary_status === 'failed' ? '{{ _("AI summary unavailable") }}' : '{{ _("Not generated") }}')) +
+                  '</div>' +
                   '<button class="btn btn-outline btn-sm" data-train-name="' + encodeURIComponent(result.best_train_name || '') + '" onclick="loadBestReport(decodeURIComponent(this.dataset.trainName))">{{ _("View full analysis") }}</button>';
                 var saveBtn = document.getElementById('saveReportBtn');
                 if (saveBtn) saveBtn.setAttribute('data-train-name', result.best_train_name || '');
                 bestDiv.classList.remove('hidden');
               }
             } else if (data.status === 'running') {
-              tuningStatus.textContent = '[{{ _("运行中") }}] ' + data.message;
+              // A plan whose reference dataset failed to resolve is never shown
+              // as a live running job.
+              if (_planNotExecutable) {
+                tuningStatus.textContent = '[{{ _("计划不可执行") }}] ' + data.message;
+              } else {
+                tuningStatus.textContent = '[{{ _("运行中") }}] ' + data.message;
+              }
             }
         });
       }
@@ -2684,6 +4170,77 @@ function saveDatasetConfig() {
     });
 }
 
+// ── Recent training shortcut (Bugfix P3) ──
+var _RECENT_TRAINING_LOADED = false;
+function loadRecentTraining() {
+  if (_RECENT_TRAINING_LOADED) return;
+  var listEl = document.getElementById('recentTrainingList');
+  if (!listEl) return;
+  fetch('/api/training/recent-runs?limit=4')
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+    .then(function (res) {
+      if (!res.ok) throw new Error((res.data && res.data.error) || '');
+      var items = res.data.items || [];
+      if (!items.length) {
+        _RECENT_TRAINING_LOADED = true;
+        var empty = document.createElement('div');
+        empty.className = 'recent-empty';
+        empty.textContent = '{{ _("No recent training results available") }}';
+        listEl.appendChild(empty);
+        return;
+      }
+      _RECENT_TRAINING_LOADED = true;
+      items.forEach(function (item) { listEl.appendChild(renderRecentTrainingItem(item)); });
+    })
+    .catch(function () {
+      var msg = document.createElement('div');
+      msg.className = 'recent-unavailable';
+      msg.textContent = '{{ _("Recent training is temporarily unavailable") }}';
+      listEl.appendChild(msg);
+    });
+}
+function _formatRecentMap(v) {
+  if (v === null || v === undefined) return '—';
+  var n = Number(v);
+  if (isNaN(n)) return '—';
+  return n.toFixed(4);
+}
+function renderRecentTrainingItem(item) {
+  var div = document.createElement('div');
+  div.className = 'recent-item';
+  div.setAttribute('role', 'button');
+  div.tabIndex = 0;
+  div.style.cssText = 'padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius); cursor:pointer; background:var(--bg-card);';
+  var name = document.createElement('div');
+  name.className = 'recent-run-name';
+  name.style.cssText = 'font-weight:600; font-size:13px;';
+  name.textContent = item.run_name || item.run_id || '—';
+  var meta = document.createElement('div');
+  meta.className = 'recent-meta';
+  meta.style.cssText = 'font-size:12px; color:var(--text-secondary); margin-top:2px;';
+  var parts = [];
+  if (item.model_name) parts.push(item.model_name);
+  parts.push('{{ _("mAP50") }} ' + _formatRecentMap(item.map50));
+  parts.push(item.source === 'tuning' ? '{{ _("Auto tuning") }}' : '{{ _("Manual training") }}');
+  if (item.finished_at) parts.push('{{ _("Completed at") }} ' + String(item.finished_at).slice(0, 16));
+  meta.textContent = parts.join(' · ');
+  div.appendChild(name);
+  div.appendChild(meta);
+  function select() {
+    var input = document.getElementById('trainingPathInput');
+    if (!input) return;
+    input.value = item.run_dir || '';
+    var prev = document.querySelector('#recentTrainingList .recent-selected');
+    if (prev) prev.classList.remove('recent-selected');
+    div.classList.add('recent-selected');
+  }
+  div.addEventListener('click', select);
+  div.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') select();
+  });
+  return div;
+}
+
 // ── Training folder analyze ──
 function analyzeTrainingFolder() {
   var input = document.getElementById('trainingPathInput');
@@ -2714,7 +4271,7 @@ function analyzeTrainingFolder() {
           '<table style="margin-top:4px;">' +
           '<tr><td style="width:120px;">{{ _("Runs Analyzed") }}</td><td><strong>' + s.total_runs + '</strong></td></tr>';
         if (s.run_name) {
-          html += '<tr><td>{{ _("Run Name") }}</td><td>' + s.run_name + '</td></tr>';
+          html += '<tr><td>{{ _("Run name") }}</td><td>' + s.run_name + '</td></tr>';
         }
         if (s.epochs) {
           html += '<tr><td>{{ _("Epochs") }}</td><td>' + s.epochs + ' (<span style="color:var(--success);">' + (s.best_epoch || '—') + ' {{ _("best epoch") }}</span>)</td></tr>';

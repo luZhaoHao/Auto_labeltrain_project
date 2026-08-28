@@ -15,6 +15,7 @@ import yaml
 from .analyzer import analyze_training_results
 from .experiment_history import ExperimentHistoryStore, make_run_id
 from auto_tune.modules.agent_engine.audit import atomic_write_json, utc_now_iso
+from auto_tune.modules.local_index import LocalIndexError
 
 _METRIC_MAP = {
     "metrics/mAP50(B)": "mAP50",
@@ -94,12 +95,20 @@ def finalize_training_run(
     finished_at: str | None = None,
     training_error: dict | None = None,
     tuning_context: dict | None = None,
+    runtime_run_id: str | None = None,
+    local_index_service=None,
+    dataset_id: str | None = None,
 ) -> dict:
     """Finalize a training run: analyze, extract KPIs and persist unified history.
 
     ``tuning_context`` carries structured auto-tuning facts (decision diagnosis,
     action, parameter changes, guardrail outcomes). It is only persisted for
     tuning runs; manual runs pass ``None`` and never gain tuning fields.
+
+    ``runtime_run_id`` is the S1.5 run identity (``<kind>:<uuid4>``) used as the
+    SQLite experiment key; the JSON ``run_id`` remains untouched. SQLite indexing
+    is best-effort: a failure only produces an independent ``index_error`` and
+    never changes the training fact or the JSON history.
     """
     params = _load_params(run_dir)
     record: dict = {
@@ -121,6 +130,7 @@ def finalize_training_run(
         "audit_path": audit_path,
         "analysis_error": None,
         "history_error": None,
+        "index_error": None,
         "error": training_error,
     }
     if source == "tuning" and tuning_context:
@@ -139,5 +149,13 @@ def finalize_training_run(
         store.upsert(record)
     except Exception as exc:
         record["history_error"] = _error("history", "history_persistence_error", str(exc))
+
+    try:
+        if local_index_service is not None:
+            local_index_service.index_experiment(
+                record, runtime_run_id=runtime_run_id, dataset_id=dataset_id
+            )
+    except LocalIndexError as exc:
+        record["index_error"] = _error("index", "local_index_persistence_error", exc.error_code)
 
     return record

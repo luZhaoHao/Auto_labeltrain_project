@@ -339,61 +339,93 @@ def test_training_start_blocked_when_snapshot_invalid(tmp_path, monkeypatch):
     assert called["n"] == 0
 
 
-def test_tuning_start_blocked_when_snapshot_invalid(tmp_path, monkeypatch):
+# ── P2: tuning resolves the reference run's own snapshot, never latest ──
+
+
+def test_tuning_start_latest_corruption_does_not_block_dry_run(tmp_path, monkeypatch):
+    """P2 removed the latest_dataset gate for tuning; a broken latest no longer
+    turns a dry-run request into a 400."""
     _register_source(monkeypatch, tmp_path)
     client = TestClient(app_mod.app)
     client.post("/api/dataset/split", json={"val_ratio": 0.2, "seed": 42})
     info = json.loads(app_mod.LATEST_DATASET_PATH.read_text(encoding="utf-8"))
     Path(info["data_yaml_path"]).write_text("broken\n", encoding="utf-8")
-    resp = client.post("/tuning/start", json={"mode": "dry_run"})
-    assert resp.status_code == 400
-    assert resp.json()["error_code"] == "SNAPSHOT_VALIDATION_FAILED"
-
-
-# ── P1: tuning must bind the validated snapshot data.yaml into the loop config ──
-
-
-def test_tuning_start_forwards_snapshot_data_yaml(tmp_path, monkeypatch):
-    _register_source(monkeypatch, tmp_path)
-    client = TestClient(app_mod.app)
-    client.post("/api/dataset/split", json={"val_ratio": 0.2, "seed": 42})
-    info = json.loads(app_mod.LATEST_DATASET_PATH.read_text(encoding="utf-8"))
-    snapshot_data_yaml = os.path.abspath(info["data_yaml_path"])
 
     captured = {}
 
     def fake_run_tuning_loop(config, **kwargs):
-        captured["config"] = config
-        captured["skip_execute"] = kwargs.get("skip_execute")
-        return {
-            "final_result": None, "best_iteration": None,
-            "best_train_name": None, "best_metrics": None,
-            "iterations": [], "eval_mode": "comprehensive",
-        }
+        captured["reference_dataset"] = kwargs.get("reference_dataset")
+        return {"error": None, "iterations": []}
 
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.loop.run_tuning_loop", fake_run_tuning_loop
     )
     resp = client.post("/tuning/start", json={"mode": "dry_run", "max_retries": 1})
     assert resp.status_code == 200
-    assert captured["config"]["training"]["data_yaml"] == snapshot_data_yaml
-    # 注入必须使用副本，不得直接修改共享 APP_CONFIG
-    assert captured["config"] is not app_mod.APP_CONFIG
+    # No reference was provided; the dry-run plan is not executable and the loop
+    # receives no frozen resolution.
+    assert captured["reference_dataset"] is None
+
+
+def test_tuning_start_forwards_frozen_reference_dataset(tmp_path, monkeypatch):
+    """P2 passes the frozen ReferenceDatasetResolution into the loop instead of
+    injecting training.data_yaml from the global latest_dataset."""
+    source = _make_source(tmp_path)
+    log_dir = _use_tmp_log(monkeypatch, tmp_path)
+    (log_dir / "latest_dataset.json").write_text(
+        json.dumps({"dataset_path": str(source), "split": False}), encoding="utf-8"
+    )
+    client = TestClient(app_mod.app)
+    snap_info = client.post("/api/dataset/split", json={"val_ratio": 0.2, "seed": 42}).json()
+    snapshot_id = snap_info["snapshot_id"]
+
+    detect = tmp_path / "detect"
+    ref = detect / "train52"
+    ref.mkdir(parents=True)
+    data_yaml = str(log_dir / "dataset_snapshots" / snapshot_id / "data.yaml")
+    (ref / "args.yaml").write_text(
+        f"model: yolov8n.pt\ndata: {data_yaml}\nlr0: 0.01\nbatch: 16\nepochs: 100\n",
+        encoding="utf-8",
+    )
+    (ref / "results.csv").write_text("epoch, metrics/mAP50(B)\n0, 0.05\n", encoding="utf-8")
+    monkeypatch.setattr(app_mod, "find_detect_dir", lambda: str(detect))
+
+    captured = {}
+
+    def fake_run_tuning_loop(config, **kwargs):
+        captured["config"] = config
+        captured["reference_dataset"] = kwargs.get("reference_dataset")
+        return {"error": None, "iterations": []}
+
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.run_tuning_loop", fake_run_tuning_loop
+    )
+    resp = client.post("/tuning/start", json={
+        "reference_run": "train52", "mode": "dry_run", "max_retries": 1,
+    })
+    assert resp.status_code == 200
+    res = captured["reference_dataset"]
+    assert res is not None
+    assert res.snapshot_id == snapshot_id
+    # The shared config is used as-is; no data_yaml injection copy is made.
+    assert captured["config"] is app_mod.APP_CONFIG
 
 
 def test_tuning_start_rejects_missing_latest(tmp_path, monkeypatch):
+    """Real training without a unique reference run is rejected before launch."""
     _use_tmp_log(monkeypatch, tmp_path)
 
     def never(*a, **k):
-        raise AssertionError("tuning must not start without a valid snapshot")
+        raise AssertionError("tuning must not start without a resolvable reference")
 
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.run_tuning_loop", never)
     resp = TestClient(app_mod.app).post("/tuning/start", json={"mode": "train", "max_retries": 1})
     assert resp.status_code == 400
-    assert resp.json()["error_code"] == "SNAPSHOT_VALIDATION_FAILED"
+    assert resp.json()["error_code"] == "REFERENCE_RUN_INVALID"
 
 
 def test_tuning_start_rejects_old_latest_without_snapshot(tmp_path, monkeypatch):
+    """A legacy latest_dataset without a snapshot never becomes the reference."""
     source = _make_source(tmp_path)
     _use_tmp_log(monkeypatch, tmp_path)
     app_mod.LATEST_DATASET_PATH.write_text(
@@ -401,9 +433,9 @@ def test_tuning_start_rejects_old_latest_without_snapshot(tmp_path, monkeypatch)
     )
 
     def never(*a, **k):
-        raise AssertionError("tuning must not start without a valid snapshot")
+        raise AssertionError("tuning must not start without a resolvable reference")
 
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.run_tuning_loop", never)
     resp = TestClient(app_mod.app).post("/tuning/start", json={"mode": "train", "max_retries": 1})
     assert resp.status_code == 400
-    assert resp.json()["error_code"] == "SNAPSHOT_VALIDATION_FAILED"
+    assert resp.json()["error_code"] == "REFERENCE_RUN_INVALID"

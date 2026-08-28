@@ -77,6 +77,14 @@ def _new_iteration(iteration: int) -> dict[str, Any]:
             "clamped": {},
             "sanitized_changes": {},
         },
+        "perception": {
+            "status": None,
+            "dataset_report_basename": None,
+            "dataset_total_images": None,
+            "training_report_basename": None,
+            "reference_run": None,
+            "training_best_mAP50": None,
+        },
         "execution": {
             "actual_params": {},
             "args_yaml_path": None,
@@ -103,6 +111,7 @@ class TuningAuditSession:
         log_dir: str,
         reference_run: str | None,
         max_retries: int | None,
+        reference_dataset: dict | None = None,
     ) -> None:
         self.session_id = session_id
         self.path = str(Path(log_dir) / f"tuning_audit_{session_id}.json")
@@ -113,9 +122,12 @@ class TuningAuditSession:
             "started_at": utc_now_iso(),
             "finished_at": None,
             "reference_run": reference_run,
+            "reference_dataset": reference_dataset,
             "max_retries": max_retries,
             "iterations": [],
             "error": None,
+            "final_summary": None,
+            "final_summary_status": None,
         }
 
     def _get_iteration(self, iteration: int) -> dict[str, Any]:
@@ -175,6 +187,21 @@ class TuningAuditSession:
         if error is not None:
             self.data["error"] = error
         self.data["finished_at"] = utc_now_iso()
+        self.flush()
+
+    def set_final_summary(
+        self, status: str, summary: dict | None = None, error_code: str | None = None
+    ) -> None:
+        """Record the deterministic final summary facts and its status.
+
+        The summary is already redacted by construction (relative names and
+        metric/param facts only); the audit's sensitive-field redaction applies
+        on top before persistence.
+        """
+        self.data["final_summary"] = summary
+        self.data["final_summary_status"] = status
+        if error_code is not None:
+            self.data["final_summary_error_code"] = error_code
         self.flush()
 
     def flush(self) -> None:

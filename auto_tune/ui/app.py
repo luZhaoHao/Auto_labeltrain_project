@@ -16,6 +16,7 @@ import zipfile
 import tempfile
 import shutil
 import datetime
+from contextlib import asynccontextmanager
 from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -64,6 +65,7 @@ from auto_tune.modules.agent_engine.training_log import (
     build_training_sse_payload,
     classify_training_line,
 )
+from auto_tune.modules.agent_engine.decision_agent import generate_suggestion
 from auto_tune.modules.dataset_snapshot import (
     SnapshotConflictError,
     SnapshotError,
@@ -83,6 +85,18 @@ from auto_tune.modules.input_safety import (
     scan_directory_bounded,
     validate_directory_path,
 )
+from auto_tune.modules.local_index import (
+    ExperimentQuery,
+    LocalIndexError,
+    LocalIndexService,
+    load_local_index_config,
+)
+from auto_tune.modules.reference_dataset import (
+    ReferenceDatasetError,
+    resolve_reference_dataset,
+)
+from auto_tune.modules.agent_engine.perception import find_module_b_report
+from auto_tune.modules.agent_engine.executor import find_detect_dir
 from auto_tune.modules.run_state.models import RunStatePersistenceError
 from auto_tune.modules.run_state.service import (
     new_run_state,
@@ -109,6 +123,8 @@ def _finalize_and_build_event(
     log_dir: str,
     started_at: str | None,
     cancelled: bool = False,
+    runtime_run_id: str | None = None,
+    local_index_service=None,
 ) -> dict:
     """Finalize a finished training and build the unified SSE completion event."""
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -135,6 +151,8 @@ def _finalize_and_build_event(
         started_at=started_at,
         finished_at=finished_at,
         training_error=training_error,
+        runtime_run_id=runtime_run_id,
+        local_index_service=local_index_service,
     )
     if result["status"] == "completed" and result["analysis_status"] == "failed":
         return {
@@ -233,6 +251,8 @@ def _manual_finalize_cb(controller, returncode):
         "log",
         controller.started_iso,
         cancelled=controller._stop_applied,
+        runtime_run_id=controller.run_id,
+        local_index_service=_local_index_service(),
     )
     event["run_id"] = controller.run_id
     event["phase"] = "terminal"
@@ -315,10 +335,40 @@ class _SseBatch:
 from .components.dataset_panel import get_dataset_report, format_dataset_summary
 from .components.train_panel import get_training_report
 from .components.tuning_panel import get_tuning_history
-from .components.experiment_panel import get_experiment_history
+from .components.experiment_panel import get_experiment_history, get_experiment_history_view
 from .i18n import make_translator, translate
+from auto_tune.modules.presentation import build_experiment_labels
+from auto_tune.modules.local_index.projection import project_outward
+from auto_tune.modules.presentation.experiment_views import ExperimentViewError
 
-app = FastAPI(title="Auto-Tune Dashboard")
+
+def _local_index_startup_backfill() -> None:
+    """Bounded, idempotent, non-fatal startup catch-up of recent JSON facts.
+
+    The local index is a rebuildable projection; after a restart (or an index
+    outage) the newest facts are backfilled on startup. The operation is bounded
+    to the most recent records, never guesses terminal states, persists a
+    bounded maintenance summary (readable via diagnostics), and a broken SQLite
+    index or corrupt fact file never blocks the app or training from starting.
+    """
+    try:
+        service = _local_index_service()
+        if service is None:
+            return
+        service.backfill_startup(max_records=50)
+    except LocalIndexError:
+        pass
+    except Exception:
+        pass
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    _local_index_startup_backfill()
+    yield
+
+
+app = FastAPI(title="Auto-Tune Dashboard", lifespan=_lifespan)
 
 # ── Direct Jinja2 (avoid Starlette TemplateResponse compatibility issue) ──
 import jinja2
@@ -328,6 +378,45 @@ _jinja_env = jinja2.Environment(
     enable_async=False,
     auto_reload=True,
 )
+
+
+def _jinja_basename(value):
+    """Template filter: reduce a path-like value to its basename for display."""
+    if isinstance(value, str):
+        return os.path.basename(value)
+    return value
+
+
+def _merge_suggestion_changes(sections) -> list:
+    """Merge the two LLM suggestion sections into one deduped display list.
+
+    ``sections`` is ``[hyperparameter_changes, training_overrides]``. Matches
+    execution-side priority (``sanitize_tuning_parameters`` applies overrides
+    last): on a same-named key the training override wins. Returns an ordered
+    list of ``[key, value, kind]`` where kind is ``hyperparameter`` or
+    ``training``, keeping hyperparameter changes first.
+    """
+    if not isinstance(sections, (list, tuple)) or len(sections) != 2:
+        return []
+    result: list[list] = []
+    index: dict[str, int] = {}
+    for kind, section in (("hyperparameter", sections[0]), ("training", sections[1])):
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            if key in ("diagnosis", "action"):
+                # Never display pseudo-keys as parameters.
+                continue
+            if key in index:
+                result[index[key]] = [key, value, kind]
+            else:
+                index[key] = len(result)
+                result.append([key, value, kind])
+    return result
+
+
+_jinja_env.filters["basename"] = _jinja_basename
+_jinja_env.filters["merge_suggestion_changes"] = _merge_suggestion_changes
 
 # Config — plaintext api_key is never loaded into the public APP_CONFIG.
 config_path = Path(__file__).parent.parent / "config.yaml"
@@ -359,6 +448,51 @@ _current_tuning_train_proc = None
 # Whether the auto-tuning loop is still owned by this worker's memory (used to
 # decide controller_owned when reconciling the persisted tuning run state).
 _tuning_loop_active = False
+
+
+def _local_index_service() -> LocalIndexService | None:
+    """Build a fresh local-index service; defaults apply when config is absent.
+
+    Paths are resolved through ``os.path.join`` so tests that redirect
+    ``os.path.join("log", ...)`` get an isolated database automatically. A
+    malformed ``local_index`` section degrades to the documented defaults so a
+    bad config can never take the whole dashboard down.
+    """
+    section = (APP_CONFIG.get("local_index") or {}) if APP_CONFIG else {}
+    section = dict(section)
+    section.setdefault("database_path", os.path.join("log", "auto_tune.db"))
+    section.setdefault("backup_dir", os.path.join("log", "db_backups"))
+    try:
+        cfg = load_local_index_config({"local_index": section})
+    except LocalIndexError:
+        cfg = load_local_index_config({"local_index": {
+            "database_path": os.path.join("log", "auto_tune.db"),
+            "backup_dir": os.path.join("log", "db_backups"),
+        }})
+    return LocalIndexService(cfg)
+
+
+def _local_index_error_response(exc: LocalIndexError) -> JSONResponse:
+    """Map a local-index domain error to a stable 5xx response.
+
+    Never leaks raw SQL, tracebacks, or the full database path.
+    """
+    return JSONResponse(
+        {"error": exc.error_code, "error_code": exc.error_code},
+        status_code=exc.status_code,
+    )
+
+
+def _experiment_view_error_response(exc: ExperimentViewError) -> JSONResponse:
+    """Map a P5 report/audit view projection error to a stable HTTP response.
+
+    The stable ``error_code`` drives the UI message; the body never carries a
+    traceback, a raw SQL string, or an absolute artifact path.
+    """
+    return JSONResponse(
+        {"error": exc.error_code, "error_code": exc.error_code},
+        status_code=exc.status_code,
+    )
 
 
 def _update_config(section: str, data: dict) -> tuple[bool, str]:
@@ -656,11 +790,24 @@ def _detect_lang(request: Request) -> str:
 def _render(template_name: str, request: Request, **context) -> str:
     lang = _detect_lang(request)
     _ = make_translator(lang)
+    # Bugfix P4: inject the shared display vocabulary so the template renders
+    # fields/enums through the same module future P5 report generators reuse.
+    context.setdefault("experiment_labels", build_experiment_labels(_))
     template = _jinja_env.get_template(template_name)
     return template.render(_=_, current_lang=lang, **context)
 
 
 # ── Helper: load report for template ──
+def _list_dataset_index(service) -> list:
+    """Best-effort dataset index for the dataset page; never raises."""
+    if service is None:
+        return []
+    try:
+        return service.list_datasets()
+    except LocalIndexError:
+        return []
+
+
 def _load_data():
     cache_key = "load_data"
     cached = _cached(cache_key)
@@ -672,48 +819,78 @@ def _load_data():
     training = get_training_report()
     project = APP_CONFIG.get("project", {}) if APP_CONFIG else {}
     tuning_history = get_tuning_history()
-    experiment_history = get_experiment_history()
+    service = _local_index_service()
+    view = get_experiment_history_view(service=service)
+    dataset_index = _list_dataset_index(service)
     dataset_analyzer_config = APP_CONFIG.get("dataset_analyzer", {})
 
-    result = (dataset, training, project, tuning_history, experiment_history, dataset_analyzer_config)
+    result = {
+        "dataset": dataset,
+        "training": training,
+        "project": project,
+        "tuning_history": tuning_history,
+        "experiment_history": view["experiments"],
+        "experiment_history_source": view["source"],
+        "experiment_index_warning": view["index_warning"],
+        "dataset_index": dataset_index,
+        "dataset_analyzer_config": dataset_analyzer_config,
+    }
     _set_cache(cache_key, result)
     return result
 
 
 # ── Helper: assemble suggestion from tuning history or LLM analysis ──
 def _get_latest_suggestion(tuning_history, training):
-    """Extract the latest hyperparameter suggestion from tuning history or LLM analysis."""
+    """Extract the latest structured suggestion for the intelligent-analysis page.
+
+    Rationale is always sourced from ``action`` (never a non-existent
+    ``llm_rationale``). Structured failures surface a stable error instead of a
+    fake "no suggestions". A plain LLM diagnosis without a structured decision
+    is never presented as an executable suggestion.
+    """
     if tuning_history:
         latest = tuning_history[-1]
         decision = latest.get("decision", {})
+        if decision.get("error"):
+            return {
+                "diagnosis": "",
+                "rationale": "",
+                "action": "",
+                "hyperparameter_changes": {},
+                "training_overrides": {},
+                "error": decision["error"],
+            }
         changes = decision.get("hyperparameter_changes", {})
-        if changes:
+        if changes or decision.get("action"):
             return {
                 "diagnosis": decision.get("diagnosis", ""),
-                "rationale": decision.get("rationale") or decision.get("action", ""),
+                "rationale": decision.get("action", ""),
+                "action": decision.get("action", ""),
                 "hyperparameter_changes": changes,
                 "training_overrides": decision.get("training_overrides", {}),
+                "error": None,
             }
-    # Check training report's own suggestion (from ZIP upload → LLM + Decision Agent)
+    # Check training report's own structured suggestion (analyze-folder / ZIP)
     if training and training.get("suggestion"):
         sug = training["suggestion"]
-        if sug.get("hyperparameter_changes") or sug.get("diagnosis"):
+        if sug.get("error"):
+            return {
+                "diagnosis": "",
+                "rationale": "",
+                "action": "",
+                "hyperparameter_changes": {},
+                "training_overrides": {},
+                "error": sug["error"],
+            }
+        if sug.get("hyperparameter_changes") or sug.get("action"):
             return {
                 "diagnosis": sug.get("diagnosis", ""),
                 "rationale": sug.get("action", ""),
+                "action": sug.get("action", ""),
                 "hyperparameter_changes": sug.get("hyperparameter_changes", {}),
                 "training_overrides": sug.get("training_overrides", {}),
+                "error": None,
             }
-    # Fallback: use LLM analysis text as diagnosis (no structured changes)
-    if training and training.get("llm_analysis"):
-        for rn, diag in training["llm_analysis"].items():
-            if diag.get("llm_diagnosis"):
-                return {
-                    "diagnosis": diag["llm_diagnosis"],
-                    "rationale": diag.get("llm_rationale", ""),
-                    "hyperparameter_changes": {},
-                    "training_overrides": {},
-                }
     return None
 
 
@@ -732,7 +909,11 @@ def _get_current_args(training):
 
 def _common_context():
     """Load all data needed by the SPA template."""
-    dataset, training, project, tuning_history, experiment_history, dataset_analyzer_config = _load_data()
+    data = _load_data()
+    dataset = data["dataset"]
+    training = data["training"]
+    project = data["project"]
+    tuning_history = data["tuning_history"]
     # Read latest dataset info
     latest_dataset = None
     if LATEST_DATASET_PATH.exists():
@@ -753,10 +934,13 @@ def _common_context():
         "training": training,
         "project": project,
         "tuning_history": tuning_history,
-        "experiment_history": experiment_history,
+        "experiment_history": data["experiment_history"],
+        "experiment_history_source": data["experiment_history_source"],
+        "experiment_index_warning": data["experiment_index_warning"],
+        "dataset_index": data["dataset_index"],
         "latest_suggestion": _get_latest_suggestion(tuning_history, training),
         "current_args": _get_current_args(training),
-        "dataset_analyzer_config": dataset_analyzer_config,
+        "dataset_analyzer_config": data["dataset_analyzer_config"],
         "training_config": APP_CONFIG.get("training", {}),
         "llm_analysis": training.get("llm_analysis") if training else None,
         "vision_analysis": training.get("vision_analysis") if training else None,
@@ -1145,6 +1329,370 @@ async def api_experiments_history():
     return JSONResponse(get_experiment_history())
 
 
+# ── Studio S2 Core: local index query / import API ──
+
+
+@app.get("/api/local-index/status")
+async def local_index_status():
+    """Report local index availability, schema and counts."""
+    service = _local_index_service()
+    try:
+        return JSONResponse(service.status())
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.get("/api/datasets")
+async def api_datasets(limit: int = Query(100)):
+    """List indexed datasets (stable query projection)."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 500):
+        return JSONResponse(
+            {"error": "limit must be an integer in [1,500]", "error_code": "INVALID_QUERY"},
+            status_code=400,
+        )
+    service = _local_index_service()
+    try:
+        datasets = service.list_datasets()[:limit]
+        return JSONResponse({
+            "datasets": [project_outward(d) for d in datasets],
+            "count": len(datasets),
+        })
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.get("/api/datasets/{dataset_id}")
+async def api_dataset_detail(dataset_id: str):
+    """Detail for one indexed dataset."""
+    service = _local_index_service()
+    try:
+        dataset = service.get_dataset(dataset_id)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    if dataset is None:
+        return JSONResponse(
+            {"error": "dataset not found", "error_code": "NOT_FOUND"}, status_code=404
+        )
+    return JSONResponse(project_outward(dataset))
+
+
+@app.get("/api/datasets/{dataset_id}/experiments")
+async def api_dataset_experiments(dataset_id: str, limit: int = Query(10)):
+    """Dataset association summary: count, best fact and recent experiments."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 100):
+        return JSONResponse(
+            {"error": "limit must be an integer in [1,100]", "error_code": "INVALID_QUERY"},
+            status_code=400,
+        )
+    service = _local_index_service()
+    try:
+        summary = service.get_dataset_experiments(dataset_id, limit=limit)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    if summary is None:
+        return JSONResponse(
+            {"error": "dataset not found", "error_code": "NOT_FOUND"}, status_code=404
+        )
+    return JSONResponse(project_outward(summary))
+
+
+@app.get("/api/training/recent-runs")
+async def api_training_recent_runs(limit: str = Query("4")):
+    """Recent completed detect training runs for the analysis shortcut (Bugfix P3).
+
+    The narrow response carries public facts plus the verified full ``run_dir``
+    (the one business field needed to fill the local input); it never echoes
+    params, commands, dataset/audit/weights paths or internal errors. Every
+    run_dir is live-validated server-side against the S1.4 input_safety policy.
+    """
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = -1
+    if isinstance(value, bool) or not (1 <= value <= 4):
+        return JSONResponse(
+            {"error": "limit must be an integer in [1,4]", "error_code": "INVALID_QUERY"},
+            status_code=400,
+        )
+    service = _local_index_service()
+    try:
+        policy = _load_input_policy()
+        items = service.recent_training_runs(limit=value, policy=policy)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    except InputSafetyError as exc:
+        return _input_safety_error_response(exc)
+    return JSONResponse({"items": items, "source": "sqlite"})
+
+
+@app.get("/api/experiments")
+async def api_experiments(
+    dataset_id: str | None = Query(None),
+    source: str | None = Query(None),
+    status: str | None = Query(None),
+    search: str | None = Query(None),
+    sort: str = Query("finished_at"),
+    order: str = Query("desc"),
+    limit: int = Query(25),
+    offset: int = Query(0),
+):
+    """Query indexed experiments with stable pagination, search and sorting.
+
+    ``limit`` is bounded to 1-100 (default 25); sorting is backed by a server
+    whitelist so a client can never inject a raw SQL fragment.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 100):
+        return JSONResponse(
+            {"error": "limit must be an integer in [1,100]", "error_code": "INVALID_QUERY"},
+            status_code=400,
+        )
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return JSONResponse(
+            {"error": "offset must be a non-negative integer", "error_code": "INVALID_QUERY"},
+            status_code=400,
+        )
+    try:
+        query = ExperimentQuery(
+            dataset_id=dataset_id or None,
+            source=source or None,
+            status=status or None,
+            search=search or None,
+            sort=sort,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": str(exc), "error_code": "INVALID_QUERY"}, status_code=400
+        )
+    service = _local_index_service()
+    try:
+        page = service.query_experiments(query)
+        page["items"] = [project_outward(e) for e in page["items"]]
+        return JSONResponse(page)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.get("/api/experiments/{run_id}")
+async def api_experiment_detail(run_id: str):
+    """Extended detail for one indexed experiment (URL-encoded run_id).
+
+    Returns sanitized facts, the dataset association and a controlled artifact
+    manifest; it never echoes full business paths and never reads arbitrary
+    local paths (the run_id is the only input).
+    """
+    service = _local_index_service()
+    try:
+        experiment = service.get_experiment_detail(run_id)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    if experiment is None:
+        return JSONResponse(
+            {"error": "experiment not found", "error_code": "NOT_FOUND"}, status_code=404
+        )
+    return JSONResponse(project_outward(experiment))
+
+
+@app.get("/api/experiments/{run_id}/report-view")
+async def api_experiment_report_view(run_id: str):
+    """Bounded, read-only training-report view for one SQLite run_id (Bugfix P5).
+
+    The report is a registered artifact of the exact experiment; its content is
+    projected to a minimal display model. No LLM/vision call, no glob, no metric
+    recomputation, no full paths and no report file writes.
+    """
+    service = _local_index_service()
+    try:
+        view = service.get_report_view(run_id)
+    except ExperimentViewError as exc:
+        return _experiment_view_error_response(exc)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    return JSONResponse(view)
+
+
+@app.get("/api/experiments/{run_id}/audit-view")
+async def api_experiment_audit_view(run_id: str):
+    """Bounded, read-only tuning-audit view for one SQLite run_id (Bugfix P5).
+
+    The audit is a registered artifact of the exact experiment and its session
+    must reconcile with the artifact identity; iterations are projected from the
+    stored facts only.
+    """
+    service = _local_index_service()
+    try:
+        view = service.get_audit_view(run_id)
+    except ExperimentViewError as exc:
+        return _experiment_view_error_response(exc)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    return JSONResponse(view)
+
+
+@app.post("/api/local-index/import-legacy")
+async def local_index_import_legacy(request: Request):
+    """Re-run the read-only legacy JSON import over the fixed log files.
+
+    Client-supplied paths are never accepted; the CSRF/origin checks apply.
+    """
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    service = _local_index_service()
+    paths = [
+        os.path.join("log", "experiment_history.json"),
+        os.path.join("log", "tuning_history.json"),
+    ]
+    try:
+        summary = service.import_legacy_files(paths)
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    _invalidate_cache("load_data")
+    return JSONResponse({
+        "source_files": summary.source_files,
+        "imported": summary.imported,
+        "skipped": summary.skipped,
+        "failed": summary.failed,
+        "failures": [
+            {"error_code": f.error_code, "message": f.message} for f in summary.failures
+        ],
+    })
+
+
+@app.get("/api/local-index/audit")
+async def local_index_audit():
+    """Read-only reconciliation audit of the projection against the facts.
+
+    The audit never initializes, migrates, creates or writes the database; it
+    returns a stable dict (with a stable ``error_code`` in the body on failure)
+    and never leaks a traceback, SQL, or an absolute path.
+    """
+    service = _local_index_service()
+    try:
+        return JSONResponse(project_outward(service.audit()))
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": "LOCAL_INDEX_AUDIT_FAILED", "error_code": "LOCAL_INDEX_AUDIT_FAILED"},
+            status_code=500,
+        )
+
+
+@app.post("/api/local-index/audit/record")
+async def local_index_audit_record(request: Request):
+    """Explicitly persist a bounded audit summary (CSRF/origin-gated).
+
+    Persisting an audit summary is a write, so it is an explicit POST, never
+    part of the read-only GET audit route.
+    """
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    service = _local_index_service()
+    try:
+        return JSONResponse(project_outward(service.persist_audit()))
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": "LOCAL_INDEX_AUDIT_FAILED", "error_code": "LOCAL_INDEX_AUDIT_FAILED"},
+            status_code=500,
+        )
+
+
+@app.post("/api/local-index/rebuild")
+async def local_index_rebuild(request: Request):
+    """Atomically rebuild the index (backup -> temp -> publish)."""
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    service = _local_index_service()
+    try:
+        result = service.rebuild()
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": "LOCAL_INDEX_REBUILD_FAILED", "error_code": "LOCAL_INDEX_REBUILD_FAILED"},
+            status_code=500,
+        )
+    _invalidate_cache("load_data")
+    return JSONResponse(project_outward(result))
+
+
+@app.get("/api/local-index/diagnostics")
+async def local_index_diagnostics():
+    """Report index health: schema/counts/quick_check/backups/recent events."""
+    service = _local_index_service()
+    try:
+        return JSONResponse(project_outward(service.diagnostics()))
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.post("/api/local-index/checkpoint")
+async def local_index_checkpoint(request: Request):
+    """Run a WAL checkpoint on the index database."""
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    service = _local_index_service()
+    try:
+        return JSONResponse(service.checkpoint())
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.post("/api/local-index/backup")
+async def local_index_backup(request: Request):
+    """Create a manual backup of the index database."""
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    service = _local_index_service()
+    try:
+        return JSONResponse(service.backup())
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+
+
+@app.post("/api/experiments/compare")
+async def api_experiments_compare(request: Request):
+    """Compare 2-5 experiments against one baseline (read-only, CSRF-gated)."""
+    try:
+        _require_security(request)
+    except _SecurityRejected as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    try:
+        body = await _safe_json_body(request)
+    except _BodyError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    service = _local_index_service()
+    try:
+        result = service.compare_experiments(
+            body.get("run_ids"), body.get("baseline_run_id")
+        )
+    except LocalIndexError as exc:
+        return _local_index_error_response(exc)
+    return JSONResponse(project_outward(result))
+
+
 @app.get("/api/tuning/status")
 async def api_tuning_status():
     """Reconcile auto-tuning state into the unified public projection.
@@ -1368,20 +1916,43 @@ async def start_tuning(request: Request):
         auto_loop = True
     eval_mode = body.get("eval_mode", "comprehensive")
 
-    # Snapshot gate: auto-tuning must never bypass a registered snapshot.
-    latest = _read_latest_dataset()
-    snapshot_data_yaml = None
-    if latest and latest.get("snapshot_id"):
+    # Resolve the reference run's bound dataset snapshot BEFORE any controller
+    # or YOLO subprocess is created. The global latest_dataset is never a
+    # candidate or fallback for auto-tuning (Bugfix P2).
+    if not reference_run:
+        report = find_module_b_report(log_dir="log")
+        if report and report.get("runs"):
+            reference_run = list(report["runs"].keys())[0]
+
+    detect_dir = find_detect_dir() if reference_run else None
+    reference_dataset = None
+    reference_dataset_error = None
+    if reference_run:
         try:
-            snapshot_data_yaml = _resolve_validated_snapshot_data_yaml(latest)
-        except SnapshotError as exc:
-            return _snapshot_error_response(exc)
+            reference_dataset = resolve_reference_dataset(
+                reference_run,
+                Path(detect_dir),
+                Path("log"),
+                local_index_service=_local_index_service(),
+            )
+        except ReferenceDatasetError as exc:
+            if not skip_execute:
+                return _reference_dataset_error_response(exc)
+            reference_dataset_error = {
+                "error_code": exc.error_code,
+                "error": exc.message,
+            }
     elif not skip_execute:
         return JSONResponse(
-            {"error": "没有已校验的不可变数据集快照，无法启动自动调优",
-             "error_code": "SNAPSHOT_VALIDATION_FAILED"},
+            {"error": "无法确定唯一的参考训练，无法启动自动调优",
+             "error_code": "REFERENCE_RUN_INVALID"},
             status_code=400,
         )
+    else:
+        reference_dataset_error = {
+            "error_code": "REFERENCE_DATASET_UNRESOLVED",
+            "error": "无参考训练，dry-run 计划不可执行",
+        }
 
     # Concurrency gate: a second active tuning run is rejected with 409.
     if _RUN_MANAGER.active_tuning() is not None:
@@ -1411,14 +1982,8 @@ async def start_tuning(request: Request):
     from auto_tune.modules.agent_engine.loop import run_tuning_loop
 
     def loop_runner(on_progress, on_state, cancel_event):
-        cfg = APP_CONFIG
-        if snapshot_data_yaml is not None:
-            cfg = dict(APP_CONFIG)
-            training = dict(APP_CONFIG.get("training", {}) or {})
-            training["data_yaml"] = str(snapshot_data_yaml)
-            cfg["training"] = training
         return run_tuning_loop(
-            config=cfg,
+            config=APP_CONFIG,
             reference_run=reference_run,
             max_retries=max_retries,
             log_dir="log",
@@ -1430,6 +1995,9 @@ async def start_tuning(request: Request):
             keep_params=keep_params,
             eval_mode=eval_mode,
             on_state=on_state,
+            runtime_run_id=run_state.run_id,
+            local_index_service=_local_index_service(),
+            reference_dataset=reference_dataset,
         )
 
     # Create + register + start the background controller. SSE is only a
@@ -1443,6 +2011,31 @@ async def start_tuning(request: Request):
         loop_runner=loop_runner,
     )
     _RUN_MANAGER.register(controller)
+
+    # Publish the frozen resolution confirmation before the loop starts so the
+    # SSE stream always carries the display-safe dataset/snapshot identity.
+    if reference_dataset is not None:
+        broker.publish({
+            "status": "preparing",
+            "event": "reference_dataset",
+            "message": "参考数据集已解析",
+            "run_id": run_state.run_id,
+            "phase": "preparing",
+            "executable": True,
+            "reference_dataset": _reference_dataset_public(reference_dataset),
+        })
+    elif reference_dataset_error is not None:
+        broker.publish({
+            "status": "preparing",
+            "event": "reference_dataset",
+            "message": "参考数据集未解析，计划不可执行",
+            "run_id": run_state.run_id,
+            "phase": "preparing",
+            "executable": False,
+            "error_code": reference_dataset_error["error_code"],
+            "error": reference_dataset_error["error"],
+        })
+
     controller.start()
     _invalidate_cache("load_data")
 
@@ -1632,6 +2225,29 @@ def _load_class_names(source_path: Path, ds_info: dict) -> dict[int, str] | None
 def _snapshot_error_response(exc: SnapshotError) -> JSONResponse:
     """Map a snapshot domain error to a structured HTTP response."""
     return JSONResponse({"error": str(exc), "error_code": exc.error_code}, status_code=exc.status_code)
+
+
+def _reference_dataset_public(res) -> dict:
+    """Display-safe projection of a resolution (no absolute paths, short IDs).
+
+    ``resolution_source`` is the stable code (``sqlite`` / ``reference_args``);
+    the UI translates it via the existing i18n map.
+    """
+    snapshot_id = res.snapshot_id or ""
+    return {
+        "reference_run": res.reference_run,
+        "dataset_display_name": res.dataset_display_name,
+        "snapshot_short_id": snapshot_id[:8] if snapshot_id else None,
+        "resolution_source": res.resolution_source,
+    }
+
+
+def _reference_dataset_error_response(exc: ReferenceDatasetError) -> JSONResponse:
+    """Map a resolution error to a stable 400/409/503 without leaking paths."""
+    return JSONResponse(
+        {"error": exc.message, "error_code": exc.error_code},
+        status_code=exc.status_code,
+    )
 
 
 def _snapshot_created_at(snapshot) -> str | None:
@@ -2010,8 +2626,9 @@ async def split_dataset(request: Request):
         return _snapshot_error_response(exc)
 
     # Register latest only after the snapshot is fully published and verified.
+    latest_info = _snapshot_to_latest_info(ds_info, snapshot)
     try:
-        _write_json_atomic(LATEST_DATASET_PATH, _snapshot_to_latest_info(ds_info, snapshot))
+        _write_json_atomic(LATEST_DATASET_PATH, latest_info)
     except OSError as exc:
         return JSONResponse(
             {"error": f"数据集快照已创建但登记失败: {exc}", "error_code": "SNAPSHOT_IO_FAILED"},
@@ -2019,7 +2636,7 @@ async def split_dataset(request: Request):
         )
 
     _invalidate_cache("load_data")
-    return JSONResponse({
+    response = {
         "status": "success",
         "reused": snapshot.reused,
         "snapshot_id": snapshot.snapshot_id,
@@ -2030,7 +2647,19 @@ async def split_dataset(request: Request):
         "val_count": snapshot.val_count,
         "background_count": snapshot.background_count,
         "total_bytes": snapshot.total_bytes,
-    })
+    }
+    # Index the dataset best-effort: an index failure must never change the
+    # snapshot success fact, only surface a recoverable warning.
+    try:
+        service = _local_index_service()
+        if service is not None:
+            service.index_dataset(latest_info)
+    except LocalIndexError:
+        response["index_warning"] = {
+            "error_code": "LOCAL_INDEX_PERSIST_FAILED",
+            "message": "数据集已创建，但本地索引更新失败",
+        }
+    return JSONResponse(response)
 
 
 # ── Training Upload & Analyze API ──
@@ -2198,27 +2827,18 @@ async def _analyze_train_zip(file: UploadFile) -> JSONResponse:
             except Exception as llm_err:
                 report["llm_analysis"] = {"error": str(llm_err)}
 
-        # Generate structured hyperparameter suggestions via Decision Agent
+        # Structured hyperparameter suggestion via the unified Decision Agent
         if report.get("llm_analysis") and isinstance(report.get("llm_analysis"), dict) and not report["llm_analysis"].get("error"):
             try:
-                from auto_tune.modules.agent_engine.decision_agent import (
-                    build_decision_prompt, call_decision_llm, _extract_json
+                report["suggestion"] = generate_suggestion(
+                    _build_decision_summary(report),
+                    APP_CONFIG.get("project", {}),
+                    APP_CONFIG,
                 )
-                summary_text = _build_decision_summary(report)
-                decision_prompt = build_decision_prompt(summary_text, APP_CONFIG.get("project", {}))
-                raw_response = call_decision_llm(decision_prompt, APP_CONFIG)
-                parsed = _extract_json(raw_response)
-                if parsed:
-                    report["suggestion"] = {
-                        "diagnosis": parsed.get("diagnosis"),
-                        "action": parsed.get("action"),
-                        "hyperparameter_changes": parsed.get("hyperparameter_changes", {}),
-                        "training_overrides": parsed.get("training_overrides", {}),
-                    }
-                else:
-                    report["suggestion"] = {"error": "Failed to parse JSON from LLM response"}
-            except Exception as sug_err:
-                report["suggestion"] = {"error": str(sug_err)}
+            except Exception:
+                # Never lose the plain diagnosis because the suggestion step
+                # itself blew up; persist a stable, safe structured error.
+                report["suggestion"] = {"error": "Suggestion generation failed"}
 
         # Stage 3: Vision consultation (if enabled — requires confusion matrix PNGs in train dir)
         if APP_CONFIG.get("vision", {}).get("enabled", False):
@@ -2340,27 +2960,18 @@ async def analyze_training_folder(request: Request):
             except Exception as llm_err:
                 report["llm_analysis"] = {"error": str(llm_err)}
 
-        # Decision Agent suggestions
+        # Structured hyperparameter suggestion via the unified Decision Agent
         if report.get("llm_analysis") and isinstance(report.get("llm_analysis"), dict) and not report["llm_analysis"].get("error"):
             try:
-                from auto_tune.modules.agent_engine.decision_agent import (
-                    build_decision_prompt, call_decision_llm, _extract_json,
+                report["suggestion"] = generate_suggestion(
+                    _build_decision_summary(report),
+                    APP_CONFIG.get("project", {}),
+                    APP_CONFIG,
                 )
-                summary_text = _build_decision_summary(report)
-                decision_prompt = build_decision_prompt(summary_text, APP_CONFIG.get("project", {}))
-                raw_response = call_decision_llm(decision_prompt, APP_CONFIG)
-                parsed = _extract_json(raw_response)
-                if parsed:
-                    report["suggestion"] = {
-                        "diagnosis": parsed.get("diagnosis"),
-                        "action": parsed.get("action"),
-                        "hyperparameter_changes": parsed.get("hyperparameter_changes", {}),
-                        "training_overrides": parsed.get("training_overrides", {}),
-                    }
-                else:
-                    report["suggestion"] = {"error": "Failed to parse JSON from LLM response"}
-            except Exception as sug_err:
-                report["suggestion"] = {"error": str(sug_err)}
+            except Exception:
+                # Never lose the plain diagnosis because the suggestion step
+                # itself blew up; persist a stable, safe structured error.
+                report["suggestion"] = {"error": "Suggestion generation failed"}
 
         # Stage 3: Vision consultation (if enabled)
         if APP_CONFIG.get("vision", {}).get("enabled", False):
