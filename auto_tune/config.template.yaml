@@ -45,6 +45,14 @@ input_safety:
   max_directory_bytes: 536870912000
   allowed_roots: []
   allow_unc_paths: false
+# 本地稳定索引（Studio S2 Core）：SQLite 只是可重建查询投影，不替代 JSON
+# 审计事实文件，也不复制数据集、权重或训练产物。database_path 与 backup_dir
+# 不能相同；backup_max_files 必须在 1-10，busy_timeout_ms 必须在 100-60000。
+local_index:
+  database_path: log/auto_tune.db
+  backup_dir: log/db_backups
+  backup_max_files: 3
+  busy_timeout_ms: 5000
 dataset_analyzer:
   blur_threshold: 30
   under_exposure_pixel_threshold: 30

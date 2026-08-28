@@ -156,7 +156,8 @@ def build_decision_prompt(
 
 - `hyperparameter_changes`: 只包含需要**修改**的参数（从当前值改为新值）
 - `training_overrides`: 训练配置层面的修改（epochs, patience, imgsz, optimizer, model等）
-- 只修改必要的参数，不要一次性改太多（最多5-8个）
+- 只修改必要的参数，不要一次性改太多（正常模式每轮最多修改 3 个参数）
+- 如果判断当前无需调整超参数，`action` 必须为 `keep_params`，此时两个参数对象都为空
 
 ## 感知数据
 
@@ -254,6 +255,79 @@ def call_decision_llm(prompt: str, config: dict) -> str:
     )
 
 
+def build_json_fix_prompt(original_prompt: str, error: str) -> str:
+    """Build a controlled "only fix the JSON format" retry prompt.
+
+    The retry never guesses parameters locally; it re-runs the same task and
+    asks the model to re-emit strict valid JSON through the same schema.
+    """
+    return (
+        "你上一次的输出未通过结构化校验，请重新输出严格合法的 JSON。\n"
+        f"错误信息: {error}\n"
+        "要求：\n"
+        "1. 仅输出一个 JSON 对象，不要包含 JSON 之外的任何文本。\n"
+        "2. 仅包含以下四个字段：\n"
+        '```json\n'
+        '{\n'
+        '  "diagnosis": "非空字符串",\n'
+        '  "action": "非空字符串",\n'
+        '  "hyperparameter_changes": {},\n'
+        '  "training_overrides": {}\n'
+        '}\n'
+        '```\n'
+        "3. 正常模式每轮最多修改 3 个参数（hyperparameter_changes 与 "
+        "training_overrides 合并计算）。\n"
+        "4. 若无需修改任何超参数，action 必须为 keep_params，两个参数对象都为空。\n"
+        "5. 除 keep_params 外，两个参数对象合并后不得为空。\n"
+        "6. 参数名必须来自可调参数列表。\n\n"
+        f"## 原始任务\n{original_prompt}"
+    )
+
+
+def _run_decision_with_retry(prompt: str, config: dict) -> tuple[str | None, dict | str, bool]:
+    """Call the Decision LLM and strict-parse the result, with one controlled retry.
+
+    A single JSON-format-fix retry is allowed only when the first attempt
+    produced a response that failed strict validation (never for API/transport
+    errors, and never guessed locally). The retry still goes through the same
+    strict parser.
+
+    Returns (raw_response, parsed_dict | stable_error_str, retried).
+    """
+    try:
+        raw = call_decision_llm(prompt, config)
+    except Exception as e:
+        return None, str(e), False
+
+    parsed = parse_decision_response(raw)
+    if not parsed.get("error"):
+        return raw, parsed, False
+
+    fix_prompt = build_json_fix_prompt(prompt, parsed["error"])
+    try:
+        raw2 = call_decision_llm(fix_prompt, config)
+    except Exception as e:
+        return raw, str(e), True
+
+    parsed2 = parse_decision_response(raw2)
+    if not parsed2.get("error"):
+        return raw2, parsed2, True
+    return raw2, parsed2["error"], True
+
+
+def _decision_error_result(raw: str | None, error: str, retried: bool) -> dict:
+    """Stable structured failure result shared by the decision entry points."""
+    return {
+        "diagnosis": None,
+        "action": None,
+        "hyperparameter_changes": {},
+        "training_overrides": {},
+        "raw_response": raw,
+        "error": error,
+        "retried": retried,
+    }
+
+
 def decide_hyperparameters(
     perception: dict,
     config: dict,
@@ -268,42 +342,56 @@ def decide_hyperparameters(
 
     Returns:
         Dict with diagnosis, action, hyperparameter_changes, training_overrides,
-        raw_response, and error (if any).
+        raw_response, error (if any), and retried (bool).
     """
     summary = summarize_perception_for_decision(perception)
     project_info = perception.get("project", {})
     prompt = build_decision_prompt(summary, project_info, previous_attempts)
 
-    try:
-        raw = call_decision_llm(prompt, config)
-    except Exception as e:
-        return {
-            "diagnosis": None,
-            "action": None,
-            "hyperparameter_changes": {},
-            "training_overrides": {},
-            "raw_response": None,
-            "error": str(e),
-        }
-
-    parsed = parse_decision_response(raw)
-    if parsed.get("error"):
-        return {
-            "diagnosis": None,
-            "action": None,
-            "hyperparameter_changes": {},
-            "training_overrides": {},
-            "raw_response": raw,
-            "error": parsed["error"],
-        }
+    raw, result_or_err, retried = _run_decision_with_retry(prompt, config)
+    if isinstance(result_or_err, str):
+        return _decision_error_result(raw, result_or_err, retried)
 
     return {
-        "diagnosis": parsed["diagnosis"],
-        "action": parsed["action"],
-        "hyperparameter_changes": parsed["hyperparameter_changes"],
-        "training_overrides": parsed["training_overrides"],
+        "diagnosis": result_or_err["diagnosis"],
+        "action": result_or_err["action"],
+        "hyperparameter_changes": result_or_err["hyperparameter_changes"],
+        "training_overrides": result_or_err["training_overrides"],
         "raw_response": raw,
         "error": None,
+        "retried": retried,
+    }
+
+
+def generate_suggestion(
+    summary_text: str,
+    project_info: dict | None,
+    config: dict,
+) -> dict:
+    """Unified structured suggestion for one training report.
+
+    Shared by the intelligent-analysis entries (folder/ZIP) so they all use the
+    exact same strict parser, the same single JSON-fix retry, and the same
+    honest failure shape. Never returns the raw model response.
+    """
+    prompt = build_decision_prompt(summary_text, project_info)
+    _, result_or_err, retried = _run_decision_with_retry(prompt, config)
+    if isinstance(result_or_err, str):
+        return {
+            "diagnosis": None,
+            "action": None,
+            "hyperparameter_changes": {},
+            "training_overrides": {},
+            "error": result_or_err,
+            "retried": retried,
+        }
+    return {
+        "diagnosis": result_or_err["diagnosis"],
+        "action": result_or_err["action"],
+        "hyperparameter_changes": result_or_err["hyperparameter_changes"],
+        "training_overrides": result_or_err["training_overrides"],
+        "error": None,
+        "retried": retried,
     }
 
 

@@ -162,6 +162,7 @@ def test_get_experiment_history_merges_legacy_tuning(tmp_path):
 
 
 def _render_history_page(experiments):
+    from auto_tune.modules.presentation import build_experiment_labels
     from auto_tune.ui.app import _jinja_env
     from auto_tune.ui.i18n import make_translator
 
@@ -169,6 +170,7 @@ def _render_history_page(experiments):
     return _jinja_env.get_template("single_page.html").render(
         _=translator,
         current_lang="zh",
+        experiment_labels=build_experiment_labels(translator),
         active_page="history",
         experiment_history=experiments,
         tuning_history=[],
@@ -215,7 +217,7 @@ def test_history_renders_sources_metrics_and_analysis_status():
     assert "普通训练" in html
     assert "自动调优" in html
     assert "mAP50" in html
-    assert "分析失败" in html
+    assert "失败" in html  # tuning analysis_status=failed via the shared enum
     assert "学习率偏高" in html
     # Four KPIs render with values
     assert "0.4000" in html  # manual mAP50
@@ -289,9 +291,11 @@ def test_history_renders_new_tuning_schema_details():
     # Guardrail outcomes render (Passed badge + warning)
     assert "通过" in html
     assert "lr0 从 0.005 约束到 0.001" in html
-    # Audit entry link renders from audit_filename
-    assert "/api/audit/tuning_audit_s1.json" in html
-    assert "查看审计记录" in html
+    # Audit entry renders as a run_id-bound modal button (Bugfix P5), not a
+    # raw-JSON link.
+    assert 'data-open-audit' in html
+    assert "查看审计结果" in html
+    assert 'data-run-id="tuning:s1:autotune_1"' in html
 
 
 def test_history_keep_params_shows_keep_original():
@@ -328,10 +332,11 @@ def test_history_manual_record_hides_tuning_sections():
 
     html = _render_history_page([manual])
 
-    assert "AI 诊断" not in html
-    assert "保持原参数训练" not in html
-    assert "查看审计记录" not in html
-    assert "/api/audit/" not in html
+    # Manual records never render an audit action in the server-rendered rows.
+    assert 'href="/api/audit/' not in html
+    # The JS-driven history renderer only emits the tuning sections (AI
+    # diagnosis / guardrails / audit) for tuning-source records.
+    assert "exp.source === 'tuning'" in html
 
 
 def test_history_detail_colspan_matches_header_columns():
@@ -350,12 +355,12 @@ def test_history_detail_colspan_matches_header_columns():
     # Header row (first <tr> after the filter) has exactly the expected columns
     header_row = table.split("<tr>", 1)[1].split("</tr>", 1)[0]
     header_cols = header_row.count("<th")
-    assert header_cols == 12
+    assert header_cols == 13
 
     # Every history-details detail row spans the header column count
     detail_rows = table.count('class="history-details"')
     assert detail_rows == 2
-    assert table.count('colspan="12"') == detail_rows
+    assert table.count('colspan="13"') == detail_rows
 
 
 def test_api_audit_route_returns_record_and_blocks_traversal(tmp_path, monkeypatch):

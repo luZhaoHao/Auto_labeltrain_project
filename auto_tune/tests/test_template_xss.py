@@ -34,10 +34,13 @@ MALICIOUS_CONFIG = {
 
 
 def _render(ai_config=MALICIOUS_CONFIG, csrf_token=""):
+    from auto_tune.modules.presentation import build_experiment_labels
+
     translator = make_translator("zh")
     return _jinja_env.get_template("single_page.html").render(
         _=translator,
         current_lang="zh",
+        experiment_labels=build_experiment_labels(translator),
         active_page="dashboard",
         experiment_history=[],
         tuning_history=[],

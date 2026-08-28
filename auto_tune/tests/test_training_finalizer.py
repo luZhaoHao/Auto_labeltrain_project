@@ -3,6 +3,13 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from auto_tune.modules.local_index.models import (
+    LocalIndexCorruptError,
+    LocalIndexMigrationError,
+    LocalIndexPersistenceError,
+)
 from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
 
 
@@ -188,3 +195,89 @@ def test_finalize_manual_has_no_tuning_field(tmp_path):
     assert "tuning" not in result
     history = json.loads((tmp_path / "log" / "experiment_history.json").read_text("utf-8"))
     assert "tuning" not in history["experiments"][0]
+
+
+@pytest.mark.parametrize("exc", [
+    LocalIndexCorruptError("corrupt"),
+    LocalIndexPersistenceError("locked"),
+    LocalIndexMigrationError("migration"),
+])
+def test_finalize_sqlite_failure_keeps_training_facts(tmp_path, exc):
+    run_dir = _make_run(tmp_path, "train_idx")
+
+    class _Boom:
+        def index_experiment(self, record, runtime_run_id=None, dataset_id=None):
+            raise exc
+
+    result = finalize_training_run(
+        run_dir, "train_idx", "manual", {}, log_dir=str(tmp_path / "log"),
+        local_index_service=_Boom(),
+    )
+
+    assert result["status"] == "completed"
+    assert result["analysis_status"] == "completed"
+    assert result["history_error"] is None
+    assert result["index_error"]["stage"] == "index"
+    assert result["index_error"]["error_type"] == "local_index_persistence_error"
+    assert result["index_error"]["message"] == exc.error_code
+    # JSON history and report are still written; only index_error is set.
+    history = json.loads((tmp_path / "log" / "experiment_history.json").read_text("utf-8"))
+    assert len(history["experiments"]) == 1
+    assert Path(result["artifacts"]["report_path"]).exists()
+
+
+def test_finalize_indexes_experiment_when_service_provided(tmp_path):
+    run_dir = _make_run(tmp_path, "train_idx_ok")
+
+    from auto_tune.modules.local_index import LocalIndexService
+    from auto_tune.modules.local_index.models import LocalIndexConfig
+
+    svc = LocalIndexService(LocalIndexConfig(
+        database_path=tmp_path / "log" / "auto_tune.db",
+        backup_dir=tmp_path / "log" / "db_backups",
+    ))
+    svc.initialize()
+
+    result = finalize_training_run(
+        run_dir, "train_idx_ok", "manual", {}, log_dir=str(tmp_path / "log"),
+        runtime_run_id="manual:uuid-abc", local_index_service=svc,
+    )
+
+    assert result["status"] == "completed"
+    assert result["index_error"] is None
+    got = svc.get_experiment("manual:uuid-abc")
+    assert got is not None
+    assert got["params"]["_legacy_record_run_id"] == "manual:train_idx_ok"
+
+
+def test_finalize_native_storage_error_only_writes_index_error(tmp_path):
+    """A native OSError/sqlite3.Error at the storage boundary never escapes the
+    finalizer: training facts, Module B report and JSON history are preserved."""
+    run_dir = _make_run(tmp_path, "train_native")
+
+    from auto_tune.modules.local_index import LocalIndexService
+    from auto_tune.modules.local_index.models import LocalIndexConfig
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file, not a dir")
+    svc = LocalIndexService(LocalIndexConfig(
+        database_path=blocker / "auto_tune.db",
+        backup_dir=tmp_path / "log" / "db_backups",
+    ))
+
+    result = finalize_training_run(
+        run_dir, "train_native", "manual", {}, log_dir=str(tmp_path / "log"),
+        local_index_service=svc,
+    )
+
+    assert result["status"] == "completed"
+    assert result["analysis_status"] == "completed"
+    assert result["history_error"] is None
+    assert result["index_error"]["stage"] == "index"
+    assert result["index_error"]["error_type"] == "local_index_persistence_error"
+    assert result["index_error"]["message"] == "LOCAL_INDEX_UNAVAILABLE"
+    # JSON history and Module B report are still written.
+    history = json.loads((tmp_path / "log" / "experiment_history.json").read_text("utf-8"))
+    assert len(history["experiments"]) == 1
+    assert history["experiments"][0]["run_id"] == "manual:train_native"
+    assert Path(result["artifacts"]["report_path"]).exists()

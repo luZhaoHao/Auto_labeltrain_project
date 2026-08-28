@@ -310,7 +310,7 @@ def test_loop_before_metrics_read_from_reference_results_csv(tmp_path, monkeypat
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.launch_training", lambda *a, **k: FakeProc())
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.monitor_training", lambda *a, **k: ProbeDecision(ProbeDecision.CONTINUE, "ok"))
 
-    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None, **kw):
         return {
             "run_id": f"manual:{run_name}",
             "run_name": run_name,
@@ -507,7 +507,7 @@ def test_tuning_training_output_forwarded_to_log_and_sse(tmp_path, monkeypatch):
     )
 
     def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None,
-                      audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+                      audit_path=None, started_at=None, finished_at=None, tuning_context=None, **kw):
         return {
             "run_id": f"tuning:{run_name}",
             "run_name": run_name,
@@ -589,7 +589,7 @@ def _finalizer_loop_setup(tmp_path, monkeypatch, fake_finalize):
 def test_loop_calls_shared_finalizer_once_with_tuning_identity(tmp_path, monkeypatch):
     calls = []
 
-    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None, **kw):
         calls.append({
             "run_dir": run_dir,
             "run_name": run_name,
@@ -658,7 +658,7 @@ def test_loop_calls_shared_finalizer_once_with_tuning_identity(tmp_path, monkeyp
 
 
 def test_loop_finalizer_metrics_reach_audit_without_renaming(tmp_path, monkeypatch):
-    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None, **kw):
         return {
             "run_id": f"tuning:{session_id}:{run_name}",
             "run_name": run_name,
@@ -693,7 +693,7 @@ def test_loop_finalizer_metrics_reach_audit_without_renaming(tmp_path, monkeypat
 
 
 def test_loop_analysis_failure_keeps_training_completed(tmp_path, monkeypatch):
-    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None):
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status, session_id=None, audit_path=None, started_at=None, finished_at=None, tuning_context=None, **kw):
         return {
             "run_id": f"tuning:{session_id}:{run_name}",
             "run_name": run_name,
@@ -906,7 +906,7 @@ def test_loop_on_state_binds_process_identity(tmp_path, monkeypatch):
 
     def fake_finalize(run_dir, run_name, source, config, log_dir, training_status,
                       session_id=None, audit_path=None, started_at=None,
-                      finished_at=None, tuning_context=None):
+                      finished_at=None, tuning_context=None, **kw):
         return {
             "run_id": f"tuning:{session_id}:{run_name}",
             "run_name": run_name,
