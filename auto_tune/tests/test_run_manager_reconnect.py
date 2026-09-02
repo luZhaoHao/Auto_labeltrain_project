@@ -67,10 +67,30 @@ def _valid_decision():
     }
 
 
+def _valid_fact_package():
+    return {
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:test",
+        "task": "detect",
+        "reference_run": "train38",
+        "sources": {
+            "dataset_report": "dataset_report_1.json",
+            "training_report": "train38_report.json",
+            "metrics": "results.csv",
+            "params": "args.yaml",
+        },
+        "facts": [{"fact_id": "training.params.lr0", "value": 0.01, "source": "params"}],
+    }
+
+
 def _monkeypatch_loop_inputs(monkeypatch):
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.loop.build_perception",
         lambda **kwargs: {"dataset": {"total_images": 10}},
+    )
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.build_tuning_fact_package",
+        lambda *a, **k: _valid_fact_package(),
     )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.loop.decide_hyperparameters",

@@ -7,7 +7,7 @@ calls DeepSeek, and extracts a JSON hyperparameter change plan.
 import json
 import re
 import requests
-from typing import Any
+from typing import Any, Callable
 
 from auto_tune.modules.security.credentials import resolve_credential
 from auto_tune.modules.security.endpoint_policy import (
@@ -18,6 +18,13 @@ from auto_tune.modules.security.endpoint_policy import (
 from auto_tune.modules.security.redaction import safe_provider_error
 
 from .parameter_registry import get_tunable_parameter_names
+from .decision_contract import (
+    DecisionContractError,
+    parse_tuning_decision_response,
+    validate_decision_evidence,
+)
+from .decision_semantics import validate_decision_semantics
+from .semantic_rules import build_parameter_rule_summary, build_semantic_rule_summary
 
 
 def _extract_json(text: str) -> dict | None:
@@ -255,6 +262,270 @@ def call_decision_llm(prompt: str, config: dict) -> str:
     )
 
 
+def build_tuning_decision_prompt(fact_package: dict) -> str:
+    """Build the auto-tuning prompt from the frozen FactPackage v1 only.
+
+    The fact package is the single fact source: no free-form perception summary,
+    no hard-coded fact values and no history. The model must echo the same
+    ``fact_package_id`` and may only reference ``fact_id`` values that exist in
+    the package.
+    """
+    package_json = json.dumps(fact_package, ensure_ascii=False, sort_keys=True)
+    allowed = ", ".join(sorted(get_tunable_parameter_names()))
+    semantic_summary = build_semantic_rule_summary()
+    return f"""你是YOLOv8超参数优化专家。你只能依据下方"事实包"中给出的真实事实做决策，禁止编造事实。
+
+## 事实包（唯一事实来源）
+
+```json
+{package_json}
+```
+
+## 输出格式（TuningDecision v1）
+
+你必须只输出一个严格 JSON 对象，不要包含其他文本：
+
+```json
+{{
+  "schema_version": "1.0",
+  "fact_package_id": "<必须与上方事实包的 fact_package_id 完全一致>",
+  "diagnosis": "简要诊断（一句话）",
+  "action": "adjust 或 keep_params",
+  "hyperparameter_changes": {{}},
+  "training_overrides": {{}},
+  "evidence_ids": {{}}
+}}
+```
+
+## 规则
+
+1. 只允许调整以下参数：{allowed}
+2. hyperparameter_changes 与 training_overrides 合并后必须有 1-3 个参数；若判断无需调整，action 必须为 keep_params 且两个参数对象与 evidence_ids 都为空。
+3. 每个修改参数必须在 evidence_ids 中给出至少一个 fact_id；evidence_ids 的键必须与本次修改的参数完全一致。
+4. 只能引用上方事实包中真实存在的 fact_id，禁止编造事实。
+5. 响应中的 fact_package_id 必须与事实包完全一致。
+6. 每个修改参数必须符合下方"允许的超参数修改关系"：引用的证据必须能支持该参数，方向与幅度必须匹配；不满足任何关系、方向相反或幅度越界的修改会导致本轮失败。
+7. 系统不会为你提供或猜测替代参数值。你必须依据同一事实包及上述语义规则，自行输出完整且合法的 TuningDecision v1。
+
+## 允许的超参数修改关系（唯一事实—参数映射）
+
+{semantic_summary}
+"""
+
+
+def build_tuning_correction_prompt(
+    prompt: str,
+    fact_package: dict,
+    error_code: str,
+    error_detail: str,
+) -> str:
+    """Build a controlled one-time correction prompt for a TuningDecision v1.
+
+    The correction only re-states the stable error code, the exact schema and
+    the same fact package; it never asks the model to invent new facts.
+    """
+    return (
+        "你上一次的输出未通过自动调优决策校验，请重新输出严格合法的 TuningDecision v1 JSON。\n"
+        f"稳定错误码: {error_code}\n"
+        f"错误详情: {error_detail}\n"
+        "要求：\n"
+        "1. 只输出一个 JSON 对象，不要包含 JSON 之外的文本。\n"
+        "2. 只能引用原事实包中真实存在的 fact_id，禁止编造事实。\n"
+        "3. fact_package_id 必须与原事实包完全一致。\n"
+        "4. evidence_ids 的键必须与本次修改的参数完全一致。\n"
+        '5. 输出结构必须严格为：\n'
+        '```json\n'
+        '{\n'
+        '  "schema_version": "1.0",\n'
+        '  "fact_package_id": "<原事实包的 fact_package_id>",\n'
+        '  "diagnosis": "非空字符串",\n'
+        '  "action": "adjust 或 keep_params",\n'
+        '  "hyperparameter_changes": {},\n'
+        '  "training_overrides": {},\n'
+        '  "evidence_ids": {}\n'
+        '}\n'
+        '```\n'
+        f"## 原事实包\n{json.dumps(fact_package, ensure_ascii=False, sort_keys=True)}\n"
+        f"## 原始任务\n{prompt}"
+    )
+
+
+def build_semantic_correction_prompt(
+    prompt: str,
+    fact_package: dict,
+    error_code: str,
+    parameter: str | None,
+    reason_code: str | None,
+) -> str:
+    """Build a controlled one-time correction prompt for a semantic failure.
+
+    Only carries the stable error code, the failing parameter, the parameter's
+    allowed evidence/direction/amplitude from the registry, and the requirement
+    to re-emit a full TuningDecision v1. Never guesses or offers substitute
+    parameter values.
+    """
+    param_summary = build_parameter_rule_summary(parameter) if parameter else ""
+    return (
+        "你上一次的输出未通过自动调优语义校验，请重新输出严格合法的 TuningDecision v1 JSON。\n"
+        f"稳定错误码: {error_code}\n"
+        f"失败参数: {parameter}\n"
+        f"失败原因: {reason_code}\n"
+        f"{param_summary}\n"
+        "要求：\n"
+        "1. 只输出一个 JSON 对象，不要包含 JSON 之外的文本。\n"
+        "2. 只能引用原事实包中真实存在的 fact_id，禁止编造事实。\n"
+        "3. 每个修改参数必须有一条证据落在上方允许关系中，方向与幅度必须匹配。\n"
+        "4. 系统不会提供具体修正值。请依据原事实包、该参数允许的证据关系、方向和幅度，"
+        "重新独立输出完整且合法的 TuningDecision v1。\n"
+        "5. fact_package_id 必须与原事实包完全一致。\n"
+        f"## 原事实包\n{json.dumps(fact_package, ensure_ascii=False, sort_keys=True)}\n"
+        f"## 原始任务\n{prompt}"
+    )
+
+
+def _default_tuning_validation(retried: bool) -> dict:
+    return {
+        "valid": False,
+        "error_code": None,
+        "error_detail": None,
+        "retried": retried,
+        "referenced_fact_ids": [],
+    }
+
+
+def _validate_tuning_response(raw: str, fact_package: dict) -> tuple[dict | None, dict]:
+    """Parse + evidence-validate (Q1.1) then semantic-validate (Q1.2) a response.
+
+    Returns ``(decision, validation)``. ``decision`` is None only when Q1.1
+    contract/evidence validation fails (Q1.2 is not reached). On a semantic
+    failure ``decision`` is the parsed decision and ``validation`` carries the
+    stable semantic error plus the ``semantic`` sub-result.
+    """
+    try:
+        decision = parse_tuning_decision_response(raw)
+        decision = validate_decision_evidence(decision, fact_package)
+    except DecisionContractError as exc:
+        return None, {
+            "valid": False,
+            "error_code": exc.error_code,
+            "error_detail": exc.detail,
+            "retried": False,
+            "referenced_fact_ids": [],
+        }
+    referenced = sorted({fid for ids in decision["evidence_ids"].values() for fid in ids})
+    semantic = validate_decision_semantics(decision, fact_package)
+    if not semantic["valid"]:
+        return decision, {
+            "valid": False,
+            "error_code": semantic["error_code"],
+            "error_detail": "semantic validation failed",
+            "retried": False,
+            "referenced_fact_ids": referenced,
+            "semantic": semantic,
+        }
+    return decision, {
+        "valid": True,
+        "error_code": None,
+        "error_detail": None,
+        "retried": False,
+        "referenced_fact_ids": referenced,
+        "semantic": semantic,
+    }
+
+
+def _build_attempt_record(
+    attempt_index: int, retried: bool, decision: dict | None, validation: dict
+) -> dict:
+    """Build one per-response audit attempt record.
+
+    The record carries the parsed decision (or None on a Q1.1 contract failure),
+    the Q1.1 decision_validation and the Q1.2 semantic_validation. It never
+    embeds the raw LLM response, credentials, absolute paths or free-form error
+    text — the same redaction boundary as the rest of the audit.
+    """
+    semantic = validation.get("semantic")
+    return {
+        "attempt": attempt_index,
+        "retried": retried,
+        "decision": dict(decision) if decision is not None else None,
+        "decision_validation": {
+            "valid": validation.get("valid"),
+            "error_code": validation.get("error_code"),
+            "error_detail": validation.get("error_detail"),
+            "referenced_fact_ids": validation.get("referenced_fact_ids", []),
+        },
+        "semantic_validation": dict(semantic) if semantic is not None else None,
+    }
+
+
+def _persist_attempt(
+    on_attempt: Callable | None,
+    attempt_index: int,
+    retried: bool,
+    decision: dict | None,
+    validation: dict,
+) -> None:
+    """Persist one validated model response before deciding to continue.
+
+    ``on_attempt`` is provided by the loop and writes through the audit object;
+    a raise here must propagate so the loop stops before any further LLM call,
+    Guardrails, command construction or training launch.
+    """
+    if on_attempt is None:
+        return
+    on_attempt(_build_attempt_record(attempt_index, retried, decision, validation))
+
+
+def _run_tuning_decision_with_retry(
+    prompt: str, config: dict, fact_package: dict, on_attempt: Callable | None = None
+) -> tuple[str | None, dict | None, dict]:
+    """Run one TuningDecision v1 decision with exactly one controlled retry.
+
+    Structural/evidence contract errors retry once against the same fact
+    package; provider/transport exceptions never retry. A second contract
+    failure is terminal.
+
+    Each model response's Q1.1/Q1.2 validation result is handed to
+    ``on_attempt`` for audit persistence immediately after validation and before
+    any decision to retry or continue; a raise from ``on_attempt`` propagates
+    and stops the decision.
+
+    Returns ``(raw_response, normalized_decision | dict | str | None, validation)``.
+    A ``str`` result is the safe provider error (never retried). A ``None``
+    result means the contract failed on both attempts; ``validation.error_code``
+    carries the stable code.
+    """
+    try:
+        raw = call_decision_llm(prompt, config)
+    except Exception as e:
+        return None, str(e), _default_tuning_validation(False)
+
+    decision, validation = _validate_tuning_response(raw, fact_package)
+    _persist_attempt(on_attempt, 1, False, decision, validation)
+    if decision is not None and validation["valid"]:
+        return raw, decision, validation
+
+    if validation.get("semantic") is not None:
+        semantic = validation["semantic"]
+        correction = build_semantic_correction_prompt(
+            prompt, fact_package, validation["error_code"],
+            semantic.get("parameter"), semantic.get("reason_code"))
+    else:
+        correction = build_tuning_correction_prompt(
+            prompt, fact_package, validation["error_code"], validation["error_detail"])
+    try:
+        raw2 = call_decision_llm(correction, config)
+    except Exception as e:
+        return raw, str(e), _default_tuning_validation(True)
+
+    decision2, validation2 = _validate_tuning_response(raw2, fact_package)
+    validation2["retried"] = True
+    _persist_attempt(on_attempt, 2, True, decision2, validation2)
+    if decision2 is not None and validation2["valid"]:
+        return raw2, decision2, validation2
+    return raw2, None, validation2
+
+
 def build_json_fix_prompt(original_prompt: str, error: str) -> str:
     """Build a controlled "only fix the JSON format" retry prompt.
 
@@ -315,51 +586,89 @@ def _run_decision_with_retry(prompt: str, config: dict) -> tuple[str | None, dic
     return raw2, parsed2["error"], True
 
 
-def _decision_error_result(raw: str | None, error: str, retried: bool) -> dict:
-    """Stable structured failure result shared by the decision entry points."""
-    return {
-        "diagnosis": None,
-        "action": None,
-        "hyperparameter_changes": {},
-        "training_overrides": {},
-        "raw_response": raw,
-        "error": error,
-        "retried": retried,
-    }
+def _semantic_validation_result(validation: dict) -> dict | None:
+    """Extract the semantic result plus the retried flag, or None when Q1.2
+    was not reached (contract/provider failure)."""
+    semantic = validation.get("semantic")
+    if semantic is None:
+        return None
+    out = dict(semantic)
+    out["retried"] = validation.get("retried", False)
+    return out
 
 
-def decide_hyperparameters(
-    perception: dict,
-    config: dict,
-    previous_attempts: list[dict] | None = None,
-) -> dict:
-    """Run the Decision Agent to get hyperparameter suggestions.
+def decide_hyperparameters(fact_package: dict, config: dict, on_attempt: Callable | None = None) -> dict:
+    """Run the auto-tuning Decision Agent against a frozen FactPackage v1.
+
+    The decision contract is TuningDecision v1: every changed parameter must
+    reference a fact in ``fact_package`` and echo its ``fact_package_id``.
+    Q1.1 contract/evidence errors and Q1.2 semantic errors each retry once and
+    return the stable error code on failure.
+
+    Each model response's validation result is handed to ``on_attempt`` for
+    audit persistence immediately after validation; the loop uses this to stop
+    on any audit write failure before retrying or continuing.
 
     Args:
-        perception: dict from build_perception().
+        fact_package: dict from build_tuning_fact_package().
         config: full app config.
-        previous_attempts: previous tuning loop results for context.
+        on_attempt: optional callable(attempt_record) invoked after each
+            validated response; a raise propagates and stops the decision.
 
     Returns:
         Dict with diagnosis, action, hyperparameter_changes, training_overrides,
-        raw_response, error (if any), and retried (bool).
+        raw_response, error (None or stable code), retried, schema_version,
+        fact_package_id, evidence_ids, validation and semantic_validation.
     """
-    summary = summarize_perception_for_decision(perception)
-    project_info = perception.get("project", {})
-    prompt = build_decision_prompt(summary, project_info, previous_attempts)
+    prompt = build_tuning_decision_prompt(fact_package)
+    raw, result, validation = _run_tuning_decision_with_retry(
+        prompt, config, fact_package, on_attempt=on_attempt,
+    )
+    semantic_validation = _semantic_validation_result(validation)
 
-    raw, result_or_err, retried = _run_decision_with_retry(prompt, config)
-    if isinstance(result_or_err, str):
-        return _decision_error_result(raw, result_or_err, retried)
-
+    if isinstance(result, str):
+        return {
+            "diagnosis": None,
+            "action": None,
+            "hyperparameter_changes": {},
+            "training_overrides": {},
+            "raw_response": raw,
+            "error": result,
+            "retried": validation["retried"],
+            "schema_version": None,
+            "fact_package_id": fact_package["fact_package_id"],
+            "evidence_ids": {},
+            "validation": validation,
+            "semantic_validation": None,
+        }
+    if result is None:
+        return {
+            "diagnosis": None,
+            "action": None,
+            "hyperparameter_changes": {},
+            "training_overrides": {},
+            "raw_response": raw,
+            "error": validation["error_code"],
+            "retried": validation["retried"],
+            "schema_version": None,
+            "fact_package_id": fact_package["fact_package_id"],
+            "evidence_ids": {},
+            "validation": validation,
+            "semantic_validation": semantic_validation,
+        }
     return {
-        "diagnosis": result_or_err["diagnosis"],
-        "action": result_or_err["action"],
-        "hyperparameter_changes": result_or_err["hyperparameter_changes"],
-        "training_overrides": result_or_err["training_overrides"],
+        "diagnosis": result["diagnosis"],
+        "action": result["action"],
+        "hyperparameter_changes": result["hyperparameter_changes"],
+        "training_overrides": result["training_overrides"],
         "raw_response": raw,
         "error": None,
-        "retried": retried,
+        "retried": validation["retried"],
+        "schema_version": result["schema_version"],
+        "fact_package_id": result["fact_package_id"],
+        "evidence_ids": result["evidence_ids"],
+        "validation": validation,
+        "semantic_validation": semantic_validation,
     }
 
 

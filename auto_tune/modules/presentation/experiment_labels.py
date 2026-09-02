@@ -65,6 +65,10 @@ FIELD_LABEL_KEYS: dict[str, str] = {
     "suggested_parameters": "Suggested parameters",
     "guarded_parameters": "Guarded parameters",
     "executed_parameters": "Executed parameters",
+    # Q1.2: semantic validation summary (status / reason / failed parameter).
+    "semantic_validation": "Semantic validation",
+    "semantic_reason": "Semantic reason",
+    "semantic_parameter": "Semantic parameter",
 }
 
 # Stable enum value -> stable English translation key. Covers the real values

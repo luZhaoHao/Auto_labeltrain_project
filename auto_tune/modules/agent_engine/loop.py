@@ -10,6 +10,7 @@ Orchestrates the full closed-loop hyperparameter optimization cycle:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import time
@@ -25,6 +26,7 @@ from .perception import (
 )
 from . import final_summary as final_summary_mod
 from .decision_agent import decide_hyperparameters
+from .decision_facts import FactPackageError, build_tuning_fact_package
 from .guardrails import sanitize_tuning_parameters, merge_params
 from .executor import (
     find_detect_dir, read_args_yaml, prepare_training, launch_training, TrainingProcess,
@@ -150,6 +152,36 @@ def _failure(stage: str, error_type: str, message: str, fatal: bool = True) -> d
         "message": message,
         "fatal": fatal,
     }
+
+
+CONTRACT_FAILURE_TYPES = {
+    "DECISION_SCHEMA_INVALID": "decision_schema_invalid",
+    "DECISION_FACT_PACKAGE_MISMATCH": "decision_fact_package_mismatch",
+    "DECISION_EVIDENCE_MISSING": "decision_evidence_missing",
+    "DECISION_EVIDENCE_UNKNOWN": "decision_evidence_unknown",
+}
+
+SEMANTIC_FAILURE_TYPES = {
+    "DECISION_SEMANTIC_UNSUPPORTED": "decision_semantic_error",
+    "DECISION_SEMANTIC_DIRECTION_CONFLICT": "decision_semantic_error",
+    "DECISION_SEMANTIC_CHANGE_TOO_LARGE": "decision_semantic_error",
+    "DECISION_SEMANTIC_CURRENT_VALUE_MISSING": "decision_semantic_error",
+    "DECISION_SEMANTIC_EVIDENCE_CONFLICT": "decision_semantic_error",
+}
+
+SEMANTIC_USER_MESSAGE = (
+    "LLM 建议引用了真实证据，但证据与参数修改之间缺少受支持的语义关系。"
+    "本轮自动调优已停止，未启动训练。"
+)
+
+
+def _classify_decision_error(err_msg: str) -> str:
+    """Classify a non-contract decision error using the legacy provider rules."""
+    lower = err_msg.lower()
+    if ("deepseek api error" in lower or "request" in lower
+            or "timeout" in lower or "connection" in lower):
+        return "decision_api_error"
+    return "decision_schema_error"
 
 
 def _metric_delta(before: dict, after: dict) -> dict:
@@ -744,21 +776,79 @@ def run_tuning_loop(
                 _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
                 return tuning_result
 
-            # ── Step 2: Decision ──
+            # ── Step 2: Freeze the FactPackage before any LLM call ──
+            ref_dir = os.path.join(detect_dir, reference_run) if reference_run else None
+            base_args = read_args_yaml(ref_dir) if (ref_dir and os.path.isdir(ref_dir)) else {}
+            before_metrics, metrics_source = _read_reference_before_metrics(reference_run, detect_dir)
+            try:
+                fact_package = build_tuning_fact_package(
+                    perception, reference_run, base_args, before_metrics, metrics_source,
+                )
+            except FactPackageError as exc:
+                failure = _persist_iteration_failure(
+                    audit, iteration, "facts", "fact_package_invalid", str(exc.detail),
+                )
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+            try:
+                audit.update_iteration(iteration, fact_package=fact_package)
+            except Exception as exc:
+                failure = _persist_iteration_failure(
+                    audit, iteration, "audit", "audit_persistence_error", f"审计写入失败: {exc}",
+                )
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
+            # ── Step 3: Decision ──
             if keep_params:
                 if on_progress:
                     on_progress(iteration, "决策层：保持原有参数，跳过 LLM 调参", step="decision", params={"_keep_params": True, "reason": "AI 判断无需调整超参数，使用原有参数继续训练"})
                 decision = {
+                    "schema_version": "1.0",
+                    "fact_package_id": fact_package["fact_package_id"],
                     "diagnosis": "按原有参数训练，不做超参数调整",
                     "action": "keep_params",
                     "hyperparameter_changes": {},
                     "training_overrides": {},
+                    "evidence_ids": {},
+                    "validation": {
+                        "valid": True, "error_code": None, "error_detail": None,
+                        "retried": False, "referenced_fact_ids": [],
+                    },
+                    "semantic_validation": {
+                        "valid": True, "error_code": None, "reason_code": None,
+                        "retried": False, "parameters": [],
+                    },
                 }
             else:
                 if on_progress:
                     on_progress(iteration, "决策层：LLM 分析并输出调参建议", step="decision")
-                prev_changes = history.get_previous_changes()
-                decision = decide_hyperparameters(perception, config, prev_changes)
+                decision_attempts: list[dict] = []
+
+                def _record_decision_attempt(attempt: dict) -> None:
+                    # 每次模型响应的 Q1.1/Q1.2 校验结果在决定继续前立即落盘。
+                    # 绝不在已交给审计对象的列表上原地修改：先构造独立候选值
+                    # （deepcopy 隔离嵌套对象），只有写盘成功后才把本地
+                    # "已成功持久化"列表更新为候选值；写盘失败时本地状态仍只
+                    # 含此前成功落盘的 attempt，异常向上传播由下方 try/except
+                    # 映射为 audit_persistence_error fail-closed 终态。
+                    nonlocal decision_attempts
+                    candidate_attempts = [*decision_attempts, copy.deepcopy(attempt)]
+                    audit.update_iteration(iteration, decision_attempts=candidate_attempts)
+                    decision_attempts = candidate_attempts
+
+                try:
+                    decision = decide_hyperparameters(
+                        fact_package, config, on_attempt=_record_decision_attempt,
+                    )
+                except Exception as exc:
+                    failure = _persist_iteration_failure(
+                        audit, iteration, "audit", "audit_persistence_error",
+                        f"审计写入失败: {exc}",
+                    )
+                    _abort_tuning(tuning_result, iter_result, audit, iteration, failure,
+                                  history, log_dir, on_progress)
+                    return tuning_result
                 combined_params = {}
                 if decision.get("hyperparameter_changes"):
                     combined_params.update(decision["hyperparameter_changes"])
@@ -773,43 +863,52 @@ def run_tuning_loop(
                                     step="decision", params={"_keep_params": True, "reason": "AI 判断无需调整超参数"})
             iter_result.decision = decision
 
-            audit.update_iteration(iteration, decision={
-                "raw_response": decision.get("raw_response"),
-                "diagnosis": decision.get("diagnosis"),
-                "action": decision.get("action"),
-                "hyperparameter_changes": decision.get("hyperparameter_changes", {}),
-                "training_overrides": decision.get("training_overrides", {}),
-            })
-
-            if decision.get("error"):
-                err_msg = str(decision["error"])
-                iter_result.error = f"决策失败: {err_msg}"
-                lower = err_msg.lower()
-                if ("deepseek api error" in lower or "request" in lower
-                        or "timeout" in lower or "connection" in lower):
-                    error_type = "decision_api_error"
-                else:
-                    error_type = "decision_schema_error"
-                failure = _persist_iteration_failure(audit, iteration, "decision", error_type, err_msg)
+            decision_validation = decision.get("validation") or {
+                "valid": decision.get("error") is None,
+                "error_code": decision.get("error") if decision.get("error") in CONTRACT_FAILURE_TYPES else None,
+                "error_detail": None,
+                "retried": bool(decision.get("retried", False)),
+                "referenced_fact_ids": [],
+            }
+            try:
+                audit.update_iteration(iteration, decision={
+                    "raw_response": decision.get("raw_response"),
+                    "diagnosis": decision.get("diagnosis"),
+                    "action": decision.get("action"),
+                    "hyperparameter_changes": decision.get("hyperparameter_changes", {}),
+                    "training_overrides": decision.get("training_overrides", {}),
+                    "schema_version": decision.get("schema_version"),
+                    "fact_package_id": decision.get("fact_package_id"),
+                    "evidence_ids": decision.get("evidence_ids", {}),
+                }, decision_validation=decision_validation,
+                   semantic_validation=decision.get("semantic_validation"))
+            except Exception as exc:
+                failure = _persist_iteration_failure(
+                    audit, iteration, "audit", "audit_persistence_error", f"审计写入失败: {exc}",
+                )
                 _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
                 return tuning_result
 
-            # ── Step 3: Guardrails ──
+            if decision.get("error"):
+                err_msg = str(decision["error"])
+                if err_msg in SEMANTIC_FAILURE_TYPES:
+                    fail_message = SEMANTIC_USER_MESSAGE
+                else:
+                    fail_message = err_msg
+                iter_result.error = f"决策失败: {fail_message}"
+                error_type = (CONTRACT_FAILURE_TYPES.get(err_msg)
+                              or SEMANTIC_FAILURE_TYPES.get(err_msg)
+                              or _classify_decision_error(err_msg))
+                failure = _persist_iteration_failure(audit, iteration, "decision", error_type, fail_message)
+                _abort_tuning(tuning_result, iter_result, audit, iteration, failure, history, log_dir, on_progress)
+                return tuning_result
+
+            # ── Step 4: Guardrails ──
             if on_progress:
                 on_progress(iteration, "安全护栏：校验和约束参数", step="guardrails")
             changes = decision.get("hyperparameter_changes", {})
             overrides = decision.get("training_overrides", {})
             dataset_info = perception.get("dataset", {})
-
-            # ── Load base and build the only executable parameter set ──
-            if reference_run:
-                ref_dir = os.path.join(detect_dir, reference_run)
-                if os.path.isdir(ref_dir):
-                    base_args = read_args_yaml(ref_dir)
-                else:
-                    base_args = {}
-            else:
-                base_args = {}
 
             merged, guard_result = sanitize_and_merge_tuning_params(
                 base_args, changes, overrides, dataset_info
@@ -835,13 +934,13 @@ def run_tuning_loop(
 
             # Write real baseline facts bound to the same reference_run:
             # reference params (or merged params when no reference run exists)
-            # plus before metrics read from the reference results.csv.
+            # plus before metrics read from the reference results.csv (already
+            # read once for the fact package; reused here unchanged).
             # Internal underscore-prefixed fields are excluded.
             if reference_run:
                 base_params = {k: v for k, v in base_args.items() if not str(k).startswith("_")}
             else:
                 base_params = {k: v for k, v in merged.items() if not str(k).startswith("_")}
-            before_metrics, metrics_source = _read_reference_before_metrics(reference_run, detect_dir)
             audit.update_iteration(iteration, baseline={
                 "reference_run": reference_run,
                 "params": base_params,

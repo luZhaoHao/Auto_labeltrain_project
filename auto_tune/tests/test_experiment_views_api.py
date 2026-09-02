@@ -301,7 +301,7 @@ def test_audit_view_api_schema_fixed(tmp_path, monkeypatch):
     assert set(body["iterations"][0]) == {
         "iteration", "status", "diagnosis", "action", "suggested_parameters",
         "guarded_parameters", "executed_parameters", "guardrails", "metrics",
-        "metric_delta", "run_name", "error_code",
+        "metric_delta", "run_name", "error_code", "semantic_validation",
     }
 
 

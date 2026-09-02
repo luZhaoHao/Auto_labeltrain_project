@@ -85,7 +85,7 @@ def test_audit_session_persists_iteration_lifecycle(tmp_path):
     session.finalize("completed")
 
     saved = json.loads(Path(session.path).read_text(encoding="utf-8"))
-    assert saved["schema_version"] == "1.0"
+    assert saved["schema_version"] == "1.2"
     assert saved["session_id"] == "session-1"
     assert saved["status"] == "completed"
     assert saved["finished_at"].endswith("Z")
@@ -195,3 +195,162 @@ def test_fail_iteration_write_error_propagates(tmp_path, monkeypatch):
         session.fail_iteration(
             1, stage="probe", error_type="probe_retry", message="x", fatal=False
         )
+
+
+def test_audit_iteration_persists_fact_package_before_decision(tmp_path):
+    audit = TuningAuditSession("s1", str(tmp_path), "train54", 1)
+    audit.start_iteration(1)
+    package = {
+        "schema_version": "1.0", "fact_package_id": "sha256:abc",
+        "task": "detect", "reference_run": "train54", "sources": {}, "facts": [],
+    }
+    audit.update_iteration(1, fact_package=package)
+    audit.update_iteration(1, decision_validation={
+        "valid": False, "error_code": "DECISION_EVIDENCE_UNKNOWN",
+        "error_detail": "unknown evidence", "retried": True,
+        "referenced_fact_ids": [],
+    })
+    saved = json.loads(Path(audit.path).read_text(encoding="utf-8"))
+    assert saved["schema_version"] == "1.2"
+    assert saved["iterations"][0]["fact_package"] == package
+    assert saved["iterations"][0]["decision_validation"]["error_code"] == "DECISION_EVIDENCE_UNKNOWN"
+    assert saved["iterations"][0]["decision_validation"]["retried"] is True
+
+
+def test_audit_iteration_decision_accepts_contract_fields(tmp_path):
+    audit = TuningAuditSession("s2", str(tmp_path), "train54", 1)
+    audit.start_iteration(1)
+    audit.update_iteration(1, decision={
+        "raw_response": None, "diagnosis": "d", "action": "adjust",
+        "hyperparameter_changes": {"lr0": 0.002}, "training_overrides": {},
+        "schema_version": "1.0", "fact_package_id": "sha256:abc",
+        "evidence_ids": {"lr0": ["training.params.lr0"]},
+    })
+    saved = json.loads(Path(audit.path).read_text(encoding="utf-8"))
+    decision = saved["iterations"][0]["decision"]
+    assert decision["schema_version"] == "1.0"
+    assert decision["fact_package_id"] == "sha256:abc"
+    assert decision["evidence_ids"] == {"lr0": ["training.params.lr0"]}
+
+
+def test_audit_iteration_persists_semantic_validation(tmp_path):
+    audit = TuningAuditSession("s3", str(tmp_path), "train54", 1)
+    audit.start_iteration(1)
+    audit.update_iteration(1, semantic_validation={
+        "valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+        "reason_code": "NO_SUPPORTING_RULE", "retried": True,
+        "parameters": [{
+            "parameter": "lr0", "current_value": 0.01, "suggested_value": 0.006,
+            "change_direction": "decrease", "rule_ids": [],
+            "supporting_fact_ids": [], "conflicting_fact_ids": [],
+            "neutral_fact_ids": ["training.metrics.mAP50"],
+        }],
+    })
+    saved = json.loads(Path(audit.path).read_text(encoding="utf-8"))
+    sv = saved["iterations"][0]["semantic_validation"]
+    assert sv["valid"] is False
+    assert sv["error_code"] == "DECISION_SEMANTIC_UNSUPPORTED"
+    assert sv["reason_code"] == "NO_SUPPORTING_RULE"
+    assert sv["retried"] is True
+    assert sv["parameters"][0]["parameter"] == "lr0"
+
+
+# ── Q1.2 返修一：decision_attempts 逐次落盘 ──
+
+
+def test_audit_iteration_has_decision_attempts_field(tmp_path):
+    audit = TuningAuditSession("s-a1", str(tmp_path), "train54", 1)
+    audit.start_iteration(1)
+    iteration = audit.to_dict()["iterations"][0]
+    assert iteration["decision_attempts"] == []
+
+
+def test_audit_iteration_persists_decision_attempts(tmp_path):
+    audit = TuningAuditSession("s-a2", str(tmp_path), "train54", 1)
+    audit.start_iteration(1)
+    audit.update_iteration(1, decision_attempts=[
+        {
+            "attempt": 1, "retried": False,
+            "decision": {"schema_version": "1.0", "fact_package_id": "sha256:abc"},
+            "decision_validation": {"valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+                                    "error_detail": "semantic failed", "referenced_fact_ids": []},
+            "semantic_validation": {"valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+                                    "reason_code": "NO_SUPPORTING_RULE", "parameters": []},
+        },
+    ])
+    saved = json.loads(Path(audit.path).read_text(encoding="utf-8"))
+    attempts = saved["iterations"][0]["decision_attempts"]
+    assert attempts[0]["attempt"] == 1
+    assert attempts[0]["decision"]["schema_version"] == "1.0"
+    assert attempts[0]["decision"]["fact_package_id"] == "sha256:abc"
+    assert attempts[0]["semantic_validation"]["error_code"] == "DECISION_SEMANTIC_UNSUPPORTED"
+    assert saved["schema_version"] == "1.2"
+
+
+# ── Q1.2 第二轮返修：update_iteration 写盘失败后内存回滚 ─────────────────────
+
+
+def test_update_iteration_rolls_back_in_memory_when_flush_fails(tmp_path, monkeypatch):
+    """flush 失败后 self.data 恢复调用前状态，失败字段不得借后续 flush 复活。"""
+    import auto_tune.modules.agent_engine.audit as audit_module
+
+    session = TuningAuditSession("s-rollback", str(tmp_path), "train54", 1)
+    session.start_iteration(1)
+    session.update_iteration(1, decision={"action": "keep_params"})
+    before = session.to_dict()
+
+    orig_write = audit_module.atomic_write_json
+
+    def boom(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(audit_module, "atomic_write_json", boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        session.update_iteration(
+            1,
+            decision_attempts=[{"attempt": 1}],
+            decision={"action": "adjust"},
+        )
+
+    # flush 失败 → 内存记录必须与调用前完全一致
+    assert session.to_dict() == before
+
+    # 恢复正常写盘后，再写无关字段
+    monkeypatch.setattr(audit_module, "atomic_write_json", orig_write)
+    session.update_iteration(1, baseline={"reference_run": "train54"})
+
+    # 从磁盘读取：失败更新中的 decision_attempts 与 decision 都没有被写进去
+    saved = json.loads(Path(session.path).read_text(encoding="utf-8"))
+    iteration = saved["iterations"][0]
+    assert iteration["decision_attempts"] == []
+    assert iteration["decision"]["action"] == "keep_params"
+    assert "attempt" not in str(iteration["decision_attempts"])
+
+
+def test_update_iteration_multi_field_atomic_rollback(tmp_path, monkeypatch):
+    """一次更新多个字段，flush 失败必须整体回滚，不允许部分字段保留。"""
+    import auto_tune.modules.agent_engine.audit as audit_module
+
+    session = TuningAuditSession("s-atomic", str(tmp_path), "train54", 1)
+    session.start_iteration(1)
+    before = session.to_dict()
+
+    def boom(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(audit_module, "atomic_write_json", boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        session.update_iteration(
+            1,
+            decision={"action": "adjust"},
+            guardrails={"valid": True},
+            decision_attempts=[{"attempt": 1}],
+        )
+
+    assert session.to_dict() == before
+    record = session.to_dict()["iterations"][0]
+    assert record["decision"]["action"] is None
+    assert record["guardrails"]["valid"] is None
+    assert record["decision_attempts"] == []

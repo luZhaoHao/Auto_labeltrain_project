@@ -144,6 +144,32 @@ def test_parse_failure_retry_fix_succeeds(monkeypatch):
     assert "JSON" in calls[1]
 
 
+def _tuning_fact_package():
+    return {
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:retry",
+        "task": "detect",
+        "reference_run": "train38",
+        "sources": {},
+        "facts": [
+            {"fact_id": "training.params.lr0", "value": 0.01, "source": "params"},
+            {"fact_id": "training.issue.plateau", "value": True, "source": "training_report"},
+        ],
+    }
+
+
+def _tuning_json():
+    return json.dumps({
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:retry",
+        "diagnosis": "mAP 停滞",
+        "action": "adjust",
+        "hyperparameter_changes": {"lr0": 0.006},
+        "training_overrides": {},
+        "evidence_ids": {"lr0": ["training.issue.plateau"]},
+    }, ensure_ascii=False)
+
+
 def test_decide_hyperparameters_also_retries_once(monkeypatch):
     calls = []
 
@@ -151,15 +177,14 @@ def test_decide_hyperparameters_also_retries_once(monkeypatch):
         calls.append(prompt)
         if len(calls) == 1:
             return "```json\n{oops}"
-        return VALID_JSON
+        return _tuning_json()
 
     monkeypatch.setattr(decision_agent, "call_decision_llm", fake_call)
-    result = decision_agent.decide_hyperparameters(
-        {"project": {}}, _config(), previous_attempts=None
-    )
+    result = decision_agent.decide_hyperparameters(_tuning_fact_package(), _config())
     assert result["error"] is None
     assert result["retried"] is True
     assert len(calls) == 2
+    assert result["evidence_ids"] == {"lr0": ["training.issue.plateau"]}
 
 
 def test_retry_both_fail_stable_error_no_raw_leak(monkeypatch):
@@ -642,6 +667,10 @@ def test_loop_schema_error_aborts_before_launch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.loop.build_perception",
         lambda **kwargs: {"dataset": {"total_images": 10}},
+    )
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.build_tuning_fact_package",
+        lambda *a, **k: _tuning_fact_package(),
     )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.loop.decide_hyperparameters",

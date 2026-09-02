@@ -138,10 +138,17 @@ def test_decision_agent():
     print("Stage 3: Decision Agent --- LLM 调参决策")
     print("=" * 60)
 
+    import os as _os
+
     from auto_tune.modules.agent_engine.perception import build_perception, summarize_perception
     from auto_tune.modules.agent_engine.decision_agent import (
         build_decision_prompt, decide_hyperparameters,
     )
+    from auto_tune.modules.agent_engine.decision_facts import (
+        FactPackageError, build_tuning_fact_package,
+    )
+    from auto_tune.modules.agent_engine.executor import find_detect_dir, read_args_yaml
+    from auto_tune.modules.agent_engine.loop import _read_reference_before_metrics
 
     config = load_config()
 
@@ -155,9 +162,27 @@ def test_decision_agent():
         print(f"  {OK}")
         return
 
-    print("\n[Test 1] LLM 调参决策")
+    print("\n[Test 1] 冻结事实包")
     perception = build_perception(log_dir="log")
-    decision = decide_hyperparameters(perception, config)
+    reference_run = (perception.get("training") or {}).get("reference_run")
+    detect_dir = find_detect_dir()
+    ref_dir = _os.path.join(detect_dir, reference_run) if reference_run else None
+    base_args = read_args_yaml(ref_dir) if ref_dir and _os.path.isdir(ref_dir) else {}
+    before_metrics, metrics_source = _read_reference_before_metrics(reference_run, detect_dir)
+    try:
+        package = build_tuning_fact_package(
+            perception, reference_run, base_args, before_metrics, metrics_source,
+        )
+    except FactPackageError as exc:
+        print(f"  [WARN] 事实包构建失败: {exc.detail}")
+        print(f"  {OK}")
+        return
+    print(f"  fact_package_id: {package['fact_package_id']}")
+    print(f"  事实数量: {len(package['facts'])}")
+    print(f"  {OK}")
+
+    print("\n[Test 2] LLM 调参决策")
+    decision = decide_hyperparameters(package, config)
     if decision.get("error"):
         print(f"  [WARN] API 错误: {decision['error']}")
     else:

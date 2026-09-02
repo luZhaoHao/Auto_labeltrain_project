@@ -120,6 +120,129 @@ def _experiment(run_id="tuning:u1", run_name="autotune_x_iter01", source="tuning
     }
 
 
+# ── 16.5 Q1.1/Q1.2: 1.0 / 1.1 / 1.2 audits all read safely ──
+
+
+@pytest.mark.parametrize("schema_version", ["1.0", "1.1", "1.2"])
+def test_audit_view_accepts_old_and_new_schema(schema_version, tmp_path):
+    iteration = _iteration()
+    if schema_version in ("1.1", "1.2"):
+        iteration["fact_package"] = {
+            "schema_version": "1.0", "fact_package_id": "sha256:abc",
+            "task": "detect", "reference_run": "train52", "sources": {}, "facts": [],
+        }
+        iteration["decision_validation"] = {
+            "valid": True, "error_code": None, "error_detail": None,
+            "retried": False, "referenced_fact_ids": [],
+        }
+    if schema_version == "1.2":
+        iteration["semantic_validation"] = {
+            "valid": True, "error_code": None, "reason_code": None,
+            "retried": False, "parameters": [],
+        }
+    payload = _audit_payload("sess1", iterations=[iteration])
+    payload["schema_version"] = schema_version
+    audit_path = _write(tmp_path / "log" / "tuning_audit_sess1.json", payload)
+    view = build_audit_view(
+        _experiment(audit_path=audit_path), artifact_roots=_roots(tmp_path)
+    )
+    assert view["session"]["session_id"] == "sess1"
+    assert view["iterations"][0]["suggested_parameters"] == {"lr0": 0.001}
+
+
+@pytest.mark.parametrize("schema_version", ["1.0", "1.1", "1.2"])
+def test_audit_view_old_records_show_no_semantic_validation(schema_version, tmp_path):
+    """旧记录没有 semantic_validation 时投影为 None（UI 显示"未执行语义校验"）。"""
+    iteration = _iteration()
+    if schema_version in ("1.1", "1.2"):
+        iteration["fact_package"] = {
+            "schema_version": "1.0", "fact_package_id": "sha256:abc",
+            "task": "detect", "reference_run": "train52", "sources": {}, "facts": [],
+        }
+        iteration["decision_validation"] = {
+            "valid": True, "error_code": None, "error_detail": None,
+            "retried": False, "referenced_fact_ids": [],
+        }
+    if schema_version == "1.2":
+        # 1.2 但缺少 semantic_validation（历史记录）→ 同样显示未执行
+        pass
+    payload = _audit_payload("sess1", iterations=[iteration])
+    payload["schema_version"] = schema_version
+    audit_path = _write(tmp_path / "log" / "tuning_audit_sess1.json", payload)
+    view = build_audit_view(
+        _experiment(audit_path=audit_path), artifact_roots=_roots(tmp_path)
+    )
+    assert view["iterations"][0]["semantic_validation"] is None
+
+
+def test_audit_view_projects_semantic_validation_minimally(tmp_path):
+    iteration = _iteration()
+    iteration["fact_package"] = {
+        "schema_version": "1.0", "fact_package_id": "sha256:abc",
+        "task": "detect", "reference_run": "train52", "sources": {}, "facts": [],
+    }
+    iteration["decision_validation"] = {
+        "valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+        "error_detail": "semantic failed", "retried": True, "referenced_fact_ids": [],
+    }
+    iteration["semantic_validation"] = {
+        "valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+        "reason_code": "NO_SUPPORTING_RULE", "retried": True,
+        "parameters": [{
+            "parameter": "lr0", "current_value": 0.01, "suggested_value": 0.006,
+            "change_direction": "decrease", "rule_ids": [],
+            "supporting_fact_ids": [], "conflicting_fact_ids": [],
+            "neutral_fact_ids": ["training.metrics.mAP50"],
+        }],
+    }
+    payload = _audit_payload("sess1", iterations=[iteration])
+    payload["schema_version"] = "1.2"
+    log_dir = Path(tmp_path) / "log"
+    audit_path = _write(log_dir / "tuning_audit_sess1.json", payload)
+    exp = _experiment(run_id="tuning:u1", run_name="iter01", audit_path=audit_path)
+
+    view = build_audit_view(exp, artifact_roots=_roots(tmp_path))
+    sv = view["iterations"][0]["semantic_validation"]
+    assert sv["valid"] is False
+    assert sv["error_code"] == "DECISION_SEMANTIC_UNSUPPORTED"
+    assert sv["reason_code"] == "NO_SUPPORTING_RULE"
+    assert sv["parameter"] == "lr0"
+    # 只投影状态/原因/参数；原始响应、完整事实包、逐参数内部与敏感信息不出现
+    blob = json.dumps(view)
+    assert "raw_response" not in blob
+    assert "fact_package" not in blob
+    assert "supporting_fact_ids" not in blob
+    assert "api_key" not in blob.lower()
+    assert "authorization" not in blob.lower()
+    assert "training.metrics.mAP50" not in blob
+
+
+def test_audit_view_never_leaks_fact_package_sources_paths(tmp_path):
+    """A malicious fact_package.sources value must never reach the client."""
+    iteration = _iteration()
+    iteration["fact_package"] = {
+        "schema_version": "1.0", "fact_package_id": "sha256:abc",
+        "task": "detect", "reference_run": "train52",
+        "sources": {
+            "dataset_report": "D:/secret/ds/dataset_report_1.json",
+            "training_report": "C:/Users/evil/train52_report.json",
+        },
+        "facts": [],
+    }
+    log_dir = Path(tmp_path) / "log"
+    audit_path = _write(log_dir / "tuning_audit_sess1.json",
+                        _audit_payload("sess1", iterations=[iteration]))
+    exp = _experiment(run_id="tuning:u1", run_name="iter01", audit_path=audit_path)
+
+    view = build_audit_view(exp, artifact_roots=_roots(tmp_path))
+    blob = json.dumps(view)
+
+    assert "D:/secret/ds" not in blob
+    assert "C:/Users/evil" not in blob
+    assert "dataset_report_1.json" not in blob
+    assert "train52_report.json" not in blob
+
+
 # ── 17. tuning run_id 精确绑定 audit ──
 
 
@@ -557,3 +680,68 @@ def test_audit_termination_reason_fixed_copy_when_no_stable_code(tmp_path):
     assert view["session"]["termination_reason"] is not None
     assert view["session"]["termination_reason"] != "boom D:/secret/data.yaml"
     assert "D:/secret/data.yaml" not in blob
+
+
+# ── Q1.2 返修一：decision_attempts 是内部追踪，不进只读视图投影 ─────────────
+
+
+def test_audit_view_does_not_project_decision_attempts(tmp_path):
+    """attempt 细节不进入 API 投影；顶层仍是最终那次结果。"""
+    iteration = _iteration()
+    iteration["fact_package"] = {
+        "schema_version": "1.0", "fact_package_id": "sha256:abc",
+        "task": "detect", "reference_run": "train52", "sources": {}, "facts": [],
+    }
+    # 顶层 = 最终采用结果（第二次 keep_params）
+    iteration["decision_validation"] = {
+        "valid": True, "error_code": None, "error_detail": None,
+        "retried": True, "referenced_fact_ids": [],
+    }
+    iteration["semantic_validation"] = {
+        "valid": True, "error_code": None, "reason_code": None,
+        "retried": True, "parameters": [],
+    }
+    iteration["decision_attempts"] = [
+        {
+            "attempt": 1, "retried": False,
+            "decision": {"schema_version": "1.0", "fact_package_id": "sha256:abc",
+                         "diagnosis": "first-attempt-diagnosis", "action": "adjust",
+                         "hyperparameter_changes": {"lr0": 0.006},
+                         "training_overrides": {}, "evidence_ids": {"lr0": ["training.metrics.mAP50"]}},
+            "decision_validation": {"valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+                                    "error_detail": "semantic failed", "referenced_fact_ids": []},
+            "semantic_validation": {"valid": False, "error_code": "DECISION_SEMANTIC_UNSUPPORTED",
+                                    "reason_code": "NO_SUPPORTING_RULE", "parameters": []},
+        },
+        {
+            "attempt": 2, "retried": True,
+            "decision": {"schema_version": "1.0", "fact_package_id": "sha256:abc",
+                         "diagnosis": "second-attempt-diagnosis", "action": "keep_params",
+                         "hyperparameter_changes": {}, "training_overrides": {}, "evidence_ids": {}},
+            "decision_validation": {"valid": True, "error_code": None, "error_detail": None,
+                                    "referenced_fact_ids": []},
+            "semantic_validation": {"valid": True, "error_code": None, "reason_code": None,
+                                    "parameters": []},
+        },
+    ]
+    payload = _audit_payload("sess1", iterations=[iteration])
+    payload["schema_version"] = "1.2"
+    log_dir = Path(tmp_path) / "log"
+    audit_path = _write(log_dir / "tuning_audit_sess1.json", payload)
+    exp = _experiment(run_id="tuning:u1", run_name="iter01", audit_path=audit_path)
+
+    view = build_audit_view(exp, artifact_roots=_roots(tmp_path))
+    blob = json.dumps(view)
+
+    # attempts 不投影，含诊断/证据细节也不泄漏
+    assert "decision_attempts" not in blob
+    assert "first-attempt-diagnosis" not in blob
+    assert "second-attempt-diagnosis" not in blob
+    assert "training.metrics.mAP50" not in blob
+    assert "0.006" not in blob
+    # 顶层仍投影最终结果（只投影状态/原因/参数，不暴露 retried 等内部细节）
+    sv = view["iterations"][0]["semantic_validation"]
+    assert sv["valid"] is True
+    assert sv["error_code"] is None
+    assert sv["reason_code"] is None
+    assert "retried" not in sv

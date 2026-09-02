@@ -54,12 +54,30 @@ def _valid_decision():
     }
 
 
+def _valid_fact_package():
+    return {
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:test",
+        "task": "detect",
+        "reference_run": "train52",
+        "sources": {
+            "dataset_report": "dataset_report_1.json",
+            "training_report": "train52_report.json",
+            "metrics": "results.csv",
+            "params": "args.yaml",
+        },
+        "facts": [{"fact_id": "training.params.lr0", "value": 0.01, "source": "params"}],
+    }
+
+
 def _loop_mocks(monkeypatch, detect_dir, launch_side_effect):
     from auto_tune.modules.agent_engine.probe_monitor import ProbeDecision
 
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect_dir))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception",
                         lambda **k: {"dataset": {"total_images": 10}})
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_tuning_fact_package",
+                        lambda *a, **k: _valid_fact_package())
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
                         lambda *a, **k: _valid_decision())
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.validate_training_preflight",

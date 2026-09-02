@@ -61,10 +61,34 @@ def _make_reference(tmp_path, name="train53", epochs=30, patience=20):
     return detect
 
 
+def _valid_fact_package():
+    return {
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:test",
+        "task": "detect",
+        "reference_run": "train53",
+        "sources": {
+            "dataset_report": "dataset_report_ds_1.json",
+            "training_report": "train53_report.json",
+            "metrics": "results.csv",
+            "params": "args.yaml",
+        },
+        "facts": [{"fact_id": "training.params.lr0", "value": 0.01, "source": "params"}],
+    }
+
+
+def _mock_fact_package(monkeypatch):
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.build_tuning_fact_package",
+        lambda *a, **k: _valid_fact_package(),
+    )
+
+
 def _loop_setup(monkeypatch, tmp_path, perception, decision):
     detect = _make_reference(tmp_path)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception", lambda **k: perception)
+    _mock_fact_package(monkeypatch)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters", lambda *a, **k: decision)
     return detect
 
@@ -300,6 +324,7 @@ def test_auto_loop_long_reference_does_not_grow_name(tmp_path, monkeypatch):
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception",
                         lambda **k: _available_perception(long_ref))
+    _mock_fact_package(monkeypatch)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
                         lambda *a, **k: _decision(overrides={"epochs": 40, "patience": 30}))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.validate_training_preflight",
