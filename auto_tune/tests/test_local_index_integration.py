@@ -30,6 +30,22 @@ def _cfg(tmp_path):
     )
 
 
+def _valid_fact_package():
+    return {
+        "schema_version": "1.0",
+        "fact_package_id": "sha256:test",
+        "task": "detect",
+        "reference_run": "train38",
+        "sources": {
+            "dataset_report": "dataset_report_1.json",
+            "training_report": "train38_report.json",
+            "metrics": "results.csv",
+            "params": "args.yaml",
+        },
+        "facts": [{"fact_id": "training.params.lr0", "value": 0.01, "source": "params"}],
+    }
+
+
 def _make_run(tmp_path, name, csv_content="epoch,metrics/mAP50(B)\n1,0.2\n"):
     run_dir = tmp_path / "detect" / name
     run_dir.mkdir(parents=True)
@@ -153,6 +169,8 @@ def test_tuning_loop_forwards_runtime_run_id(tmp_path, monkeypatch):
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect_dir))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception",
                         lambda **k: {"dataset": {"total_images": 10}})
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_tuning_fact_package",
+                        lambda *a, **k: _valid_fact_package())
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
                         lambda *a, **k: {"diagnosis": "ok", "action": "keep",
                                          "hyperparameter_changes": {}, "training_overrides": {}})

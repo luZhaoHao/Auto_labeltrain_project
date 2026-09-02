@@ -48,6 +48,10 @@ auto_tune/config.yaml
 /_llm_diagnosis.txt
 /_vision_output.txt
 /docs/_render_leader_roadmap*/
+/.codex_*.py
+/.codex_doc_review_*/
+/.codex_doc_render_*/
+/tmp_detect/
 
 # Environment
 env/

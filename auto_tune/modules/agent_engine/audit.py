@@ -13,7 +13,7 @@ from typing import Any
 from auto_tune.modules.security.credentials import known_credentials
 from auto_tune.modules.security.redaction import REDACTED, redact_sensitive
 
-AUDIT_SCHEMA_VERSION = "1.0"
+AUDIT_SCHEMA_VERSION = "1.2"
 
 
 def utc_now_iso() -> str:
@@ -69,7 +69,26 @@ def _new_iteration(iteration: int) -> dict[str, Any]:
             "action": None,
             "hyperparameter_changes": {},
             "training_overrides": {},
+            "schema_version": None,
+            "fact_package_id": None,
+            "evidence_ids": {},
         },
+        "fact_package": None,
+        "decision_validation": {
+            "valid": None,
+            "error_code": None,
+            "error_detail": None,
+            "retried": False,
+            "referenced_fact_ids": [],
+        },
+        "semantic_validation": {
+            "valid": None,
+            "error_code": None,
+            "reason_code": None,
+            "retried": False,
+            "parameters": [],
+        },
+        "decision_attempts": [],
         "guardrails": {
             "valid": None,
             "warnings": [],
@@ -146,11 +165,24 @@ class TuningAuditSession:
 
     def update_iteration(self, iteration: int, **fields: object) -> None:
         record = self._get_iteration(iteration)
-        for key, value in fields.items():
+        for key in fields:
             if key not in record:
                 raise KeyError(f"Unknown audit iteration field: {key}")
-            record[key] = value
-        self.flush()
+        # Memory atomicity: apply the fields on deep copies (never on objects a
+        # caller still mutates), persist, and only commit the in-memory state
+        # when the flush succeeds. On a failed flush the record is rolled back
+        # to its pre-call state and the original write exception re-raised, so a
+        # later successful flush can never resurrect a modification that never
+        # reached disk.
+        snapshot = {key: copy.deepcopy(record[key]) for key in fields}
+        for key, value in fields.items():
+            record[key] = copy.deepcopy(value)
+        try:
+            self.flush()
+        except Exception:
+            for key, value in snapshot.items():
+                record[key] = value
+            raise
 
     def fail_iteration(
         self,

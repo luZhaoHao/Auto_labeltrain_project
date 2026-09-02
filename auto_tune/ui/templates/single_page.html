@@ -2592,6 +2592,22 @@ function closeReportView() {
   var modal = document.getElementById('reportViewModal');
   if (modal) modal.style.display = 'none';
 }
+function _semanticValidationText(r) {
+  if (!r || !r.semantic_validation) {
+    return '{{ _("Semantic validation not executed") }}';
+  }
+  var sv = r.semantic_validation;
+  if (sv.valid === true) {
+    return '{{ _("Semantic validation passed") }}';
+  }
+  if (sv.valid === false) {
+    var parts = ['{{ _("Semantic validation failed") }}'];
+    if (sv.reason_code) parts.push(sv.reason_code);
+    if (sv.parameter) parts.push(sv.parameter);
+    return parts.join(' / ');
+  }
+  return '{{ _("Semantic validation not executed") }}';
+}
 function openAuditView(runId) {
   var modal = document.getElementById('auditViewModal');
   if (!modal) return;
@@ -2661,7 +2677,8 @@ function _renderAuditView(body, d) {
       _experimentFieldLabel('executed_parameters'),
       'mAP50', 'mAP50-95', 'Precision', 'Recall',
       _experimentFieldLabel('metric_delta'),
-      _experimentFieldLabel('error_code')
+      _experimentFieldLabel('error_code'),
+      _experimentFieldLabel('semantic_validation')
     ], iterRows.map(function (r) {
       return [
         r.iteration,
@@ -2677,7 +2694,8 @@ function _renderAuditView(body, d) {
         r.metrics ? r.metrics.precision : null,
         r.metrics ? r.metrics.recall : null,
         r.metric_delta,
-        r.error_code
+        r.error_code,
+        _semanticValidationText(r)
       ];
     })));
     it.wrap.appendChild(scrollWrap);

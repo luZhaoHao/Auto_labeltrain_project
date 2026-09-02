@@ -601,6 +601,25 @@ def _project_iteration(it: dict) -> dict:
     metric_delta = _sanitize_params(_as_param_object(
         result.get("metric_delta"), "metric_delta"))
 
+    # Q1.2: minimal semantic-validation projection. Only the stable status,
+    # reason code and failed parameter leave the audit; the full fact package,
+    # raw response and per-parameter internals never reach the client. Old
+    # audits without the field project None ("未执行语义校验" on the UI side).
+    semantic_raw = it.get("semantic_validation")
+    semantic = None
+    if isinstance(semantic_raw, dict):
+        parameter = semantic_raw.get("parameter")
+        if parameter is None:
+            params = semantic_raw.get("parameters")
+            if isinstance(params, list) and params and isinstance(params[0], dict):
+                parameter = params[0].get("parameter")
+        semantic = {
+            "valid": semantic_raw.get("valid"),
+            "error_code": semantic_raw.get("error_code"),
+            "reason_code": semantic_raw.get("reason_code"),
+            "parameter": parameter,
+        }
+
     return {
         "iteration": it.get("iteration"),
         "status": it.get("status"),
@@ -618,6 +637,7 @@ def _project_iteration(it: dict) -> dict:
         "metric_delta": metric_delta,
         "run_name": execution.get("train_name"),
         "error_code": (error or {}).get("error_type"),
+        "semantic_validation": semantic,
     }
 
 
