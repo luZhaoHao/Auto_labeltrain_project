@@ -72,6 +72,7 @@ def _state_to_dict(state: RunState) -> dict:
         "last_event": last_event,
         "run_name": state.run_name,
         "terminal_reason": state.terminal_reason,
+        "finished_at": state.finished_at,
     }
 
 
@@ -229,6 +230,7 @@ def _parse_new(data: dict) -> RunState:
         last_event=last_event,
         run_name=data.get("run_name"),
         terminal_reason=data.get("terminal_reason"),
+        finished_at=data.get("finished_at"),
     )
 
 

@@ -34,8 +34,10 @@ class TuningRunController:
         broker,
         manager,
         loop_runner,
+        reservation_token=None,
     ):
         self.run_id = run_state.run_id
+        self.reservation_token = reservation_token
         self.state_file = state_file
         self.broker = broker
         self.manager = manager
@@ -251,3 +253,16 @@ class TuningRunController:
                     self.manager.retain(self.run_id, self)
                 except Exception:
                     pass
+                self._release_reservation()
+
+    def _release_reservation(self) -> None:
+        """Free the training slot only after the controller truly finished."""
+        token = self.reservation_token
+        if token is None:
+            return
+        try:
+            self.manager.release(token)
+        except Exception:
+            pass
+        finally:
+            self.reservation_token = None

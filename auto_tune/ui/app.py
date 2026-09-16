@@ -8,6 +8,7 @@ Provides three major pages:
 
 import json
 import os
+import re
 import time
 import secrets
 import asyncio
@@ -17,6 +18,7 @@ import tempfile
 import shutil
 import datetime
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -109,10 +111,21 @@ from auto_tune.modules.run_state.process_identity import (
     capture_process_identity,
     reconcile_persisted_state,
 )
+from auto_tune.modules.run_state.gate import (
+    evaluate_persisted_run_state,
+    hpo_storage_has_live_process,
+)
 from auto_tune.modules.run_state.events import EventBroker
-from auto_tune.modules.run_state.manager import _RUN_MANAGER
+from auto_tune.modules.run_state.manager import (
+    _RUN_MANAGER,
+    TrainingBusyError,
+)
 from auto_tune.modules.run_state.manual_controller import ManualRunController
 from auto_tune.modules.run_state.tuning_controller import TuningRunController
+from auto_tune.modules.hpo import HpoError, HpoRunner, HpoService
+from .hpo_api import create_hpo_router, safe_hpo_error_code
+from .hpo_reuse import resolve_hpo_verification
+from .hpo_training import TrainingSubmitDeps, create_hpo_training_router
 
 
 def _finalize_and_build_event(
@@ -189,6 +202,149 @@ def _remove_status_file() -> None:
 def _persist_run_state(state_file, state) -> None:
     """Atomically persist a run state; propagates RunStatePersistenceError."""
     write_run_state(state_file, state)
+
+
+def _hpo_storage_root() -> str:
+    """Controlled HPO study storage root (frozen below the existing log root)."""
+    return os.path.join("log", "hpo", "studies")
+
+
+def _busy_training_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "已有训练在运行（普通训练/大模型调参/HPO），请先停止或等待完成",
+         "error_code": "RUN_ALREADY_ACTIVE"},
+        status_code=409,
+    )
+
+
+def _reconcile_failed_response() -> JSONResponse:
+    """Controlled 503 for a failed terminal write-back (no exception detail).
+
+    Deliberately carries no path, PID, command or original message: the caller
+    only needs to know that the slot could not be proven free.
+    """
+    return JSONResponse(
+        {"error": "无法确认上一训练已安全收敛，本次未启动训练",
+         "error_code": "RUN_STATE_RECONCILE_FAILED",
+         "next_action": "请检查日志目录写入权限、磁盘空间与运行状态记录后重试；"
+                        "在确认上一训练已结束后系统才会允许启动新训练。"},
+        status_code=503,
+    )
+
+
+def _assert_training_slot_free() -> JSONResponse | None:
+    """Real-training mutual exclusion across manual/tuning/hpo + restart facts.
+
+    Returns a 409 response when the single real-training slot is occupied by a
+    live in-memory controller, by an already-taken reservation, OR by a leftover
+    persisted ``starting``/``running`` record whose process may still be alive
+    (restart). A record that is provably gone (MISSING/MISMATCH) is reconciled to
+    a terminal ``interrupted`` state — and that write-back must *succeed* before
+    a new run is allowed. A failed write-back returns 503
+    (``RUN_STATE_RECONCILE_FAILED``) instead of silently freeing the slot: the
+    old run may still be alive and the record would still claim it is running.
+
+    The reservation check is not redundant with the controller check: starting a
+    run takes the reservation *before* it creates/registers its controller, so a
+    gate that only looked at active controllers would let a second caller slip
+    into that atomic gap.
+    """
+    if _RUN_MANAGER.reservation_owner() is not None:
+        return _busy_training_response()
+    if _RUN_MANAGER.active_train() is not None:
+        return _busy_training_response()
+    for run_kind, filename in (("manual", "training_running.json"),
+                               ("tuning", "tuning_running.json")):
+        state_file = os.path.join("log", filename)
+        state = read_run_state(state_file, run_kind=run_kind)
+        decision = evaluate_persisted_run_state(state)
+        if decision.persist is not None:
+            try:
+                _persist_run_state(state_file, decision.persist)
+            except RunStatePersistenceError:
+                # Conservatively block: the orphaned record still says the run
+                # is alive, and nothing proves the process is gone.
+                return _reconcile_failed_response()
+        if decision.blocked:
+            return _busy_training_response()
+    if hpo_storage_has_live_process(_hpo_storage_root()):
+        # A leftover RUNNING HPO subprocess may still be alive.
+        return _busy_training_response()
+    return None
+
+
+def _reserve_or_busy(run_kind: str, run_id: str) -> tuple[str | None, JSONResponse | None]:
+    """Try to reserve the training slot; returns (token, busy_response)."""
+    try:
+        token = _RUN_MANAGER.reserve(run_kind, run_id)
+        return token, None
+    except TrainingBusyError:
+        return None, _busy_training_response()
+
+
+def _release_reservation(token) -> None:
+    if token is None:
+        return
+    try:
+        _RUN_MANAGER.release(token)
+    except Exception:
+        pass
+
+
+_TRAIN_DIR_RE = re.compile(r"^train(\d+)$")
+_MAX_TRAIN_NAME_PROBES = 1000
+
+
+def _next_train_index(detect_dir: str) -> int:
+    """Highest existing ``trainN`` index under ``detect_dir`` (read-only)."""
+    try:
+        names = os.listdir(detect_dir)
+    except OSError:
+        return 0
+    max_n = 0
+    for name in names:
+        m = _TRAIN_DIR_RE.match(name)
+        if m and os.path.isdir(os.path.join(detect_dir, name)):
+            max_n = max(max_n, int(m.group(1)))
+    return max_n
+
+
+def _pick_train_name(detect_dir: str) -> str:
+    """Next free ``trainN`` name; creates nothing and never overwrites.
+
+    A name is skipped while *any* file-system entry already uses it, so a
+    leftover file named ``train7`` can never be silently clobbered by a run.
+    """
+    n = _next_train_index(detect_dir)
+    for _ in range(_MAX_TRAIN_NAME_PROBES):
+        candidate = f"train{n + 1}"
+        if not os.path.exists(os.path.join(detect_dir, candidate)):
+            return candidate
+        n += 1
+    raise OSError("no free training directory name available")
+
+
+def _create_train_dirs(detect_dir: str, train_dir: str) -> None:
+    """Create the run directory (only ever called with the slot reserved)."""
+    os.makedirs(detect_dir, exist_ok=True)
+    os.mkdir(train_dir)
+
+
+def _train_dir_error_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "训练目录创建失败，未启动训练",
+         "error_code": "TRAIN_DIR_CREATE_FAILED",
+         "next_action": "请检查 Detect 目录权限、磁盘空间与同名占用后重试。"},
+        status_code=500,
+    )
+
+
+def _run_dir_write_error_response(error_code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": message, "error_code": error_code,
+         "next_action": "系统未启动训练，请检查运行目录写入权限后重试。"},
+        status_code=500,
+    )
 
 
 _RUN_STATE_DETAIL_THROTTLE = 10
@@ -894,6 +1050,48 @@ def _get_latest_suggestion(tuning_history, training):
     return None
 
 
+def _monitor_latest_projection(training, experiment_history):
+    """确定性投影“最近有效训练”，供训练监控首屏渲染（P1 返修）。
+
+    顺序复用服务端既有规则：``experiment_history`` 已是统一实验索引的确定性顺序
+    （SQLite 按 ``finished_at`` 降序，见 ``ExperimentQuery``）。这里取其中最新一条
+    已完成、有指标、且在当前训练报告 ``training.runs`` 里有对应 run 的记录，用报告
+    里的 epochs 与最终指标（同一 run 的权威事实）。找不到时返回 ``None``，页面诚实
+    显示“—”；绝不依赖 Jinja for 循环里的局部变量逸出，也不按字典遍历顺序猜测。
+    """
+    runs = (training or {}).get("runs") or {}
+    for record in experiment_history or ():
+        if not isinstance(record, dict):
+            continue
+        run_name = record.get("run_name")
+        if record.get("status") != "completed" or not run_name or run_name not in runs:
+            continue
+        entry = runs.get(run_name) or {}
+        metrics = (entry.get("results") or {}).get("final_metrics") or {}
+        if not metrics:
+            continue
+        args = entry.get("args") or {}
+        mapping = (
+            ("mAP50", "metrics/mAP50(B)"),
+            ("mAP50_95", "metrics/mAP50-95(B)"),
+            ("precision", "metrics/precision(B)"),
+            ("recall", "metrics/recall(B)"),
+        )
+        projection = {"run_name": run_name,
+                      "epochs": args.get("epochs")}
+        for key, source_key in mapping:
+            raw = metrics.get(source_key)
+            if raw is None or raw == "":
+                projection[key] = None
+                continue
+            try:
+                projection[key] = float(raw)
+            except (TypeError, ValueError):
+                projection[key] = None
+        return projection
+    return None
+
+
 def _get_current_args(training):
     """Get the current hyperparameter values from the best training run."""
     if training and training.get("runs"):
@@ -932,6 +1130,9 @@ def _common_context():
     return {
         "dataset": dataset,
         "training": training,
+        # 训练监控首屏的“最近有效训练”由服务端确定性选出（不靠模板循环变量）
+        "monitor_latest": _monitor_latest_projection(
+            training, data["experiment_history"]),
         "project": project,
         "tuning_history": tuning_history,
         "experiment_history": data["experiment_history"],
@@ -989,6 +1190,37 @@ async def training_monitor_page(request: Request):
     ctx = _common_context()
     html = _render("single_page.html", request, active_page="training_monitor", **ctx)
     return HTMLResponse(html)
+
+
+@app.get("/static/hpo.js")
+async def hpo_static_script():
+    """Serve the HPO front-end script from the packaged ui/static directory."""
+    from fastapi.responses import Response
+
+    script_path = Path(__file__).parent / "static" / "hpo.js"
+    try:
+        body = script_path.read_text(encoding="utf-8")
+    except OSError:
+        return Response(status_code=404, content="hpo.js not found")
+    return Response(content=body, media_type="application/javascript")
+
+
+@app.get("/static/monitor.js")
+async def monitor_static_script():
+    """Serve the shared training-monitor script (same packaged ui/static dir).
+
+    The module is a separate file so both the ordinary training stream and the
+    reconnect stream share one result projection, and so the real front-end
+    logic can be executed directly by tests/js/minidom.js.
+    """
+    from fastapi.responses import Response
+
+    script_path = Path(__file__).parent / "static" / "monitor.js"
+    try:
+        body = script_path.read_text(encoding="utf-8")
+    except OSError:
+        return Response(status_code=404, content="monitor.js not found")
+    return Response(content=body, media_type="application/javascript")
 
 
 @app.get("/history", response_class=HTMLResponse)
@@ -1906,6 +2138,15 @@ async def start_tuning(request: Request):
     reference_run = body.get("reference_run") or None
     max_retries = body.get("max_retries", 3)
     mode = body.get("mode", "dry_run")
+    # Only the historical legal values may reach this endpoint; ``train`` is a
+    # legacy real-tuning value still used by existing callers/tests. Any unknown
+    # value (including ``hpo``) must never fall through to the LLM tuning branch;
+    # HPO has its own route and controller.
+    if mode not in ("dry_run", "keep_params", "full", "train"):
+        return JSONResponse(
+            {"error": f"未知训练模式: {mode}", "error_code": "INVALID_MODE"},
+            status_code=422,
+        )
     skip_execute = mode == "dry_run"
     keep_params = mode == "keep_params"
     auto_analyze = body.get("auto_analyze", False)
@@ -1954,13 +2195,19 @@ async def start_tuning(request: Request):
             "error": "无参考训练，dry-run 计划不可执行",
         }
 
-    # Concurrency gate: a second active tuning run is rejected with 409.
+    # A second active tuning run is rejected for every mode (legacy behavior).
     if _RUN_MANAGER.active_tuning() is not None:
         return JSONResponse(
             {"error": "已有活动调优运行，请先停止或等待完成",
              "error_code": "RUN_ALREADY_ACTIVE"},
             status_code=409,
         )
+    # Real strategies (keep_params/full) share the unified single training slot
+    # with ordinary training and HPO. dry_run is a preview and never reserves.
+    if not skip_execute:
+        _gate = _assert_training_slot_free()
+        if _gate is not None:
+            return _gate
 
     global _tuning_cancel_event, _current_tuning_train_proc
     _tuning_cancel_event.clear()
@@ -1969,10 +2216,16 @@ async def start_tuning(request: Request):
     # Create the unified tuning run identity and persist it before anything
     # starts; the first write must succeed or the loop never launches.
     run_state = new_run_state("tuning")
+    reservation_token = None
+    if not skip_execute:
+        reservation_token, _busy = _reserve_or_busy("tuning", run_state.run_id)
+        if _busy is not None:
+            return _busy
     _tuning_status_file = os.path.join("log", "tuning_running.json")
     try:
         _persist_run_state(_tuning_status_file, run_state)
     except RunStatePersistenceError as exc:
+        _release_reservation(reservation_token)
         return JSONResponse(
             {"error": f"运行状态写入失败，未启动调优: {exc}",
              "error_code": "RUN_STATE_PERSIST_FAILED"},
@@ -2009,6 +2262,7 @@ async def start_tuning(request: Request):
         broker=broker,
         manager=_RUN_MANAGER,
         loop_runner=loop_runner,
+        reservation_token=reservation_token,
     )
     _RUN_MANAGER.register(controller)
 
@@ -2036,7 +2290,11 @@ async def start_tuning(request: Request):
             "error": reference_dataset_error["error"],
         })
 
-    controller.start()
+    try:
+        controller.start()
+    except Exception:
+        _release_reservation(reservation_token)
+        raise
     _invalidate_cache("load_data")
 
     return StreamingResponse(
@@ -3028,6 +3286,186 @@ async def analyze_training_folder(request: Request):
 
 # ── First-time Training API ──
 
+_HPO_REUSE_STATUS = {
+    "HPO_NO_SUCCESS": 409,
+    "HPO_SOURCE_INVALID": 409,
+    "HPO_NOT_FOUND": 409,
+    "HPO_EXECUTION_CONFLICT": 409,
+    "HPO_BINDING_MISMATCH": 409,
+    "HPO_VERSION_MISMATCH": 409,
+    "HPO_CORRUPT_STUDY": 500,
+    "HPO_CORRUPT_EXECUTION": 500,
+}
+
+
+def _hpo_reuse_error_response(exc: HpoError) -> JSONResponse:
+    """Stable, redacted error for a best-config verification start.
+
+    Only the stable code and fixed text are returned: the underlying
+    ``exc.message`` can carry file-system detail from the storage layer and is
+    never assumed display-safe.
+    """
+    code = safe_hpo_error_code(exc.code)
+    status = _HPO_REUSE_STATUS.get(code, 500)
+    message = {
+        409: "该最佳配置当前不可用于验证。",
+        500: "研究记录暂不可用。",
+    }[status]
+    next_action = {
+        409: "请刷新研究结果后重试；系统未启动训练。",
+        500: "系统未启动训练，请稍后重试。",
+    }[status]
+    return JSONResponse(
+        {"error_code": code, "error": message, "next_action": next_action},
+        status_code=status,
+    )
+
+
+async def _start_hpo_verification_training(body: dict):
+    """Start one fixed-config verification run from an HPO source study/trial.
+
+    Only ``source_hpo`` may be present; every effective parameter (six search
+    params + fixed conditions) is rebuilt server-side from the authoritative
+    HPO records. The bound **initial** weights and snapshot are used, a new run
+    directory is created and the HPO study/execution/ranking are never touched.
+    """
+    import os as _os
+    import yaml as _yaml
+
+    from auto_tune.modules.agent_engine.executor import (
+        find_detect_dir,
+        resolve_yolo_executable,
+    )
+
+    source = body.get("source_hpo")
+    extra = [key for key in body if key != "source_hpo"]
+    if extra:
+        return JSONResponse(
+            {"error": "固定配置验证不能同时提交自由训练参数",
+             "error_code": "MIXED_TRAINING_PARAMS",
+             "next_action": "请只提交来源研究/试验，其余参数由系统重建。"},
+            status_code=422,
+        )
+    if not isinstance(source, dict) or set(source.keys()) - {"study_id", "trial_id"}:
+        return JSONResponse(
+            {"error": "来源格式不合法", "error_code": "INVALID_SOURCE_HPO",
+             "next_action": "请重新载入最佳配置后再验证。"},
+            status_code=422,
+        )
+    try:
+        verified = resolve_hpo_verification(
+            _hpo_service, _hpo_runner, source.get("study_id"), source.get("trial_id"))
+    except HpoError as exc:
+        return _hpo_reuse_error_response(exc)
+
+    effective = verified.effective
+    data_yaml = effective["data"]
+    model = effective["model"]
+    epochs = int(effective["epochs"])
+
+    # Read-only candidate name: an invalid/forged source or a busy slot must
+    # leave the Detect tree exactly as it was (no trainN, no args.yaml, no
+    # hpo_source.json, no training process).
+    detect_dir = find_detect_dir()
+    train_name = _pick_train_name(detect_dir)
+
+    run_state = new_run_state("manual", run_name=train_name)
+    reservation_token, _busy = _reserve_or_busy("manual", run_state.run_id)
+    if _busy is not None:
+        return _busy
+    _state_file = os.path.join("log", "training_running.json")
+
+    # Same ordering contract as ordinary training: the run directory and its
+    # files are written while the slot is held, before the run-state record, so
+    # no failure can leave a persisted `starting` record behind.
+    train_name = _pick_train_name(detect_dir)  # re-check under the held slot
+    train_dir = _os.path.join(detect_dir, train_name)
+    try:
+        _create_train_dirs(detect_dir, train_dir)
+    except OSError:
+        _release_reservation(reservation_token)
+        return _train_dir_error_response()
+    if train_name != run_state.run_name:
+        run_state = replace(run_state, run_name=train_name)
+
+    params = dict(effective)
+    params["data"] = _os.path.abspath(data_yaml)
+    params["model"] = model
+    params["name"] = train_name
+    params["project"] = _os.path.abspath(detect_dir)
+    params["exist_ok"] = "True"
+    try:
+        with open(_os.path.join(train_dir, "args.yaml"), "w", encoding="utf-8") as _f:
+            _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True,
+                       sort_keys=False)
+    except OSError:
+        _release_reservation(reservation_token)
+        return _run_dir_write_error_response(
+            "ARGS_PERSIST_FAILED", "训练参数文件写入失败，未启动验证训练")
+
+    # Source metadata must be traceable BEFORE the run starts.
+    try:
+        with open(_os.path.join(train_dir, "hpo_source.json"), "w",
+                  encoding="utf-8") as _sf:
+            json.dump(verified.source_public, _sf, ensure_ascii=False, indent=2)
+    except OSError:
+        _release_reservation(reservation_token)
+        return JSONResponse(
+            {"error": "来源元数据写入失败，未启动验证训练",
+             "error_code": "SOURCE_METADATA_PERSIST_FAILED"},
+            status_code=500,
+        )
+
+    try:
+        _persist_run_state(_state_file, run_state)
+    except RunStatePersistenceError as exc:
+        _release_reservation(reservation_token)
+        return JSONResponse(
+            {"error": f"运行状态写入失败，未启动验证训练: {exc}",
+             "error_code": "RUN_STATE_PERSIST_FAILED"},
+            status_code=500,
+        )
+
+    cmd = [resolve_yolo_executable(), "train"]
+    for _k, _v in params.items():
+        cmd.append(f"{_k}={_v}")
+
+    broker = EventBroker(run_state.run_id)
+    controller = ManualRunController(
+        run_state=run_state,
+        state_file=_state_file,
+        cmd=cmd,
+        params=params,
+        train_name=train_name,
+        train_dir=train_dir,
+        data_yaml=data_yaml,
+        model=model,
+        epochs=epochs,
+        log_path=os.path.join(train_dir, "training.log"),
+        finalize_cb=_manual_finalize_cb,
+        broker=broker,
+        manager=_RUN_MANAGER,
+        reservation_token=reservation_token,
+    )
+    controller.source_hpo = verified.source_public
+    _RUN_MANAGER.register(controller)
+    try:
+        controller.start()
+    except Exception:
+        _release_reservation(reservation_token)
+        raise
+    _invalidate_cache("load_data")
+    return StreamingResponse(
+        _run_sse(broker, controller, 0),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/training/start")
 async def start_first_training(request: Request):
     """Start a first-time YOLO training.
@@ -3042,13 +3480,15 @@ async def start_first_training(request: Request):
 
     from auto_tune.modules.agent_engine.executor import find_detect_dir
 
-    # Concurrency gate: a second active manual run is rejected with 409.
-    if _RUN_MANAGER.active_manual() is not None:
-        return JSONResponse(
-            {"error": "已有活动训练运行，请先停止或等待完成",
-             "error_code": "RUN_ALREADY_ACTIVE"},
-            status_code=409,
-        )
+    # Unified gate: ordinary training, LLM tuning and HPO share one real
+    # training slot; leftover restart records also occupy it (H1.3).
+    _gate = _assert_training_slot_free()
+    if _gate is not None:
+        return _gate
+
+    # Best-config verification: parameters are rebuilt from the HPO source.
+    if "source_hpo" in body:
+        return await _start_hpo_verification_training(body)
 
     # Read params from request body or config.yaml
     training_cfg = APP_CONFIG.get("training", {})
@@ -3076,32 +3516,32 @@ async def start_first_training(request: Request):
             status_code=400,
         )
 
-    # Determine directories + next train name synchronously so the very first
-    # run-state write can be validated before any SSE stream or subprocess.
-    import re as _re
+    # The candidate run name is computed read-only: nothing is created on disk
+    # until this request actually owns the single training slot, so a losing
+    # racer leaves no empty directory, no args file and no training process
+    # behind (and cannot shift the historical trainN numbering).
     detect_dir = find_detect_dir()
-    _os.makedirs(detect_dir, exist_ok=True)
-    max_n = 0
-    for _d in _os.listdir(detect_dir):
-        if _os.path.isdir(_os.path.join(detect_dir, _d)):
-            _m = _re.match(r"^train(\d+)$", _d)
-            if _m:
-                max_n = max(max_n, int(_m.group(1)))
-    train_name = f"train{max_n + 1}"
-    train_dir = _os.path.join(detect_dir, train_name)
-    _os.makedirs(train_dir, exist_ok=True)
+    train_name = _pick_train_name(detect_dir)
 
-    # The very first state write must succeed or training never starts.
     run_state = new_run_state("manual", run_name=train_name)
+    reservation_token, _busy = _reserve_or_busy("manual", run_state.run_id)
+    if _busy is not None:
+        return _busy
     _state_file = os.path.join("log", "training_running.json")
+
+    # Everything below runs only while this request owns the slot. The run
+    # directory (and its files) are created before the first run-state write so
+    # a failed write can never leave a persisted `starting` record that the
+    # restart gate would have to treat as an unresolvable live process.
+    train_name = _pick_train_name(detect_dir)  # re-check under the held slot
+    train_dir = _os.path.join(detect_dir, train_name)
     try:
-        _persist_run_state(_state_file, run_state)
-    except RunStatePersistenceError as exc:
-        return JSONResponse(
-            {"error": f"运行状态写入失败，未启动训练: {exc}",
-             "error_code": "RUN_STATE_PERSIST_FAILED"},
-            status_code=500,
-        )
+        _create_train_dirs(detect_dir, train_dir)
+    except OSError:
+        _release_reservation(reservation_token)
+        return _train_dir_error_response()
+    if train_name != run_state.run_name:
+        run_state = replace(run_state, run_name=train_name)
 
     # Build params + args.yaml + the exact command once.
     import yaml as _yaml
@@ -3120,8 +3560,27 @@ async def start_first_training(request: Request):
         "save": True,
         "device": "0",
     }
-    with open(_os.path.join(train_dir, "args.yaml"), "w", encoding="utf-8") as _f:
-        _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    try:
+        with open(_os.path.join(train_dir, "args.yaml"), "w", encoding="utf-8") as _f:
+            _yaml.dump(params, _f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    except OSError:
+        _release_reservation(reservation_token)
+        return _run_dir_write_error_response(
+            "ARGS_PERSIST_FAILED", "训练参数文件写入失败，未启动训练")
+
+    # The first state write must succeed or training never starts. The
+    # reservation token is bound to this controller and released only when the
+    # controller truly finishes (never on an SSE disconnect or stop request).
+    try:
+        _persist_run_state(_state_file, run_state)
+    except RunStatePersistenceError as exc:
+        _release_reservation(reservation_token)
+        return JSONResponse(
+            {"error": f"运行状态写入失败，未启动训练: {exc}",
+             "error_code": "RUN_STATE_PERSIST_FAILED"},
+            status_code=500,
+        )
+
     from auto_tune.modules.agent_engine.executor import resolve_yolo_executable
     cmd = [resolve_yolo_executable(), "train"]
     for _k, _v in params.items():
@@ -3144,9 +3603,14 @@ async def start_first_training(request: Request):
         finalize_cb=_manual_finalize_cb,
         broker=broker,
         manager=_RUN_MANAGER,
+        reservation_token=reservation_token,
     )
     _RUN_MANAGER.register(controller)
-    controller.start()
+    try:
+        controller.start()
+    except Exception:
+        _release_reservation(reservation_token)
+        raise
     _invalidate_cache("load_data")
 
     return StreamingResponse(
@@ -3250,6 +3714,494 @@ async def run_stream(run_id: str, after_seq: int = Query(0)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+# ── H1.3 HPO API mount (prefix /api/hpo) ──────────────────────────
+
+_HPO_SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _valid_count(value) -> bool:
+    """A real non-negative integer count (booleans are never counts)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _resolve_hpo_snapshot(snapshot_id: str):
+    """Resolve an explicit snapshot_id to its controlled published directory.
+
+    The snapshot id is looked up only under the controlled snapshot root and is
+    never replaced by the global ``latest_dataset``. Full content validation is
+    performed later by ``HpoService.create_study``; this resolver only locates
+    and sanity-checks identity.
+    """
+    if not isinstance(snapshot_id, str) or not _HPO_SNAPSHOT_ID_RE.fullmatch(snapshot_id):
+        raise HpoError("HPO_INVALID_CONFIG", "快照 ID 格式不合法")
+    snap_dir = Path(DATASET_SNAPSHOT_ROOT) / snapshot_id
+    if not snap_dir.is_dir():
+        raise HpoError("HPO_INVALID_CONFIG", "指定快照不存在或已失效")
+    try:
+        manifest = json.loads((snap_dir / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("snapshot_id") != snapshot_id:
+            raise HpoError("HPO_INVALID_CONFIG", "快照 manifest 身份不一致")
+    except (OSError, ValueError) as exc:
+        raise HpoError("HPO_INVALID_CONFIG", "快照 manifest 无法读取") from exc
+    return snap_dir
+
+
+def list_published_snapshots(root=None, include_source_root=False) -> list[dict]:
+    """Read-only published-snapshot listing for the HPO snapshot selector.
+
+    Only the controlled snapshot root is scanned; a candidate must be a
+    directory whose name is a full 64-hex snapshot id and whose manifest carries
+    the same identity. An unreadable/corrupt snapshot stays **visible** but is
+    never selectable, so the user sees the real state instead of a silently
+    shortened list. No absolute path, no global ``latest_dataset`` fallback and
+    no data substitution: selecting an older legal snapshot is allowed even when
+    nothing is registered as latest.
+
+    ``image_count`` follows the manifest count contract: the legal sample total
+    is ``train_count + val_count`` (equal to the manifest ``samples`` length),
+    and ``background_count`` is a **subset** of those samples — it is reported
+    separately and never added to the total.
+    """
+    base = Path(root) if root is not None else Path(DATASET_SNAPSHOT_ROOT)
+    rows: list[dict] = []
+    if not base.is_dir():
+        return rows
+    try:
+        children = sorted(base.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return rows
+    for child in children:
+        if not _HPO_SNAPSHOT_ID_RE.fullmatch(child.name) or not child.is_dir():
+            continue
+        row = {
+            "snapshot_id": child.name,
+            "short_id": child.name[:8],
+            "readable": False,
+            "selectable": False,
+            "reason_code": "SNAPSHOT_MANIFEST_INVALID",
+            "dataset_name": None,
+            "created_at": None,
+            "image_count": None,
+            "train_count": None,
+            "val_count": None,
+            "background_count": None,
+        }
+        try:
+            manifest = json.loads(
+                (child / "manifest.json").read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("snapshot_id") != child.name:
+                raise ValueError("snapshot identity mismatch")
+            source_root = manifest.get("source_root")
+            train_count = manifest.get("train_count")
+            val_count = manifest.get("val_count")
+            background = manifest.get("background_count")
+            if not _valid_count(train_count) or not _valid_count(val_count) \
+                    or not _valid_count(background):
+                raise ValueError("snapshot counts are not non-negative integers")
+            samples = manifest.get("samples")
+            # 合法样本总数以 train+val 为准（manifest 的 samples 长度契约）；
+            # background 是 train/val 的子集，绝不与总数相加。
+            if not isinstance(samples, list) or len(samples) != train_count + val_count:
+                raise ValueError("snapshot sample count does not match train+val")
+            if background > train_count + val_count:
+                raise ValueError("snapshot background count exceeds train+val")
+            row.update({
+                "readable": True,
+                "selectable": True,
+                "reason_code": None,
+                "dataset_name": (os.path.basename(os.path.normpath(source_root))
+                                 if isinstance(source_root, str) and source_root else None),
+                "created_at": manifest.get("created_at"),
+                "train_count": train_count,
+                "val_count": val_count,
+                "background_count": background,
+                "image_count": train_count + val_count,
+            })
+            if include_source_root:
+                row["source_root"] = (os.path.abspath(os.path.normpath(source_root))
+                                      if isinstance(source_root, str) and source_root
+                                      else None)
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+        rows.append(row)
+    readable = [r for r in rows if r["readable"]]
+    unreadable = [r for r in rows if not r["readable"]]
+    readable.sort(key=lambda r: (r["created_at"] or "", r["snapshot_id"]), reverse=True)
+    return readable + unreadable
+
+
+_HPO_MODEL_SCAN_LIMIT = 100
+
+
+def list_local_models() -> list[dict]:
+    """Minimal local ``.pt`` listing for the HPO weight selector.
+
+    Scans only controlled roots: the project working directory (non-recursive)
+    and the Detect directory with its per-run ``weights`` folders. It never
+    walks the system, never follows links/reparse points, and is bounded in
+    both depth and entry count. The absolute path is returned because the user
+    must confirm which local file gets bound (the create API re-validates and
+    hashes it); selection alone never grants trust.
+
+    Each row carries ``kind`` (``initial`` vs ``training_artifact``) and a
+    human ``origin`` so a training product (``trainN/weights/best.pt``) is never
+    presented as if it were the same thing as an initial weight.
+    """
+    candidates: list[tuple[Path, str, str]] = []
+    try:
+        for path in sorted(Path(os.getcwd()).glob("*.pt")):
+            candidates.append((path, "initial", "项目根目录"))
+    except OSError:
+        pass
+    detect_dir = Path(_hpo_detect_dir())
+    try:
+        for path in sorted(detect_dir.glob("*.pt")):
+            candidates.append((path, "initial", "Detect 目录"))
+        for run_dir in sorted(detect_dir.iterdir(), key=lambda p: p.name)[:200]:
+            if not run_dir.is_dir():
+                continue
+            for path in sorted(run_dir.glob("weights/*.pt")):
+                candidates.append(
+                    (path, "training_artifact", f"训练产物 {run_dir.name}/weights"))
+    except OSError:
+        pass
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for path, kind, origin in candidates:
+        if len(rows) >= _HPO_MODEL_SCAN_LIMIT:
+            break
+        try:
+            if _is_reparse_like(path) or not path.is_file():
+                continue
+            resolved = str(Path(os.path.abspath(str(path))))
+            if resolved.lower() in seen:
+                continue
+            size_mb = round(path.stat().st_size / (1024 * 1024), 1)
+        except OSError:
+            continue
+        seen.add(resolved.lower())
+        rows.append({"name": path.name, "path": resolved, "size_mb": size_mb,
+                     "kind": kind, "origin": origin})
+    return rows
+
+
+def _is_reparse_like(path: Path) -> bool:
+    try:
+        if os.path.islink(path):
+            return True
+    except OSError:
+        return False
+    try:
+        from auto_tune.modules.hpo.storage import _is_reparse_point
+
+        return bool(_is_reparse_point(Path(path)))
+    except Exception:
+        return False
+
+
+def _validate_hpo_model(value):
+    """Map a local initial-weight file to a validated absolute path.
+
+    Link/reparse and regular-file checks plus content hashing are enforced by
+    ``HpoService.create_study``; this resolver only requires an existing local
+    ``.pt`` file so input errors surface early and nothing is auto-downloaded.
+    """
+    if not isinstance(value, str) or not value:
+        raise HpoError("HPO_INVALID_CONFIG", "请选择本地初始权重文件")
+    norm = os.path.abspath(os.path.normpath(value))
+    path = Path(norm)
+    if path.suffix.lower() != ".pt" or not path.is_file():
+        raise HpoError("HPO_INVALID_CONFIG", "本地初始权重不存在或不是 .pt 文件")
+    return norm
+
+
+_hpo_service = HpoService(Path(_hpo_storage_root()))
+_hpo_runner = HpoRunner(Path(_hpo_storage_root()), Path(find_detect_dir()), Path("log"))
+
+
+def _hpo_training_deps():
+    """Build the ordinary-training dependencies for a formal HPO run.
+
+    Resolved per request so the current controlled Detect directory, executable
+    and app-level callables are always used. The controller lifecycle stays in
+    ``ManualRunController``; this only wires the shared pieces.
+    """
+    from auto_tune.modules.agent_engine.executor import (
+        find_detect_dir as _find_detect_dir,
+        resolve_yolo_executable as _resolve_yolo_executable,
+    )
+
+    return TrainingSubmitDeps(
+        run_manager=_RUN_MANAGER,
+        detect_dir=_find_detect_dir,
+        resolve_executable=_resolve_yolo_executable,
+        new_run_state=new_run_state,
+        broker_factory=EventBroker,
+        manual_controller_cls=ManualRunController,
+        finalize_cb=_manual_finalize_cb,
+        pick_train_name=_pick_train_name,
+        create_train_dirs=_create_train_dirs,
+        persist_run_state=_persist_run_state,
+        reserve=_reserve_or_busy,
+        release=_release_reservation,
+        gate=_assert_training_slot_free,
+        log_dir="log",
+        state_file=os.path.join("log", "training_running.json"),
+        invalidate_cache=_invalidate_cache,
+        run_state_replace=lambda state, name: replace(state, run_name=name),
+    )
+
+
+def _hpo_detect_dir() -> str:
+    from auto_tune.modules.agent_engine.executor import find_detect_dir as _fdd
+
+    return _fdd()
+
+
+# ── HPO 服务端权威默认绑定（少让用户选；缺失/不合法才要求一次必要选择）──
+#
+# 默认值只来自**受控事实**：已登记数据集的合法快照、当前项目/训练配置里的合法本地
+# 权重、当前普通训练配置。任何“配置了但不合法”的值都原样返回并附稳定 warning，
+# 绝不静默替换成别的值；任何“缺失”才回退到既有默认。
+
+_HPO_SEARCH_DEFAULTS = {"sampler": "tpe", "budget": 10, "epochs": 30, "seed": 42,
+                        "timeout_seconds": 3600,
+                        # 评价模式：UI 默认全面模式（后端契约仍兼容旧单指标语义）
+                        "evaluation_mode": "comprehensive"}
+_HPO_BATCH_RANGE = (1, 256)
+_HPO_IMGSZ_RANGE = (32, 2048)
+_HPO_EPOCHS_RANGE = (1, 1000)
+_HPO_DEVICE_RE = re.compile(r"^(?:cpu|[0-9]|[1-5][0-9]|6[0-3])$")
+
+
+def _cuda_available() -> bool:
+    """只读探测本机是否有可用的 CUDA 设备；任何失败都视为不可用。"""
+    try:
+        import torch
+    except Exception:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _available_gpus() -> list[int]:
+    """只读投影已探测到的 GPU 编号；不可用时为空列表（绝不猜测编号）。"""
+    if not _cuda_available():
+        return []
+    try:
+        import torch
+
+        count = int(torch.cuda.device_count())
+    except Exception:
+        count = 0
+    if count <= 0:
+        # is_available() 为真但拿不到计数时，仍允许用户显式选择 GPU 0
+        return [0]
+    return list(range(min(count, 64)))
+
+
+def _default_device(raw) -> tuple[str, dict | None]:
+    """计算设备默认值：配置优先；缺失时 GPU 可用默认 ``0``，否则 CPU + 提示。
+
+    在 GPU 可用的本机绝不静默回退 CPU；无 GPU 时明确给出可操作提示。
+    """
+    if raw is not None:
+        if isinstance(raw, str) and _HPO_DEVICE_RE.fullmatch(raw.strip()):
+            return raw.strip(), None
+        return raw, {"code": "CONFIG_VALUE_INVALID", "field": "device"}
+    if _cuda_available():
+        return "0", None
+    return "cpu", {"code": "GPU_NOT_AVAILABLE_CPU_FALLBACK",
+                   "message": "未检测到可用 GPU，已使用 CPU；如需 GPU 训练请在“计算设备”中填写显卡编号。"}
+
+
+def _valid_int_in(value, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _same_local_path(left: str, right: str) -> bool:
+    try:
+        return (os.path.normcase(os.path.normpath(os.path.abspath(left)))
+                == os.path.normcase(os.path.normpath(os.path.abspath(right))))
+    except (OSError, ValueError):
+        return False
+
+
+def _default_snapshot_binding() -> tuple[dict | None, str, bool]:
+    """Return ``(snapshot_row, reason_code, registered)`` for the current dataset.
+
+    Only two facts may auto-bind: the **registered** snapshot when it validates,
+    or a legal snapshot whose original ``source_root`` equals the registered
+    dataset path. A snapshot belonging to another original directory is never
+    auto-selected, even when it is the globally newest one.
+    """
+    latest = _read_latest_dataset() or {}
+    registered_id = latest.get("snapshot_id")
+    source = latest.get("source_dataset_path") or latest.get("dataset_path")
+    registered = isinstance(source, str) and bool(source)
+
+    rows = list_published_snapshots(include_source_root=True)
+    by_id = {row["snapshot_id"]: row for row in rows}
+
+    if isinstance(registered_id, str) and registered_id and _latest_snapshot_valid(latest):
+        row = by_id.get(registered_id)
+        if row is not None and row["readable"]:
+            return row, "REGISTERED_SNAPSHOT", True
+
+    if registered:
+        # rows are already newest-first, so the first match is the newest legal
+        # snapshot of the *same* original directory.
+        for row in rows:
+            if row["readable"] and row.get("source_root") \
+                    and _same_local_path(row["source_root"], source):
+                return row, "SAME_SOURCE_ROOT", True
+
+    return None, ("NO_MATCHING_SNAPSHOT" if registered else "NO_REGISTERED_DATASET"), registered
+
+
+def _default_model_binding(project_cfg: dict, training_cfg: dict) -> dict:
+    """Default initial weight: configured legal local ``.pt``, else yolov8n.pt.
+
+    A configured-but-illegal value is never silently swapped for a different
+    file (that would change the user's experiment); it is reported so the user
+    makes the one necessary selection. A search-stage ``best.pt`` is never
+    auto-selected and nothing is ever downloaded.
+    """
+    def resolve(value) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        norm = os.path.abspath(os.path.normpath(value.strip()))
+        path = Path(norm)
+        try:
+            if path.suffix.lower() != ".pt" or not path.is_file() \
+                    or _is_reparse_like(path):
+                return None
+        except OSError:
+            return None
+        return norm
+
+    for source_key, value in (("project.model", project_cfg.get("model")),
+                              ("training.model", training_cfg.get("model"))):
+        if isinstance(value, str) and value.strip():
+            resolved = resolve(value)
+            if resolved is None:
+                return {"path": None, "name": None, "source": None,
+                        "available": False, "reason_code": "MODEL_CONFIG_INVALID"}
+            return {"path": resolved, "name": os.path.basename(resolved),
+                    "source": source_key, "available": True,
+                    "reason_code": "MODEL_BOUND"}
+
+    fallback = resolve("yolov8n.pt")
+    if fallback is not None:
+        return {"path": fallback, "name": os.path.basename(fallback),
+                "source": "fallback:yolov8n.pt", "available": True,
+                "reason_code": "MODEL_BOUND"}
+    return {"path": None, "name": None, "source": None, "available": False,
+            "reason_code": "MODEL_MISSING"}
+
+
+def build_hpo_defaults() -> dict:
+    """Read-only server-side defaults for the HPO draft + formal-training form."""
+    project_cfg = dict(APP_CONFIG.get("project") or {})
+    training_cfg = dict(APP_CONFIG.get("training") or {})
+    warnings: list[dict] = []
+
+    def configured(key: str):
+        """Raw configured value (None when absent/empty), warning when illegal."""
+        if key not in training_cfg or training_cfg[key] in (None, ""):
+            return None
+        return training_cfg[key]
+
+    def number(key: str, low: int, high: int, fallback: int, *, multiple=None) -> int:
+        raw = configured(key)
+        if raw is None:
+            return fallback
+        if _valid_int_in(raw, low, high) and (multiple is None or raw % multiple == 0):
+            return raw
+        warnings.append({"code": "CONFIG_VALUE_INVALID", "field": key})
+        return raw
+
+    batch = number("batch", *_HPO_BATCH_RANGE, fallback=16)
+    imgsz = number("imgsz", *_HPO_IMGSZ_RANGE, fallback=640, multiple=32)
+    formal_epochs = number("default_epochs", *_HPO_EPOCHS_RANGE, fallback=100)
+    dev, device_notice = _default_device(configured("device"))
+    if device_notice is not None:
+        if device_notice.get("code") == "CONFIG_VALUE_INVALID":
+            warnings.append({"code": "CONFIG_VALUE_INVALID", "field": "device"})
+
+    snapshot_row, reason_code, registered = _default_snapshot_binding()
+    return {
+        "dataset": {
+            "registered": registered,
+            "display_name": (snapshot_row or {}).get("dataset_name"),
+            "snapshot": snapshot_row,
+            "reason_code": reason_code,
+            "needs_user_confirmation": snapshot_row is None,
+        },
+        "model": _default_model_binding(project_cfg, training_cfg),
+        "search": {
+            "sampler": _HPO_SEARCH_DEFAULTS["sampler"],
+            "budget": _HPO_SEARCH_DEFAULTS["budget"],
+            "epochs": _HPO_SEARCH_DEFAULTS["epochs"],
+            "seed": _HPO_SEARCH_DEFAULTS["seed"],
+            "timeout_seconds": _HPO_SEARCH_DEFAULTS["timeout_seconds"],
+            "evaluation_mode": _HPO_SEARCH_DEFAULTS["evaluation_mode"],
+            "batch": batch,
+            "imgsz": imgsz,
+            "device": dev,
+        },
+        # 已探测设备：UI 只列这些 GPU 编号与 CPU（明确选择控件，不用自由文本），
+        # 权威默认来自配置或 GPU 探测，绝不静默回退 CPU。
+        "devices": {"gpus": _available_gpus(), "default": dev},
+        # 无 GPU 时的可操作提示（仅提示，不改变用户已选条件）
+        "device_notice": (device_notice
+                          if device_notice and device_notice.get("message")
+                          else None),
+        # 正式训练默认取当前**普通训练**配置，绝不沿用验收研究的 epochs1/imgsz64
+        "formal": {"epochs": formal_epochs, "batch": batch, "imgsz": imgsz,
+                   "device": dev},
+        "config_warnings": warnings,
+    }
+
+
+@app.get("/api/hpo/defaults")
+async def hpo_defaults():
+    """Read-only default bindings; never creates a study, snapshot or training."""
+    return JSONResponse(build_hpo_defaults())
+
+
+app.include_router(
+    create_hpo_router(
+        service=_hpo_service,
+        runner=_hpo_runner,
+        manager=_RUN_MANAGER,
+        resolve_snapshot=_resolve_hpo_snapshot,
+        validate_model=_validate_hpo_model,
+        assert_training_slot_free=_assert_training_slot_free,
+        list_snapshots=list_published_snapshots,
+        list_models=list_local_models,
+    ),
+    prefix="/api/hpo",
+)
+app.include_router(
+    create_hpo_training_router(
+        # accessors, not captured instances: the module globals are the truth
+        service=lambda: _hpo_service,
+        runner=lambda: _hpo_runner,
+        manager=lambda: _RUN_MANAGER,
+        detect_dir=_hpo_detect_dir,
+        log_dir="log",
+        build_deps=_hpo_training_deps,
+        # 权威实验索引的只读访问器：把“查看结果”绑定到索引详情身份（不是 JSON 历史 ID）
+        index=lambda: _local_index_service(),
+    ),
+    prefix="/api/hpo",
+)
 
 
 # ── Run ──

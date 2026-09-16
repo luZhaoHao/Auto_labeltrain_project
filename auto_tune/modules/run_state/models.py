@@ -85,6 +85,7 @@ class RunState:
     last_event: LastEvent | None
     run_name: str | None
     terminal_reason: str | None
+    finished_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in RUN_STATUSES:

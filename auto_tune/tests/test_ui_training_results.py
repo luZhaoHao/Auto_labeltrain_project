@@ -1,6 +1,9 @@
 """Tests for the unified training-completion contract consumed by the UI."""
 
 import json
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -937,3 +940,671 @@ def test_s14_page_has_no_zip_upload_control():
     assert "uploadDataset" not in html
     assert "uploadTraining" not in html
     assert "splitStatus.innerHTML" not in html
+
+
+# ── P1b 返修：训练监控指标投影（首屏 + 终态事件）────────────────────
+#
+# 这里执行的是**渲染后的真实模板 + 真实前端脚本**（tests/js/minidom.js 在 Node 中
+# 按页面顺序执行内联脚本与 /static/*.js），不是源码字符串断言，也不是 JS 逻辑的
+# Python 改写。缺失的指标体系显示“—”，真实 0 显示 0/0.0000/0.000。
+
+_UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+_HARNESS = Path(__file__).resolve().parent / "js" / "minidom.js"
+_NODE = shutil.which("node")
+
+monitor_node = pytest.mark.skipif(_NODE is None, reason="node is not available")
+
+
+def _render_monitor_page(training, experiment_history=()):
+    from auto_tune.modules.presentation import build_experiment_labels
+    from auto_tune.ui.app import _jinja_env, _monitor_latest_projection
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator("zh")
+    return _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang="zh",
+        experiment_labels=build_experiment_labels(translator),
+        active_page="training_monitor",
+        experiment_history=list(experiment_history),
+        tuning_history=[],
+        dataset=None,
+        training=training,
+        monitor_latest=_monitor_latest_projection(training, list(experiment_history)),
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=None,
+    )
+
+
+def _run_monitor_scenario(scenario, training, tmp_path, history=()):
+    """Execute one monitor scenario against the rendered page (real scripts)."""
+    page = tmp_path / "rendered_monitor.html"
+    page.write_text(_render_monitor_page(training, history), encoding="utf-8")
+    result = subprocess.run(
+        [_NODE, str(_HARNESS), scenario, str(_UI_DIR), str(page)],
+        capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload.get("error")
+    return payload
+
+
+def _training_runs(**runs):
+    """A training report whose runs are keyed by run_name (Module B shape)."""
+    return {
+        "summary": {"best_overall_run": list(runs)[0] if runs else None},
+        "runs": {
+            name: {
+                "name": name,
+                "args": {"epochs": spec.get("epochs")},
+                "results": {"final_metrics": spec.get("final_metrics", {})},
+            }
+            for name, spec in runs.items()
+        },
+    }
+
+
+def _history_record(run_name, status="completed"):
+    return {
+        "run_id": "manual:" + run_name,
+        "run_name": run_name,
+        "source": "manual",
+        "status": status,
+        "metrics": {},
+        "artifacts": {},
+    }
+
+
+@monitor_node
+def test_monitor_first_paint_shows_the_latest_valid_run(tmp_path):
+    """刷新后四个卡片展示最近有效训练事实（按服务端既有顺序，不靠字典遍历）。"""
+    # dict 插入顺序故意与“最近”相反：报告里 train2 在前，历史顺序里 train9 最新
+    training = _training_runs(
+        train2={"epochs": 30, "final_metrics": {"metrics/mAP50(B)": 0.31,
+                                               "metrics/mAP50-95(B)": 0.11,
+                                               "metrics/precision(B)": 0.4,
+                                               "metrics/recall(B)": 0.5}},
+        train9={"epochs": 7, "final_metrics": {"metrics/mAP50(B)": 0.00037,
+                                               "metrics/mAP50-95(B)": 0.00007,
+                                               "metrics/precision(B)": 0.00066,
+                                               "metrics/recall(B)": 0.06452}},
+    )
+    history = [_history_record("train9"), _history_record("train2")]
+    facts = _run_monitor_scenario("monitor_first_paint", training, tmp_path, history)
+
+    assert facts["cards"]["epochs"] == "7"
+    assert facts["cards"]["map50"] == "0.0004"
+    assert facts["cards"]["map5095"] == "0.0001"
+    assert facts["cards"]["pr"] == "0.001 / 0.065"
+
+
+@monitor_node
+def test_monitor_first_paint_is_honest_without_history(tmp_path):
+    """空历史时四个卡片显示“—”，绝不猜测。"""
+    facts = _run_monitor_scenario("monitor_first_paint", _training_runs(), tmp_path)
+    cards = facts["cards"]
+    assert cards["epochs"] == "—"
+    assert cards["map50"] == "—"
+    assert cards["map5095"] == "—"
+    assert cards["pr"] == "—"
+
+
+@monitor_node
+def test_monitor_terminal_event_projects_metrics_to_the_cards(tmp_path):
+    """重连流终态事件必须投影 epochs 与四项指标，且不受他 run/重复事件影响。"""
+    facts = _run_monitor_scenario("monitor_terminal_metrics", _training_runs(), tmp_path)
+
+    after = facts["afterTerminal"]
+    assert after["epochs"] == "2"
+    assert after["map50"] == "0.0004"
+    assert after["map5095"] == "0.0001"
+    assert after["pr"] == "0.001 / 0.065"
+    assert facts["logText"]  # 日志仍然渲染，未被指标投影破坏
+
+
+@monitor_node
+def test_monitor_epochs_card_follows_the_finalized_result_contract(tmp_path):
+    """终态 result.epochs 是结构化对象：优先 configured，逐级回退，缺失诚实显示“—”。"""
+    facts = _run_monitor_scenario("monitor_epochs_contract", _training_runs(), tmp_path)
+
+    # 结构化对象存在时以“已配置”为准，而不是 completed/best/params
+    assert facts["configuredPreferred"] == "2"
+    # configured 缺失 → completed；再缺 → params.epochs
+    assert facts["completedFallback"] == "5"
+    assert facts["paramsFallback"] == "9"
+    # 真实 0 是有效数值，不得因真值判断显示“—”
+    assert facts["realZero"] == "0"
+    # 整个 epochs 结构缺失 → 诚实显示“—”，绝不补造 0
+    assert facts["missingStructure"] == "—"
+    # 旧标量事件仍兼容
+    assert facts["legacyScalar"] == "3"
+    # 候选值全部非法 → “—”
+    assert facts["allIllegal"] == "—"
+
+
+@monitor_node
+def test_monitor_projection_handles_real_zeros_and_missing_values(tmp_path):
+    """真实 0 显示数值，缺失项才显示“—”，并按位数格式化。"""
+    facts = _run_monitor_scenario("monitor_result_projection", _training_runs(), tmp_path)
+
+    assert facts["zeros"]["epochs"] == "0"
+    assert facts["zeros"]["map50"] == "0.0000"
+    assert facts["zeros"]["map5095"] == "0.0000"
+    assert facts["zeros"]["pr"] == "0.000 / 0.000"
+    assert facts["zeros"]["reportVisible"] is True
+
+    assert facts["partial"]["epochs"] == "3"
+    assert facts["partial"]["map50"] == "0.5000"
+    assert facts["partial"]["map5095"] == "—"
+    assert facts["partial"]["pr"] == "—"
+    assert facts["partial"]["reportVisible"] is False
+
+    assert facts["rounded"]["map50"] == "0.1235"
+    assert facts["rounded"]["map5095"] == "0.9877"
+    assert facts["rounded"]["pr"] == "0.123 / 0.988"
+
+
+@monitor_node
+def test_monitor_original_stream_and_reconnect_stream_agree(tmp_path):
+    """普通训练原始流与重连流必须产生一致的 DOM 结果。"""
+    facts = _run_monitor_scenario("monitor_stream_parity", _training_runs(), tmp_path)
+    assert facts["reconnect"] == facts["legacy"]
+    assert facts["reconnect"]["epochs"] == "2"
+    assert facts["reconnect"]["map50"] == "0.1234"
+    assert facts["reconnect"]["pr"] == "0.891 / 0.234"
+
+
+# ── 第四轮：HPO 正式训练复用共用监控屏幕（同一组唯一 ID） ────────────
+
+
+def _render_intelligent_page(training, experiment_history=()):
+    """Rendered Intelligent-Analysis page (page 2 active) with the monitor projection."""
+    from auto_tune.modules.presentation import build_experiment_labels
+    from auto_tune.ui.app import _jinja_env, _monitor_latest_projection
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator("zh")
+    return _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang="zh",
+        experiment_labels=build_experiment_labels(translator),
+        active_page="agent_suggestion",
+        experiment_history=list(experiment_history),
+        tuning_history=[],
+        dataset=None,
+        training=training,
+        monitor_latest=_monitor_latest_projection(training, list(experiment_history)),
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=None,
+    )
+
+
+def _run_intelligent_scenario(scenario, training, tmp_path, history=()):
+    page = tmp_path / "rendered_intelligent.html"
+    page.write_text(_render_intelligent_page(training, history), encoding="utf-8")
+    result = subprocess.run(
+        [_NODE, str(_HARNESS), scenario, str(_UI_DIR), str(page)],
+        capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload.get("error")
+    return payload
+
+
+@monitor_node
+def test_hpo_formal_training_reuses_the_shared_monitor_screen(tmp_path):
+    """202 后自动订阅同一 runtime run；共用监控节点在 HPO 模式下就位于正式训练旁。"""
+    facts = _run_intelligent_scenario("formal_monitor_reuse",
+                                      _training_runs(), tmp_path)
+
+    # 监控块被移动到正式训练监控宿主，且指标 ID 仍然唯一
+    assert facts["hostAfter"] == "hpoFormalMonitorHost"
+    assert facts["monitorInsideFormalHost"] is True
+    assert facts["monitorIdCounts"] == [1, 1, 1, 1, 1]
+    # 只按 202 返回的完整 runtime 身份订阅，绝不使用 JSON 历史 ID
+    assert facts["subscribed"] is True
+    # 终态事件把同一份投影写进共用卡片
+    cards = facts["cards"]
+    assert cards["epochs"] == "2"
+    assert cards["map50"] == "0.0004"
+    assert cards["map5095"] == "0.0001"
+    assert cards["pr"] == "0.001 / 0.065"
+    assert "已接受" in facts["formalStatus"]
+
+
+@monitor_node
+def test_hpo_formal_monitor_belongs_to_the_current_study(tmp_path):
+    """进入 HPO / 切换研究必须收敛监控所有权，刷新恢复只认权威 runtime 投影。"""
+    training = _training_runs(train9={"epochs": 7, "final_metrics": {
+        "metrics/mAP50(B)": 0.31, "metrics/mAP50-95(B)": 0.11,
+        "metrics/precision(B)": 0.4, "metrics/recall(B)": 0.5}})
+    history = [_history_record("train9")]
+    facts = _run_intelligent_scenario("hpo_monitor_ownership", training, tmp_path,
+                                      history)
+
+    # 首屏：全局最近有效训练（另一条 run）已投影到公共监控
+    assert facts["firstPaint"]["cards"]["epochs"] == "7"
+    # 进入 HPO：立即收敛，绝不保留全局最近运行
+    assert facts["hpoEntry"]["cards"]["epochs"] == "—"
+    assert facts["hpoEntry"]["cards"]["map50"] == "—"
+    assert "train9" not in (facts["hpoEntry"]["log"] or "")
+    # study B 没有关联正式训练：保持空状态
+    assert facts["studyB"]["cards"]["map50"] == "—"
+    assert "train5" not in (facts["studyB"]["log"] or "")
+
+    # study C：只按权威投影里的合法 runtime UUID 订阅监控
+    assert facts["subscribed"] is True
+    # 刷新恢复：该 run 的 epochs 与四项指标来自其自身权威事实，终态事件不伪造
+    cards = facts["studyC"]["cards"]
+    assert cards["epochs"] == "2"
+    assert cards["map50"] == "0.7100"
+    assert cards["map5095"] == "0.4400"
+    assert cards["pr"] == "0.620 / 0.550"
+    assert "epoch 2/2" in facts["studyC"]["log"]
+    # 其它 run 的终态事件不得污染当前卡片
+    assert "train9" not in facts["studyC"]["log"]
+
+    # 从 C 切回 B：立即清空并收敛，C 的订阅被断开
+    assert facts["backToB"]["cards"]["map50"] == "—"
+    assert facts["backToB"]["pendingRunStreams"] == 0
+    assert facts["monitorRunId"] is None
+
+    # 离开 HPO：其它三模式恢复进入前的公共监控投影
+    assert facts["leftHpo"]["cards"]["epochs"] == "7"
+    assert facts["leftHpo"]["log"] == facts["firstPaint"]["log"]
+    # 仍然只有一组监控身份
+    assert facts["monitorIdCounts"] == [1, 1, 1, 1, 1]
+
+
+@monitor_node
+def test_hpo_monitor_keeps_ordinary_training_layout_intact(tmp_path):
+    """非 HPO 模式下共用监控仍留在训练监控页宿主里（其它三模式不回归）。"""
+    page = tmp_path / "rendered_monitor.html"
+    page.write_text(_render_monitor_page(_training_runs()), encoding="utf-8")
+    result = subprocess.run(
+        [_NODE, str(_HARNESS), "monitor_first_paint", str(_UI_DIR), str(page)],
+        capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload.get("error")
+    # 首屏投影不受监控块搬家影响
+    assert payload["cards"]["epochs"] == "—"
+
+
+# ── 第二轮返修 Task 1/2：公共监控的完整状态所有权 ─────────────────────
+
+
+@monitor_node
+def test_hpo_takeover_clears_every_monitor_field_of_the_previous_run(tmp_path):
+    """进入 HPO 且未绑定正式运行时，指标/徽章/提示/按钮/链接/两套日志全部收敛。"""
+    facts = _run_intelligent_scenario("hpo_monitor_full_state",
+                                      _training_runs(), tmp_path)
+    before = facts["beforeHpo"]
+    # 进入前：运行中的普通训练 A 的完整投影
+    assert before["badge"] == {"text": "运行中", "cls": "badge badge-yellow"}
+    assert before["stopDisplay"] == "inline-flex"
+    assert before["cards"]["epochs"] == "7"
+    assert before["cards"]["reportVisible"] is True
+    assert "epoch 1/2" in before["log"]
+    assert "A full detail line" in before["fullLog"]
+
+    for name in ("hpoEntry", "emptyStudy"):
+        state = facts[name]
+        # 四项指标显示“—”
+        assert state["cards"]["epochs"] == "—", name
+        assert state["cards"]["map50"] == "—", name
+        assert state["cards"]["map5095"] == "—", name
+        assert state["cards"]["pr"] == "—", name
+        # 徽章不得显示上一运行的状态，而是明确的“未选择”
+        assert state["badge"]["text"] == "未选择", name
+        assert "badge-green" not in state["badge"]["cls"], name
+        assert "badge-yellow" not in state["badge"]["cls"], name
+        assert "badge-red" not in state["badge"]["cls"], name
+        # 提示清空隐藏、停止按钮隐藏、报告链接隐藏
+        assert state["note"] == {"text": "", "display": "none"}, name
+        assert state["stopDisplay"] == "none", name
+        assert state["cards"]["reportVisible"] is False, name
+        # 默认日志只有未选择提示，完整日志被清空
+        assert "尚未选择正式训练" in state["log"], name
+        assert "epoch 1/2" not in state["log"], name
+        assert state["fullLog"] == "", name
+        assert "A full detail line" not in state["fullLog"], name
+
+    # 上一订阅真正断开：没有遗留的 run 流在途
+    assert facts["emptyStudy"]["pendingRunStreams"] == 0
+    # DOM 中仍只有一组公共监控身份
+    assert facts["monitorIdCounts"] == [1, 1, 1, 1, 1, 1]
+
+
+@monitor_node
+def test_hpo_formal_run_owns_status_log_and_metrics(tmp_path):
+    """绑定正式运行 B1 后，状态/提示/停止按钮/日志都只属于 B1。"""
+    facts = _run_intelligent_scenario("hpo_monitor_full_state",
+                                      _training_runs(), tmp_path)
+    bound = facts["b1Bound"]
+    # 徽章来自该 formal run 的权威状态（运行中），不是上一运行也不是未选择
+    assert bound["badge"] == {"text": "运行中", "cls": "badge badge-yellow"}
+    assert bound["stopDisplay"] == "inline-flex"
+    # 绑定即切换监控目标：上一运行的日志不得残留
+    assert "epoch 1/2" not in bound["log"]
+    assert "A full detail line" not in bound["fullLog"]
+    # B1 自己的日志只来自 B1 的流
+    assert "B1 epoch 1/2" in facts["b1Log"]
+    assert "epoch 1/2" not in facts["b1Log"].replace("B1 epoch 1/2", "")
+
+    # B1 的终态：徽章显示 B1 自己的“失败”，绝不被全局最近运行 A（运行中）覆盖
+    terminal = facts["b1Terminal"]
+    assert terminal["badge"] == {"text": "失败", "cls": "badge badge-red"}
+    assert terminal["stopDisplay"] == "none"
+    assert facts["b1Terminal"]["log"] == facts["b1Log"]
+
+
+@monitor_node
+def test_late_terminal_event_of_a_superseded_subscription_changes_nothing(tmp_path):
+    """切换研究后，上一订阅的迟到终态无权更新指标、状态或日志。"""
+    facts = _run_intelligent_scenario("hpo_monitor_full_state",
+                                      _training_runs(), tmp_path)
+    switched = facts["switched"]
+    # 切换研究后是“未选择”的空状态
+    assert switched["badge"]["text"] == "未选择"
+    for state in (facts["afterLateB1"], facts["afterStaleEnd"]):
+        assert state["badge"] == switched["badge"]
+        assert state["cards"] == switched["cards"]
+        assert state["note"] == switched["note"]
+        assert state["stopDisplay"] == switched["stopDisplay"]
+        assert state["log"] == switched["log"]
+        assert state["fullLog"] == switched["fullLog"]
+        assert "B1 迟到终态" not in state["log"]
+        assert state["cards"]["map50"] == "—"
+
+
+@monitor_node
+def test_leaving_hpo_restores_the_full_monitor_state(tmp_path):
+    """离开 HPO 完整恢复进入前的 A：徽章 class、提示、按钮、链接与两套日志。"""
+    facts = _run_intelligent_scenario("hpo_monitor_full_state",
+                                      _training_runs(), tmp_path)
+    before, after = facts["beforeHpo"], facts["leftHpo"]
+    assert after["badge"] == before["badge"]
+    assert after["note"] == before["note"]
+    assert after["stopDisplay"] == before["stopDisplay"]
+    assert after["cards"] == before["cards"]
+    assert after["log"] == before["log"]
+    assert after["fullLog"] == before["fullLog"]
+    # 恢复的是 A 的事实，不是 HPO 空状态
+    assert after["cards"]["epochs"] == "7"
+    assert after["badge"]["text"] == "运行中"
+    assert "epoch 1/2" in after["log"]
+
+
+# ── 第三轮 P1：同一 runtime_run_id 的状态与结果必须每次收敛 ─────────────
+
+# 与 minidom.js 的 hpo_formal_monitor_* 场景保持一致的三条运行身份
+_FORMAL_RUN_A = "manual:aaaaaaaa-1111-4111-8111-111111111111"
+_FORMAL_RUN_B = "manual:bbbbbbbb-2222-4222-8222-222222222222"
+_FORMAL_RUN_C = "manual:cccccccc-3333-4333-8333-333333333333"
+
+
+@monitor_node
+def test_accepted_formal_submission_converges_the_monitor_to_the_new_run(tmp_path):
+    """202 之后（首个流事件之前）监控必须收敛为该 run 的已接受/运行中事实。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_convergence",
+                                      _training_runs(), tmp_path)
+    before, accepted = facts["beforeSubmit"], facts["accepted"]
+    # 提交前：上一正式运行 A1 的完整终态显示在公共监控上
+    assert before["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    assert before["cards"]["map50"] == "0.7000"
+    assert before["cards"]["epochs"] == "2"
+    assert "A1 epoch 1/2" in before["log"]
+
+    # 202 之后：身份已是新 run 的完整 UUID，徽章不再是上一 run 的“已完成”
+    assert accepted["monitorRunId"] == _FORMAL_RUN_B
+    assert accepted["badge"]["text"] == "运行中"
+    assert "badge-green" not in accepted["badge"]["cls"]
+    # 停止按钮可见（该 run 处于活跃阶段）
+    assert accepted["stopDisplay"] == "inline-flex"
+    # 上一 run 的指标、报告链接与两套日志全部清除
+    assert accepted["cards"]["epochs"] == "—"
+    assert accepted["cards"]["map50"] == "—"
+    assert accepted["cards"]["map5095"] == "—"
+    assert accepted["cards"]["pr"] == "—"
+    assert accepted["cards"]["reportVisible"] is False
+    assert "A1 epoch 1/2" not in accepted["log"]
+    assert "A1 epoch 1/2" not in accepted["fullLog"]
+    # 新的 run 只被订阅一次
+    assert accepted["streamsB"] == 1
+    assert accepted["streamsA"] == 1
+
+
+@monitor_node
+def test_same_runtime_run_refreshes_status_and_result_without_resubscribing(tmp_path):
+    """同一 runtime_run_id 由 running → completed：刷新权威状态与结果，不重订阅。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_convergence",
+                                      _training_runs(), tmp_path)
+    assert "B epoch 1/5" in facts["bLogBeforePoll"]
+
+    running = facts["bRunning"]
+    assert running["badge"] == {"text": "运行中", "cls": "badge badge-yellow"}
+    assert running["stopDisplay"] == "inline-flex"
+    # 同一身份的刷新不清空该 run 已有的日志，也不重新订阅
+    assert "B epoch 1/5" in running["log"]
+    assert running["streamsB"] == 1
+
+    completed = facts["bCompleted"]
+    assert completed["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    assert completed["stopDisplay"] == "none"
+    # 最终指标来自该 run 的权威结果投影
+    assert completed["cards"]["epochs"] == "5"
+    assert completed["cards"]["map50"] == "0.6600"
+    assert completed["cards"]["map5095"] == "0.3300"
+    assert completed["cards"]["pr"] == "0.510 / 0.420"
+    assert "B epoch 1/5" in completed["log"]
+    assert completed["streamsB"] == 1
+
+
+@monitor_node
+def test_repeated_identical_polling_is_idempotent(tmp_path):
+    """完全重复的 /formal-runs 轮询不得重复订阅、重置日志或制造重复投影。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_convergence",
+                                      _training_runs(), tmp_path)
+    completed, repeated = facts["bCompleted"], facts["repeated"]
+    # 重复轮询后的事实仍是该 run 自己的权威终态与结果
+    assert repeated["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    assert repeated["cards"]["epochs"] == "5"
+    assert repeated["cards"]["map50"] == "0.6600"
+    # 与第一次收敛后的状态完全一致：没有重复订阅、没有重置日志
+    assert repeated["badge"] == completed["badge"]
+    assert repeated["cards"] == completed["cards"]
+    assert repeated["log"] == completed["log"] == "B epoch 1/5"
+    assert repeated["fullLog"] == completed["fullLog"]
+    assert repeated["stopDisplay"] == completed["stopDisplay"]
+    assert repeated["streamsB"] == 1
+
+
+@monitor_node
+def test_other_run_events_cannot_change_the_current_formal_monitor(tmp_path):
+    """上一订阅的迟到事件不得更新任何监控字段。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_convergence",
+                                      _training_runs(), tmp_path)
+    for key in ("afterLateA",):
+        state = facts[key]
+        assert state["badge"] == facts["bCompleted"]["badge"], key
+        assert state["cards"] == facts["bCompleted"]["cards"], key
+        assert state["log"] == facts["bCompleted"]["log"], key
+        assert "A1 迟到终态" not in state["log"], key
+        assert state["cards"]["map50"] == "0.6600", key
+
+
+@monitor_node
+def test_switching_to_another_runtime_clears_and_resubscribes_once(tmp_path):
+    """切换到另一 runtime：清空上一 run、使其迟到事件失效，且只订阅新 run。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_convergence",
+                                      _training_runs(), tmp_path)
+    switched, after_late = facts["switchedToC"], facts["afterLateB"]
+    assert switched["monitorRunId"] == _FORMAL_RUN_C
+    assert switched["badge"]["text"] == "运行中"
+    # 上一正式 run 的事实被清空
+    assert switched["cards"]["map50"] == "—"
+    assert switched["cards"]["epochs"] == "—"
+    assert "B epoch 1/5" not in switched["log"]
+    # 新 runtime 只订阅一次，旧 runtime 不再新增订阅
+    assert switched["streamsC"] == 1
+    assert switched["streamsB"] == 1
+    # B 的迟到终态不改变任何监控字段
+    assert after_late["badge"] == switched["badge"]
+    assert after_late["cards"] == switched["cards"]
+    assert after_late["log"] == switched["log"]
+    assert after_late["monitorRunId"] == switched["monitorRunId"]
+
+
+@monitor_node
+def test_running_to_failed_converges_without_resubscribing(tmp_path):
+    """同一 runtime 由 running → failed：徽章收敛为失败并隐藏停止按钮。"""
+    facts = _run_intelligent_scenario("hpo_formal_monitor_failure",
+                                      _training_runs(), tmp_path)
+    assert facts["running"]["badge"] == {"text": "运行中", "cls": "badge badge-yellow"}
+    failed = facts["failed"]
+    assert failed["badge"] == {"text": "失败", "cls": "badge badge-red"}
+    assert failed["stopDisplay"] == "none"
+    assert failed["streams"] == 1
+    assert "B epoch 1/5" in failed["log"]
+
+
+@monitor_node
+def test_each_hpo_session_captures_a_fresh_baseline(tmp_path):
+    """第二次进出 HPO 必须恢复“新的 B”，而不是第一次的旧快照 A。"""
+    facts = _run_intelligent_scenario("hpo_monitor_full_state",
+                                      _training_runs(), tmp_path)
+    before2, after2 = facts["beforeHpo2"], facts["leftHpo2"]
+    # 第二次进入前的事实是 B（与第一次的 A 完全不同）
+    assert before2["cards"]["epochs"] == "30"
+    assert before2["cards"]["map50"] == "0.5000"
+    assert before2["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    assert "B epoch 1/30" in before2["log"]
+    assert "epoch 1/2" not in before2["log"]
+    # HPO 内连续切换两个研究后离开：恢复的仍是 B
+    assert after2 == before2
+    assert after2["cards"]["epochs"] == "30"
+    assert after2["badge"]["text"] == "已完成"
+    assert "B epoch 1/30" in after2["log"]
+    assert "A full detail line" not in after2["fullLog"]
+
+
+# ── 第四轮 P1：202 后必须自动启动轮询（不依赖用户手动刷新）─────────────
+#
+# 这些场景只推进 fake clock 并应答实现自己发出的请求；它们从不调用
+# hpoRefreshFormalRuns()/hpoRefreshRound()，因此断言的是“自动轮询”本身，而不是
+# 手动刷新后的投影结果。
+
+
+@monitor_node
+def test_accepted_formal_training_starts_the_only_poll_timer(tmp_path):
+    """已完成研究本来没有定时器：202 之后必须自动建立唯一的 2 秒轮询。"""
+    facts = _run_intelligent_scenario("hpo_formal_polling_after_accept",
+                                      _training_runs(), tmp_path)
+    before, accepted = facts["beforeSubmit"], facts["accepted"]
+    # 提交前：已完成研究 + 已完成的正式运行 A1，没有任何轮询定时器
+    assert before["timers"] == 0
+    assert before["monitorRunId"] == _FORMAL_RUN_A
+    assert before["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    # 202 之后（首个流事件之前）：自动产生唯一轮询，且只订阅该 run 一次
+    assert accepted["timers"] == 1
+    assert accepted["monitorRunId"] == _FORMAL_RUN_B
+    assert accepted["badge"] == {"text": "运行中", "cls": "badge badge-yellow"}
+    assert accepted["stopDisplay"] == "inline-flex"
+    assert accepted["watchFormal"] is True
+    assert facts["subscriptions"] == 1
+    assert facts["streamOpen"] is True
+
+
+@monitor_node
+def test_the_poll_timer_converges_the_linked_list_then_stops(tmp_path):
+    """只推进时钟即可自动收敛关联列表/结果按钮/最终模型，并在终态后自动停止。"""
+    facts = _run_intelligent_scenario("hpo_formal_polling_after_accept",
+                                      _training_runs(), tmp_path)
+    # 终态轮询不清空该 run 已有的日志，也不重复订阅
+    assert "B epoch 1/5" in facts["logBeforePoll"]
+
+    converged = facts["converged"]
+    assert converged["timers"] == 0          # watchFormal=false 后自动停止，不空转
+    assert converged["badge"] == {"text": "已完成", "cls": "badge badge-green"}
+    assert converged["stopDisplay"] == "none"
+    assert "已完成" in converged["list"]
+    assert "train2" in converged["list"]
+    buttons = {b["label"]: b["disabled"] for b in converged["buttons"]}
+    assert buttons["查看结果"] is False       # 权威实验身份可用 → 入口启用
+    assert "下载最终 best.pt" in buttons      # best_pt_available=true → 出现
+
+    # 公共监控保持终态与最终指标（来自该 run 的权威事实）
+    assert converged["cards"]["epochs"] == "5"
+    assert converged["cards"]["map50"] == "0.6600"
+    assert converged["cards"]["map5095"] == "0.3300"
+    assert converged["cards"]["pr"] == "0.510 / 0.420"
+    assert "B epoch 1/5" in converged["log"]
+    assert facts["subscriptions"] == 1
+
+    # 终态后继续推进时钟：没有新请求，也没有新定时器
+    assert facts["afterExtraTick"]["timers"] == 0
+    assert facts["afterExtraTick"]["formal"] == facts["afterTerminal"]["formal"]
+    assert facts["afterExtraTick"]["total"] == facts["afterTerminal"]["total"]
+
+
+@monitor_node
+def test_an_interval_tick_during_the_accepted_refresh_is_coalesced(tmp_path):
+    """202 后的首次刷新在途时，tick 走既有合并机制：不并发，也不丢最后一次刷新。"""
+    facts = _run_intelligent_scenario("hpo_formal_polling_coalesces_inflight_tick",
+                                      _training_runs(), tmp_path)
+    # 搜索仍在进行 → 提交前已有唯一轮询
+    assert facts["beforeSubmit"]["timers"] == 1
+    inflight, after_tick = facts["inflight"], facts["afterTick"]
+    assert inflight["pending"] > 0
+    # tick 落在在途刷新上：不得并发发出第二次请求
+    assert after_tick["pending"] == inflight["pending"]
+    assert after_tick["formal"] == inflight["formal"]
+
+    # 被合并的那一次随后补跑（最后一次刷新不丢），且始终只有一个定时器
+    assert facts["formalAfterSettle"] == inflight["formal"] + 2
+    coalesced = facts["coalesced"]
+    assert coalesced["timers"] == 1
+    assert coalesced["monitorRunId"] == _FORMAL_RUN_B
+    assert "运行中" in coalesced["list"]
+
+
+@monitor_node
+def test_switching_studies_stops_the_old_timer_and_drops_its_response(tmp_path):
+    """训练期间切换研究：旧定时器与在途响应失效，新研究不继续旧轮询。"""
+    facts = _run_intelligent_scenario("hpo_formal_polling_switch_study",
+                                      _training_runs(), tmp_path)
+    assert facts["training"]["timers"] == 1
+    assert facts["training"]["monitorRunId"] == _FORMAL_RUN_B
+    assert facts["inflightFormal"] is True
+
+    # 切换后立即停止旧定时器、断开旧订阅并清空监控
+    after_switch = facts["afterSwitch"]
+    assert after_switch["timers"] == 0
+    assert after_switch["monitorRunId"] is None
+    assert after_switch["pendingRunStreams"] == 0
+    assert after_switch["badge"]["text"] == "未选择"
+
+    # 旧研究关联结果的迟到响应无权更新任何字段
+    assert facts["afterLateA"] == after_switch
+    switched = facts["switched"]
+    assert switched["timers"] == 0
+    assert switched["watchFormal"] is False
+    assert switched["monitorRunId"] is None
+    assert switched["list"] == "暂无由该研究发起的正式训练。"
+
+    # 再推进时钟：不复活旧轮询，也不产生任何新请求
+    assert facts["afterFinalTick"]["timers"] == 0
+    assert facts["afterFinalTick"]["total"] == facts["beforeFinalTick"]

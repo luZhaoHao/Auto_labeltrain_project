@@ -204,21 +204,28 @@ def validate_training_preflight(
     return errors
 
 
-def build_yolo_command(train_name: str, args_path: str, merged_params: dict) -> list[str]:
+def build_yolo_command(train_name: str, args_path: str, merged_params: dict,
+                       executable: str | None = None) -> list[str]:
     """Build the YOLO training command.
 
     Args:
         train_name: training name (e.g., "train_autotune_1").
         args_path: path to the new args.yaml.
         merged_params: full merged training params.
+        executable: pre-resolved YOLO executable to embed as command[0]. When
+            omitted, ``resolve_yolo_executable()`` is consulted at call time.
+            HPO historical replay passes a previously frozen executable so a
+            frozen command can be rebuilt without re-resolving the current env.
 
     Returns:
         Command list for subprocess.
     """
-    cmd = [resolve_yolo_executable(), "train"]
+    resolved = resolve_yolo_executable() if executable is None else executable
+    cmd = [resolved, "train"]
 
     # Map merged params to CLI args
     param_map = {
+        "task": "task",
         "model": "model",
         "data": "data",
         "epochs": "epochs",
@@ -265,6 +272,7 @@ def build_yolo_command(train_name: str, args_path: str, merged_params: dict) -> 
         "save_period": "save_period",
         "val": "val",
         "plots": "plots",
+        "amp": "amp",
     }
 
     for yaml_key, cli_flag in param_map.items():

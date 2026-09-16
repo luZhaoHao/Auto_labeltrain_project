@@ -148,7 +148,10 @@ def _terminal(state: RunState, status: str, reason: str) -> RunState:
 
 
 def reconcile_persisted_state(
-    state: RunState | None, controller_owned: bool
+    state: RunState | None,
+    controller_owned: bool,
+    *,
+    identity_match: IdentityMatch | None = None,
 ) -> RunState | None:
     """Conservatively reconcile a persisted run state.
 
@@ -159,6 +162,12 @@ def reconcile_persisted_state(
       process still exists → ``interrupted``. A missing PID → ``process_missing``;
       a reused PID → ``pid_reused``; unverifiable → ``unknown``.
     - Terminal states are returned unchanged.
+
+    ``identity_match`` lets a caller that has *already* observed the process
+    identity pass that single observation in, so one gate decision never reads
+    the PID twice (a PID reused between two reads would otherwise be able to
+    change the resulting terminal reason). When omitted the identity is
+    captured here, keeping every existing call site compatible.
     """
     if state is None:
         return None
@@ -170,9 +179,11 @@ def reconcile_persisted_state(
         # No process identity to verify (e.g. dry-run without a training PID);
         # after the controller is gone the run can only be interrupted.
         return _terminal(state, "interrupted", "controller_lost")
-    match = compare_process_identity(
-        ProcessIdentity(state.pid, state.process_create_token)
-    )
+    match = identity_match
+    if match is None:
+        match = compare_process_identity(
+            ProcessIdentity(state.pid, state.process_create_token)
+        )
     if match is IdentityMatch.MATCH:
         return _terminal(state, "interrupted", "controller_lost")
     if match is IdentityMatch.MISSING:
