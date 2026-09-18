@@ -9,15 +9,34 @@ client that disconnected just before completion can still replay the run's
 buffered events (including the real terminal and finalizer results) via
 ``after_seq``. Retention is bounded by count and TTL; evicted runs fall back
 to the persisted terminal state.
+
+Ordinary training, LLM auto-tuning, HPO execution and a fixed-config
+verification run all share one process-wide training slot (H1.3). ``reserve``
+hands out a single opaque reservation token; the owning controller releases it
+only after it truly finishes. ``release`` refuses to release a token owned by
+someone else, so a stale/disconnected caller can never free a live slot.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+import uuid
 
 RETAIN_MAX = 20
 RETAIN_TTL_SECONDS = 30 * 60
+
+# Real-training slot kinds that share the single active-training reservation.
+# ``dry_run`` preview never reserves a slot.
+RESERVABLE_KINDS = frozenset({"manual", "tuning", "hpo"})
+
+
+class TrainingBusyError(Exception):
+    """A real-training slot is already occupied; routes map this to 409."""
+
+
+class TrainingGateError(Exception):
+    """Invalid reservation usage (unknown kind, wrong-token release)."""
 
 
 class _RetainedRun:
@@ -35,6 +54,7 @@ class RunManager:
         self._retain_max = retain_max
         self._retain_ttl = retain_ttl
         self._lock = threading.Lock()
+        self._reservation: dict | None = None  # {run_kind, run_id, token}
 
     def register(self, controller) -> None:
         with self._lock:
@@ -104,8 +124,84 @@ class RunManager:
                     return c
         return None
 
+    def _controller_for_kind(self, run_kind: str):
+        """Return the active controller of ``run_kind`` (explicit kind only)."""
+        if run_kind == "manual":
+            return self.active_manual()
+        if run_kind == "tuning":
+            return self.active_tuning()
+        if run_kind == "hpo":
+            return self.active_hpo()
+        raise TrainingGateError(f"unknown run kind for active lookup: {run_kind!r}")
+
     def active_for_kind(self, run_kind: str):
-        return self.active_manual() if run_kind == "manual" else self.active_tuning()
+        """Explicit-kind active lookup; unknown kinds must never map to tuning."""
+        return self._controller_for_kind(run_kind)
+
+    def active_hpo(self):
+        with self._lock:
+            for c in self._controllers.values():
+                if c.run_kind == "hpo" and c.is_active():
+                    return c
+        return None
+
+    def active_train(self):
+        """The single active real-training controller across manual/tuning/hpo."""
+        with self._lock:
+            for c in self._controllers.values():
+                if c.run_kind in RESERVABLE_KINDS and c.is_active():
+                    return c
+        return None
+
+    def _has_active_locked(self) -> bool:
+        for c in self._controllers.values():
+            if c.run_kind in RESERVABLE_KINDS and c.is_active():
+                return True
+        return False
+
+    # ── single training-slot reservation (H1.3) ────────────────────
+
+    def reserve(self, run_kind: str, run_id: str) -> str:
+        """Atomically occupy the single training slot and return an opaque token.
+
+        Fails with ``TrainingBusyError`` when another reservation or an active
+        real-training controller is present. The caller must pass the returned
+        token to the owning controller and release it only on true completion.
+        """
+        if run_kind not in RESERVABLE_KINDS:
+            raise TrainingGateError(f"kind {run_kind!r} cannot reserve a training slot")
+        with self._lock:
+            if self._reservation is not None:
+                raise TrainingBusyError(
+                    f"training slot already reserved by {self._reservation['run_kind']}:"
+                    f"{self._reservation['run_id']}")
+            if self._has_active_locked():
+                raise TrainingBusyError("an active training controller already occupies the slot")
+            token = uuid.uuid4().hex
+            self._reservation = {"run_kind": run_kind, "run_id": run_id, "token": token}
+            return token
+
+    def release(self, token: str) -> bool:
+        """Release the reservation only when ``token`` is the owning token.
+
+        A foreign token is refused (raises ``TrainingGateError``) and never
+        releases someone else's live slot. Returns True when a reservation was
+        actually released.
+        """
+        with self._lock:
+            if self._reservation is None:
+                return False
+            if self._reservation["token"] != token:
+                raise TrainingGateError("reservation token mismatch; refusing foreign release")
+            self._reservation = None
+            return True
+
+    def reservation_owner(self) -> tuple | None:
+        """Public read of the current reservation ``(run_kind, run_id)`` or None."""
+        with self._lock:
+            if self._reservation is None:
+                return None
+            return (self._reservation["run_kind"], self._reservation["run_id"])
 
     def snapshot(self) -> list:
         with self._lock:

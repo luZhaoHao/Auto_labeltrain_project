@@ -118,6 +118,9 @@ def _new_iteration(iteration: int) -> dict[str, Any]:
             "analysis": None,
         },
         "error": None,
+        # F1.1-B：本轮的多轮策略判定（是否为改善、基线、停止原因）。
+        # 由确定性代码写入，不含 LLM 自述。
+        "round_verdict": None,
     }
 
 
@@ -144,6 +147,8 @@ class TuningAuditSession:
             "reference_dataset": reference_dataset,
             "max_retries": max_retries,
             "iterations": [],
+            # 多轮调优的确定性停止原因（稳定字符串常量）；未触发时保持 None。
+            "stop_reason": None,
             "error": None,
             "final_summary": None,
             "final_summary_status": None,
@@ -206,6 +211,30 @@ class TuningAuditSession:
         # failure fact. Write failures must propagate; callers translate them
         # into audit_persistence_error (never silently degraded).
         self.flush()
+
+    def record_round_verdict(self, iteration: int, verdict: dict) -> None:
+        """Persist one round's deterministic verdict and the session stop reason.
+
+        A single flush writes both, so the round verdict and the session-level
+        ``stop_reason`` can never disagree on disk: a stop reason without its
+        verdict would make the session unauditable retroactively.
+        """
+        record = self._get_iteration(iteration)
+        previous_verdict = copy.deepcopy(record["round_verdict"])
+        previous_stop = self.data["stop_reason"]
+        record["round_verdict"] = copy.deepcopy(verdict)
+        if verdict.get("stop_reason"):
+            self.data["stop_reason"] = verdict["stop_reason"]
+        try:
+            self.flush()
+        except Exception:
+            record["round_verdict"] = previous_verdict
+            self.data["stop_reason"] = previous_stop
+            raise
+
+    def set_stop_reason(self, stop_reason: str) -> None:
+        """Set the session stop reason without flushing (finalize flushes it)."""
+        self.data["stop_reason"] = stop_reason
 
     def complete_iteration(self, iteration: int) -> None:
         record = self._get_iteration(iteration)

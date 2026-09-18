@@ -141,9 +141,12 @@
                 </div>
                 <div style="margin-bottom:12px;">
                     <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Mode") }}</label>
-                    <select name="mode" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+                    {# 与 single_page.html 一致：四种已批准模式，顺序 dry_run / keep_params / hpo / full #}
+                    <select name="mode" id="tuningModeSelect" onchange="window.onTuningModeChange && window.onTuningModeChange(this.value)" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
                         <option value="dry_run">{{ _("Dry-Run (generate plan only)") }}</option>
-                        <option value="full">{{ _("Full Training") }}</option>
+                        <option value="keep_params">{{ _("Train with Original Parameters") }}</option>
+                        <option value="hpo">{{ _("HPO Algorithm Tuning") }}</option>
+                        <option value="full">{{ _("LLM Parameter Tuning") }}</option>
                     </select>
                 </div>
                 <button type="submit" class="btn btn-primary" style="width:100%;" id="startTuningBtn">
@@ -220,6 +223,16 @@ if (tuningForm) {
         e.preventDefault();
         const formData = new FormData(tuningForm);
 
+        // HPO never falls through to the LLM /tuning/start branch.
+        if (formData.get('mode') === 'hpo') {
+            if (window.hpoHandleSubmit) {
+                window.hpoHandleSubmit(formData);
+            } else if (tuningStatus) {
+                tuningStatus.textContent = '[ERROR] HPO script not loaded';
+            }
+            return;
+        }
+
         startBtn.disabled = true;
         startBtn.innerHTML = '<svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> {{ _("Running...") }}';
         tuningProgress.classList.remove('hidden');
@@ -280,4 +293,5 @@ if (tuningForm) {
     });
 }
 </script>
+<script src="/static/hpo.js" defer></script>
 {% endblock %}

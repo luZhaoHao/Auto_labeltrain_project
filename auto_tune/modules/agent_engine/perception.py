@@ -356,10 +356,11 @@ def _build_training_section(tr: dict | None, reference_run: str | None) -> dict:
                 {"type": i.get("type"), "severity": i.get("severity")}
                 for i in (issues or [])
             ],
+            # 只投影训练报告真实提供的损失曲线。TrainAnalyzer 不产出 mAP50
+            # 指标趋势，投影它只会造出一个永远为空、且事实层会直接拒绝的键。
             "curve_trends": {
                 "val_box_loss": curves.get("val_box", {}).get("trend", ""),
                 "val_cls_loss": curves.get("val_cls", {}).get("trend", ""),
-                "mAP50": curves.get("mAP50", {}).get("trend", ""),
             },
         }
 

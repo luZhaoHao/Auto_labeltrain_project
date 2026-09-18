@@ -150,6 +150,13 @@ def build_deterministic_summary(
             "recall": best.get("result_recall") if best else None,
         },
         "best_score": composite_score(best, eval_mode) if best else None,
+        # 「最佳轮次」只是调优轮次内的最佳。当没有任何轮次严格优于进入调优前的
+        # 原参考运行时，整体最佳仍是原参考运行——报告必须把这一点说清楚，不能
+        # 让变差的首轮看起来像整体最佳。
+        "reference_baseline": tuning_result.get("reference_baseline"),
+        "kept_reference_baseline": bool(tuning_result.get("kept_reference_baseline")),
+        "baseline_run": tuning_result.get("baseline_run"),
+        "baseline_score": tuning_result.get("baseline_score"),
         "best_weights_path": "weights/best.pt",
         "generated_at": generated_at or utc_now_iso(),
     }
@@ -188,7 +195,8 @@ def render_final_summary_text(summary: dict, llm_text: str | None = None) -> str
         lines.append(f"- Module B 分析: {r.get('analysis_status') or '—'}")
         lines.append("")
 
-    lines.append("## 最佳轮次")
+    kept_reference = bool(summary.get("kept_reference_baseline"))
+    lines.append("## 调优轮次内最佳" if kept_reference else "## 最佳轮次")
     lines.append(f"- 最佳轮次: 第 {summary.get('best_iteration')} 轮")
     lines.append(f"- 最佳训练: {summary.get('best_train_name')}")
     best_metrics = summary.get("best_metrics") or {}
@@ -200,6 +208,19 @@ def render_final_summary_text(summary: dict, llm_text: str | None = None) -> str
     lines.append(f"- 综合评分: {_fmt(summary.get('best_score'))}")
     lines.append(f"- 最佳权重: {summary.get('best_weights_path', 'weights/best.pt')}")
     lines.append(f"- 生成时间: {summary.get('generated_at')}")
+
+    if kept_reference:
+        baseline = summary.get("reference_baseline") or {}
+        lines.append("")
+        lines.append("## 原参考运行基线")
+        lines.append(
+            f"- 原参考运行: {baseline.get('run_name') or '—'}"
+            f"（综合分 {_fmt(baseline.get('score'))}）"
+        )
+        lines.append(
+            "- 调优结论: 没有任何调优轮次严格优于原参考运行，整体最佳仍是原参考运行；"
+            "上方「调优轮次内最佳」只是调优轮次内的最佳，不是整体最佳。"
+        )
 
     if llm_text:
         lines.append("")
@@ -254,6 +275,13 @@ def build_llm_summary_prompt(summary: dict) -> str:
                  f"最佳综合分={_fmt(summary.get('best_score'))}，"
                  f"最佳指标={json_safe(summary.get('best_metrics'))}，"
                  f"权重={summary.get('best_weights_path')}")
+    if summary.get("kept_reference_baseline"):
+        baseline = summary.get("reference_baseline") or {}
+        lines.append(
+            f"原参考运行基线: {baseline.get('run_name')}"
+            f"（综合分 {_fmt(baseline.get('score'))}），"
+            "没有任何调优轮次严格优于它，整体最佳仍是该原参考运行。"
+        )
     lines.append("")
     lines.append("请用中文回答，说明：")
     lines.append("1. 为什么选中该最佳轮次；")

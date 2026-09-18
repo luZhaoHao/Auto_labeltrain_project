@@ -1012,7 +1012,17 @@ def _loop_perception(reference_run="train54"):
     }
 
 
-def _reference_run(tmp_path, name="train54"):
+_DEFAULT_FINAL_METRICS = {
+    "precision": 0.00266, "recall": 0.57692, "mAP50": 0.04768, "mAP50_95": 0.00815,
+}
+
+
+def _reference_run(tmp_path, name="train54", final_metrics=None):
+    """参考运行目录。
+
+    ``final_metrics`` 为 None 时沿用既有默认指标；显式传入的 ``None`` 值写出空
+    单元格，表示该指标**缺失**（不是 0），供「基线未知」场景使用。
+    """
     detect = tmp_path / "detect"
     ref = detect / name
     ref.mkdir(parents=True)
@@ -1020,16 +1030,23 @@ def _reference_run(tmp_path, name="train54"):
         "model: yolov8n.pt\ndata: test_data.yaml\nlr0: 0.01\nbatch: 16\nepochs: 100\n",
         encoding="utf-8",
     )
+    metrics = dict(_DEFAULT_FINAL_METRICS if final_metrics is None else final_metrics)
+
+    def _cell(value):
+        return "" if value is None else f"{value}"
+
     (ref / "results.csv").write_text(
         "epoch, metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B)\n"
-        "0, 0.00266, 0.57692, 0.04768, 0.00815\n",
+        f"0, {_cell(metrics['precision'])}, {_cell(metrics['recall'])}, "
+        f"{_cell(metrics['mAP50'])}, {_cell(metrics['mAP50_95'])}\n",
         encoding="utf-8",
     )
     return detect
 
 
-def _loop_basic_mocks(monkeypatch, tmp_path, reference_run="train54"):
-    detect = _reference_run(tmp_path, reference_run)
+def _loop_basic_mocks(monkeypatch, tmp_path, reference_run="train54",
+                      final_metrics=None):
+    detect = _reference_run(tmp_path, reference_run, final_metrics)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.find_detect_dir", lambda: str(detect))
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception",
                         lambda **k: _loop_perception(reference_run))
@@ -1299,6 +1316,335 @@ def test_valid_evidence_still_enters_guardrails(tmp_path, monkeypatch):
     assert it["decision_validation"]["valid"] is True
     assert it["baseline"]["reference_run"] == "train54"
     assert it["baseline"]["metrics"]["mAP50"] == 0.04768
+
+
+# ── F1.1-B 阶段五：多轮调优的基线更新与停止条件由代码确定 ──────────────────
+#
+# 旧实现每轮无条件把 reference_run 换成刚训练完的运行：变差的运行也会成为新
+# 基线，模型看不到「上次那招没用」，于是同一组建议被反复提出（真实审计里
+# lr0 被逐轮腰斩 0.01→0.005→0.0025→0.00125，无人叫停）。
+
+
+def _auto_loop_decision(changes=None, action="adjust"):
+    decision = _valid_tuning_decision()
+    decision["action"] = action
+    decision["hyperparameter_changes"] = dict(changes or {"lr0": 0.005})
+    decision["evidence_ids"] = {k: ["training.params.lr0"]
+                                for k in decision["hyperparameter_changes"]}
+    return decision
+
+
+def _auto_loop_harness(monkeypatch, tmp_path, decisions, metrics, max_rounds=2,
+                       final_metrics=None, keep_params=False):
+    """驱动 auto_loop：逐轮返回给定决策与最终指标，记录每轮真正启动的训练。
+
+    ``final_metrics`` 控制参考运行 results.csv 的最终指标，因此也决定进入调优前
+    的原参考基线综合分。
+    """
+    from auto_tune.modules.agent_engine.probe_monitor import ProbeDecision
+
+    launched = []
+    _loop_basic_mocks(monkeypatch, tmp_path, final_metrics=final_metrics)
+    _mock_fact_package(monkeypatch)
+    decisions_iter, metrics_iter = iter(decisions), iter(metrics)
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
+                        lambda *a, **k: next(decisions_iter))
+
+    def _finalize(run_dir, run_name, source, config, **kw):
+        launched.append(run_name)
+        return {
+            "run_id": f"tuning:{kw.get('session_id')}:{run_name}",
+            "run_name": run_name, "source": "tuning", "status": "completed",
+            "analysis_status": "completed", "metrics": next(metrics_iter),
+            "epochs": {"configured": 100, "completed": 3, "best": 2},
+            "artifacts": {"report_path": None},
+            "analysis_error": None, "history_error": None,
+            "index_error": None, "error": None,
+        }
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.finalize_training_run", _finalize)
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.monitor_training",
+                        lambda *a, **k: ProbeDecision(ProbeDecision.CONTINUE, "ok"))
+
+    class FakeProc:
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.launch_training",
+                        lambda *a, **k: FakeProc())
+
+    result = run_tuning_loop(
+        {"probe": {"max_retries": max_rounds}}, reference_run="train54",
+        log_dir=str(tmp_path), auto_analyze=True, auto_loop=True,
+        keep_params=keep_params,
+    )
+    audit = json.loads(Path(result["audit_path"]).read_text(encoding="utf-8"))
+    return result, audit, launched
+
+
+def test_auto_loop_keeps_the_better_baseline_when_a_round_regresses(tmp_path, monkeypatch):
+    """第二轮变差时，基线仍是第一轮；并且就此结束，不再继续下探。
+
+    这正是真实审计里 lr0 被逐轮腰斩（0.006→0.004→0.002）而指标不动的场景：
+    变差的运行不得接替基线，循环也不该继续消耗训练。
+    """
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005}),
+                   _auto_loop_decision({"lr0": 0.002})],
+        metrics=[{"mAP50": 0.60, "mAP50_95": 0.30},
+                 {"mAP50": 0.10, "mAP50_95": 0.05}],
+        max_rounds=5,
+    )
+
+    assert len(launched) == 2
+    assert audit["iterations"][1]["perception"]["reference_run"] == launched[0]
+    verdict = audit["iterations"][1]["round_verdict"]
+    assert verdict["improved"] is False
+    assert verdict["best_run"] == launched[0]
+    assert verdict["next_reference_run"] == launched[0]
+    assert result["stop_reason"] == "no_improvement"
+    assert result["baseline_run"] == launched[0]
+
+
+def test_auto_loop_improvement_moves_the_baseline_forward(tmp_path, monkeypatch):
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005}),
+                   _auto_loop_decision({"lr0": 0.002})],
+        metrics=[{"mAP50": 0.30, "mAP50_95": 0.10},
+                 {"mAP50": 0.70, "mAP50_95": 0.40}],
+        max_rounds=2,
+    )
+
+    assert audit["iterations"][1]["perception"]["reference_run"] == launched[0]
+    verdict = audit["iterations"][1]["round_verdict"]
+    assert verdict["improved"] is True
+    assert verdict["best_run"] == launched[1]
+    assert verdict["next_reference_run"] == launched[1]
+
+
+def test_auto_loop_stops_when_the_same_change_is_repeated(tmp_path, monkeypatch):
+    """第二轮给出与已执行轮次相同的实际参数：训练前就停止，不浪费一次训练。
+
+    旧实现在训练完成后才判定重复，因此永远会白白多跑一轮。
+    """
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005}),
+                   _auto_loop_decision({"lr0": 0.005})],
+        metrics=[{"mAP50": 0.60, "mAP50_95": 0.30}],
+        max_rounds=5,
+    )
+
+    assert len(launched) == 1
+    assert result["stop_reason"] == "repeated_change"
+    assert audit["stop_reason"] == "repeated_change"
+    verdict = audit["iterations"][1]["round_verdict"]
+    assert verdict["repeated_change"] is True
+    assert verdict["phase"] == "pre_training"
+
+
+def test_auto_loop_stops_on_parameter_oscillation_before_training(tmp_path, monkeypatch):
+    """同一个参数先增后减（来回摆动）时必须在训练前终止。"""
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.02}),
+                   _auto_loop_decision({"lr0": 0.005})],
+        metrics=[{"mAP50": 0.30, "mAP50_95": 0.10}],
+        max_rounds=5,
+    )
+
+    assert len(launched) == 1
+    assert result["stop_reason"] == "oscillation"
+    verdict = audit["iterations"][1]["round_verdict"]
+    assert verdict["oscillating_params"] == ["lr0"]
+    assert verdict["phase"] == "pre_training"
+
+
+def test_auto_loop_keep_params_launches_no_training(tmp_path, monkeypatch):
+    """LLM 返回 keep_params 是正常终态：不建目录、不构造命令、不启动训练。"""
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({}, action="keep_params")],
+        metrics=[{"mAP50": 0.60, "mAP50_95": 0.30}],
+        max_rounds=4,
+    )
+
+    assert launched == []
+    assert result["stop_reason"] == "keep_params"
+    assert audit["status"] == "completed"
+    assert audit["stop_reason"] == "keep_params"
+
+    iteration = audit["iterations"][0]
+    assert iteration["round_verdict"]["stop_reason"] == "keep_params"
+    assert iteration["round_verdict"]["phase"] == "pre_training"
+    # 审计闭环：决策、护栏结果与当前最佳基线都能追溯到
+    assert iteration["decision"]["action"] == "keep_params"
+    assert iteration["guardrails"]["valid"] is True
+    assert iteration["baseline"]["reference_run"] == "train54"
+    # 没有构造训练命令，也没有分配训练目录
+    assert iteration["execution"]["command"] == []
+    assert iteration["execution"]["train_name"] is None
+    # 没有创建任何调优运行目录（detect/ 下只剩原参考运行）
+    assert sorted(p.name for p in (tmp_path / "detect").iterdir()) == ["train54"]
+
+
+def test_auto_loop_repeated_after_clamping_stops_before_training(tmp_path, monkeypatch):
+    """重复必须按护栏处理后的实际执行值判断，而不是按模型原始建议值。
+
+    两轮建议的 lr0 不同（1e-6 / 1e-7），但都会被夹紧到同一个下界 1e-5：
+    实际准备执行的参数完全相同，因此第二轮不得再启动训练。
+    """
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 1e-6}),
+                   _auto_loop_decision({"lr0": 1e-7})],
+        metrics=[{"mAP50": 0.60, "mAP50_95": 0.30}],
+        max_rounds=5,
+    )
+
+    assert len(launched) == 1
+    assert audit["iterations"][0]["guardrails"]["clamped"]["lr0"] == 1e-5
+    assert audit["iterations"][1]["guardrails"]["clamped"]["lr0"] == 1e-5
+    assert result["stop_reason"] == "repeated_change"
+    assert audit["iterations"][1]["round_verdict"]["phase"] == "pre_training"
+
+
+def test_auto_loop_still_trains_a_genuinely_new_change(tmp_path, monkeypatch):
+    """真正的新参数建议仍照常启动训练（预训练判定不得误伤正常轮次）。"""
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005}),
+                   _auto_loop_decision({"lr0": 0.004}),
+                   _auto_loop_decision({"lr0": 0.003})],
+        metrics=[{"mAP50": 0.30, "mAP50_95": 0.10},
+                 {"mAP50": 0.40, "mAP50_95": 0.15},
+                 {"mAP50": 0.50, "mAP50_95": 0.20}],
+        max_rounds=3,
+    )
+
+    assert len(launched) == 3
+    assert [it["round_verdict"]["phase"] for it in audit["iterations"]] == [
+        "post_training", "post_training", "post_training"]
+
+
+def test_manual_train_with_original_params_still_launches_training(tmp_path, monkeypatch):
+    """用户主动选择「按原参数训练」时仍必须训练一次。
+
+    预训练停止只针对 LLM 在 auto_loop 里返回的 action=keep_params；显式的
+    keep_params 模式代表「用原参数跑一次」，且不调用 LLM，契约不变。
+    """
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[],
+        metrics=[{"mAP50": 0.60, "mAP50_95": 0.30}],
+        max_rounds=1,
+        keep_params=True,
+    )
+
+    assert len(launched) == 1
+    assert result["stop_reason"] == "keep_params"
+
+
+# ── Codex 复核 P1：进入调优前的原参考运行就是初始最佳基线 ──────────────────
+
+_HIGH_REFERENCE_METRICS = {
+    "mAP50": 0.90, "mAP50_95": 0.90, "precision": 0.90, "recall": 0.90,
+}
+_LOW_REFERENCE_METRICS = {
+    "mAP50": 0.10, "mAP50_95": 0.05, "precision": 0.10, "recall": 0.10,
+}
+
+
+def test_reference_run_is_the_initial_baseline_when_the_first_round_regresses(
+        tmp_path, monkeypatch):
+    """原参考综合分 0.90、首轮 0.16：基线仍是原参考运行，整体最佳不是首轮。"""
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005})],
+        metrics=[{"mAP50": 0.20, "mAP50_95": 0.10}],
+        max_rounds=3,
+        final_metrics=_HIGH_REFERENCE_METRICS,
+    )
+
+    assert len(launched) == 1
+    verdict = audit["iterations"][0]["round_verdict"]
+    assert verdict["improved"] is False
+    assert verdict["best_run"] == "train54"
+    assert verdict["best_score"] == pytest.approx(0.90)
+    assert verdict["next_reference_run"] == "train54"
+    assert result["stop_reason"] == "no_improvement"
+    assert result["baseline_run"] == "train54"
+    assert result["kept_reference_baseline"] is True
+
+    # 收尾报告不得把变差的首轮描述成整体最佳
+    summary = result["final_summary"]
+    assert summary["kept_reference_baseline"] is True
+    assert summary["reference_baseline"]["run_name"] == "train54"
+    assert summary["reference_baseline"]["score"] == pytest.approx(0.90)
+    text = Path(result["final_summary_path"]).read_text(encoding="utf-8")
+    assert "原参考运行" in text
+    assert "train54" in text
+
+
+def test_first_round_better_than_the_reference_replaces_the_baseline(tmp_path, monkeypatch):
+    """原参考 0.0875、首轮 0.93：只有这时首轮才接替基线。"""
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005})],
+        metrics=[{"mAP50": 0.95, "mAP50_95": 0.90}],
+        max_rounds=1,
+        final_metrics=_LOW_REFERENCE_METRICS,
+    )
+
+    verdict = audit["iterations"][0]["round_verdict"]
+    assert verdict["improved"] is True
+    assert verdict["best_run"] == launched[0]
+    assert result["reference_baseline"]["run_name"] == "train54"
+    assert result["reference_baseline"]["score"] == pytest.approx(0.0875)
+    assert result["kept_reference_baseline"] is False
+
+
+def test_reference_without_metrics_keeps_the_initial_baseline_unknown(
+        tmp_path, monkeypatch):
+    """原参考指标缺失：基线分数保持未知（None），绝不补造 0。
+
+    未知基线之后沿用既有的「首个可测分数即基线」语义（此时没有任何可比较的
+    历史最佳），但初始化本身必须是 None 而不是 0。
+    """
+    missing = {"mAP50": None, "mAP50_95": None, "precision": None, "recall": None}
+    result, audit, launched = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005})],
+        metrics=[{"mAP50": 0.30, "mAP50_95": 0.10}],
+        max_rounds=1,
+        final_metrics=missing,
+    )
+
+    assert result["reference_baseline"] == {"run_name": "train54", "score": None}
+
+    verdict = audit["iterations"][0]["round_verdict"]
+    assert verdict["improved"] is True
+    assert verdict["best_run"] == launched[0]
+
+
+def test_auto_loop_regression_does_not_promote_the_worse_run(tmp_path, monkeypatch):
+    """变差的运行不得成为被记录的最佳运行。"""
+    result, audit, _ = _auto_loop_harness(
+        monkeypatch, tmp_path,
+        decisions=[_auto_loop_decision({"lr0": 0.005}),
+                   _auto_loop_decision({"lr0": 0.002})],
+        metrics=[{"mAP50": 0.80, "mAP50_95": 0.50},
+                 {"mAP50": 0.05, "mAP50_95": 0.01}],
+        max_rounds=2,
+    )
+
+    assert result["best_iteration"] == 1
+    assert result["best_metrics"]["mAP50"] == 0.80
 
 
 def test_legal_chain_builds_command_once_and_audits_params(tmp_path, monkeypatch):
@@ -1669,3 +2015,94 @@ def test_keep_params_path_records_empty_decision_attempts(tmp_path, monkeypatch)
     assert result["failure"] is None
     audit = json.loads(Path(result["audit_path"]).read_text(encoding="utf-8"))
     assert audit["iterations"][0]["decision_attempts"] == []
+
+
+# ── F1.1-A Task 4：大模型调优继承参考运行的初始权重 ─────────────────
+
+
+def test_llm_tuning_inherits_the_reference_run_model():
+    """执行参数里的 model 必须就是参考运行 args.yaml 里的那一个。
+
+    大模型调优没有独立权重选择器，也不存在任何请求字段能覆盖它；合并只
+    在参考运行的 base_args 之上应用护栏校验过的超参数变更。
+    """
+    reference_args = {
+        "model": "detect/train63/weights/best.pt",
+        "batch": 16,
+        "imgsz": 640,
+        "lr0": 0.01,
+        "optimizer": "SGD",
+    }
+
+    merged, guard = sanitize_and_merge_tuning_params(
+        reference_args, {"lr0": 0.005}, {"batch": 8}, {"total_images": 230})
+
+    assert guard.valid is True
+    assert merged["model"] == reference_args["model"]
+    assert merged["lr0"] == 0.005
+    assert merged["batch"] == 8
+    # 参考运行里没有的模型字段绝不会被凭空造出来，也不会变成默认权重名
+    assert merged["model"] != "yolov8n.pt"
+
+
+def test_llm_tuning_never_executes_a_swapped_model():
+    """即使 LLM 违规给出 model 变更，也在结构契约边界被判不合法（零启动）。
+
+    model 只有「继承参考运行」这一种来源：它已不是可调参数，因此违规响应在
+    TuningDecision v1 解析阶段就以 unknown parameter 被拒绝，既不会进入 Q1.2
+    语义校验，也不可能进入执行参数；参考运行的基线不会被新权重悄悄沿用。
+    """
+    from auto_tune.modules.agent_engine.decision_contract import (
+        DecisionContractError,
+        parse_tuning_decision_response,
+    )
+    from auto_tune.modules.agent_engine.decision_semantics import (
+        validate_decision_semantics,
+    )
+    from auto_tune.modules.agent_engine.parameter_registry import (
+        get_tunable_parameter_names,
+    )
+    from auto_tune.modules.agent_engine.semantic_rules import (
+        get_semantic_parameter_set,
+    )
+
+    assert "model" not in get_tunable_parameter_names()
+    assert "model" not in get_semantic_parameter_set()
+
+    reference_model = "detect/train63/weights/best.pt"
+    package = {
+        "schema_version": "1.0", "fact_package_id": "sha256:test",
+        "task": "detect", "reference_run": "train63", "sources": {},
+        "facts": [
+            {"fact_id": "training.issue.underfitting", "value": True,
+             "source": "issue"},
+            {"fact_id": "training.params.model", "value": reference_model,
+             "source": "params"},
+        ],
+    }
+    decision = {
+        "schema_version": "1.0", "fact_package_id": "sha256:test",
+        "diagnosis": "d", "action": "adjust",
+        "hyperparameter_changes": {"model": "yolo11n.pt"},
+        "training_overrides": {},
+        "evidence_ids": {"model": ["training.issue.underfitting"]},
+    }
+
+    # 第一道边界：结构化契约直接拒绝，违规响应不产生任何 decision
+    with pytest.raises(DecisionContractError) as excinfo:
+        parse_tuning_decision_response(json.dumps(decision))
+    assert excinfo.value.error_code == "DECISION_SCHEMA_INVALID"
+    assert "model" in excinfo.value.detail
+
+    # 纵深防御：即便绕过解析器构造出该 decision，语义层也没有任何 model 规则
+    result = validate_decision_semantics(decision, package)
+    assert result["valid"] is False
+    assert result["parameter"] == "model"
+
+    # 执行参数里的 model 只能来自参考运行
+    executed, guard = sanitize_and_merge_tuning_params(
+        {"model": reference_model, "batch": 16, "imgsz": 640, "lr0": 0.01},
+        {}, {}, {"total_images": 230})
+    assert guard.valid is True
+    assert executed["model"] == reference_model
+    assert executed["model"] != "yolo11n.pt"

@@ -123,7 +123,7 @@ def test_start_persist_failure_rejects_before_subprocess(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 500
         assert "RUN_STATE_PERSIST_FAILED" in resp.text
@@ -150,7 +150,7 @@ def test_start_streams_run_id_phase_seq_and_terminal(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 200
         events = _sse_events(resp.text)
@@ -200,7 +200,7 @@ def test_start_failure_writes_failed_terminal(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 200
         assert "训练失败" in resp.text

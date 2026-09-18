@@ -1,6 +1,7 @@
 """Tests for the structured LLM decision boundary."""
 
 import json
+import re
 
 import pytest
 
@@ -305,7 +306,7 @@ def test_tuning_decision_first_pass_success_no_retry(monkeypatch):
 def test_tuning_decision_transport_error_no_retry(monkeypatch):
     calls = []
 
-    def boom(prompt, config):
+    def boom(prompt, config, **kwargs):
         calls.append(1)
         raise RuntimeError("DeepSeek API error: network_failed")
 
@@ -369,7 +370,7 @@ def test_tuning_prompt_semantic_summary_comes_from_registry():
     prompt = decision_agent.build_tuning_decision_prompt(_fact_package())
     assert "允许的超参数修改关系" in prompt
     assert "training.issue.plateau" in prompt
-    assert "未开放自动修改的参数" in prompt
+    assert "禁止修改参数" in prompt
     assert "lr0" in prompt
     # 语义摘要必须来自注册表：weight_decay 规则与超参列表都出现在提示词中
     assert "weight_decay" in prompt
@@ -382,7 +383,7 @@ def test_generate_suggestion_keeps_old_four_field_contract(monkeypatch):
         "hyperparameter_changes": {"lr0": 0.002},
         "training_overrides": {},
     })
-    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda p, c: old)
+    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda p, c, **k: old)
     result = decision_agent.generate_suggestion("summary", None, _tuning_config())
     assert result["error"] is None
     assert result["hyperparameter_changes"] == {"lr0": 0.002}
@@ -406,6 +407,51 @@ def test_tuning_prompt_unaffected_by_any_history():
     assert "training.params.lr0" in first
     assert "training.issue.overfitting" in first
     assert "fact_package_id" in first
+
+
+# ── 提示词可调集合必须与语义规则开放集合一致 ───────────────────────────────
+
+
+def _prompt_parameter_lists(prompt: str):
+    """从提示词里取出「可修改 / 禁止修改」两份参数清单。"""
+    opened = closed = None
+    for line in prompt.splitlines():
+        if line.startswith("- 可修改参数："):
+            opened = {p.strip() for p in line.split("：", 1)[1].split(",") if p.strip()}
+        elif line.startswith("- 禁止修改参数："):
+            closed = {p.strip() for p in line.split("：", 1)[1].split(",") if p.strip()}
+    return opened, closed
+
+
+def test_tuning_prompt_advertises_only_semantically_open_parameters():
+    """提示词宣布的可调集合必须等于语义规则开放集合。
+
+    宣布全部可调参数而其中大多数没有任何语义关系，等于把一批必然失败的选择
+    摆到模型面前：模型一旦选中就是 DECISION_SEMANTIC_UNSUPPORTED /
+    NO_SUPPORTING_RULE，本轮直接失败（生产真实审计中已出现同类失败）。
+    未开放参数必须被显式标注为禁止修改，而不是只在末尾附带一句。
+    """
+    from auto_tune.modules.agent_engine.parameter_registry import (
+        get_tunable_parameter_names,
+    )
+    from auto_tune.modules.agent_engine.semantic_rules import get_semantic_parameter_set
+
+    opened_param_set = set(get_semantic_parameter_set())
+    all_tunable = set(get_tunable_parameter_names())
+
+    opened, closed = _prompt_parameter_lists(
+        decision_agent.build_tuning_decision_prompt(_fact_package()))
+
+    assert opened == opened_param_set
+    assert closed == all_tunable - opened_param_set
+    assert not (opened & closed)
+
+
+def test_tuning_prompt_states_that_closed_parameters_fail_the_round():
+    prompt = decision_agent.build_tuning_decision_prompt(_fact_package())
+    assert "禁止修改参数" in prompt
+    # 规则 1 不得再把「全部可调参数」说成允许修改
+    assert "只允许调整以下参数" not in prompt
 
 
 def test_build_tuning_decision_prompt_rejects_previous_attempts():
@@ -590,3 +636,219 @@ def test_semantic_correction_prompt_carries_rules_and_package_id():
     assert "重新独立输出完整且合法的 TuningDecision v1" in prompt
     assert "ORIGINAL" in prompt
 
+
+# ── F1.1-A 复审 Task 2：model 不再是 LLM 可调参数 ──────────────────────────
+
+_MODEL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])model(?![A-Za-z0-9_])")
+
+
+def test_legacy_decision_prompt_does_not_offer_model_as_a_tunable_parameter():
+    """旧决策提示词不得再把 model 列入 training_overrides / 可调参数。"""
+    prompt = decision_agent.build_decision_prompt("感知摘要（不含权重字样）")
+    assert _MODEL_TOKEN_RE.search(prompt) is None
+
+
+def test_structured_decision_prompt_does_not_offer_model_as_a_tunable_parameter():
+    """新版结构化决策提示词（允许参数列表 + 语义摘要）不得出现 model。"""
+    prompt = decision_agent.build_tuning_decision_prompt(_fact_package())
+    allowed = [line for line in prompt.splitlines() if line.startswith("- 可修改参数：")]
+    assert allowed, "提示词缺少可修改参数列表"
+    assert "model" not in allowed[0]
+    assert _MODEL_TOKEN_RE.search(prompt) is None
+
+
+def test_legacy_parser_rejects_a_model_change():
+    """旧解析入口同样在结构边界拒绝 model（不进入语义校验）。"""
+    raw = json.dumps({
+        "diagnosis": "换模型",
+        "action": "换更大模型",
+        "hyperparameter_changes": {"model": "yolo11n.pt"},
+        "training_overrides": {},
+    })
+    result = parse_decision_response(raw)
+    assert result["error"] == "Unknown parameter(s): model"
+
+
+# ── F1.1-A 第二轮复审 Task 1：提示词不得再诱导“换更大模型” ────────────────────
+
+# 第一轮复审已复现：model 虽已脱离可调参数注册表，旧提示词规则8 仍写着“换更大模型”，
+# 于是 LLM 按提示输出 model，又在结构契约处以未知参数被拒，导致整轮调优失败。
+_MODEL_SWAP_PHRASES = (
+    "换更大模型", "换模型", "更换模型", "更大模型", "更换权重", "切换权重",
+    "换权重的模型",
+)
+
+
+def _model_fact_package():
+    """真实 FactPackage：参考运行的 model 作为只读事实进入事实包。"""
+    package = _fact_package()
+    package["facts"] = list(package["facts"]) + [
+        {"fact_id": "training.params.model", "value": "yolov8n.pt", "source": "params"},
+    ]
+    return package
+
+
+def _underfitting_rule(prompt: str) -> str:
+    """抽取“规则8：欠拟合”整段（到下一个同级/更高级小节为止）。"""
+    start = prompt.index("### 规则8")
+    rest = prompt[start:]
+    boundaries = [pos for pos in (rest.find("\n### ", 1), rest.find("\n## ", 1))
+                  if pos != -1]
+    return rest if not boundaries else rest[:min(boundaries)]
+
+
+def test_legacy_decision_prompt_never_suggests_swapping_the_model():
+    """旧决策提示词不得再给出任何“换更大模型 / 更换权重”的正向调优动作。"""
+    prompt = decision_agent.build_decision_prompt("感知摘要")
+    for phrase in _MODEL_SWAP_PHRASES:
+        assert phrase not in prompt, f"旧提示词仍在建议 {phrase}"
+
+
+def test_legacy_underfitting_rule_only_offers_supported_parameters():
+    """欠拟合规则只能建议允许且有语义规则支撑的参数，并声明权重不可修改。"""
+    rule = _underfitting_rule(decision_agent.build_decision_prompt("感知摘要"))
+    for phrase in _MODEL_SWAP_PHRASES:
+        assert phrase not in rule
+    # 模型 / 初始权重属于参考运行的不可变条件
+    assert "禁止" in rule
+    assert "模型" in rule or "权重" in rule
+    # 只保留有语义规则支撑的方向：epochs 增大、weight_decay 减小，小目标时 imgsz/box 增大
+    for parameter in ("epochs", "weight_decay", "imgsz", "box"):
+        assert parameter in rule
+    # 欠拟合在语义规则里没有任何 lr0 关系，方向相反的建议更不允许出现
+    assert "lr0" not in rule
+
+
+def test_structured_decision_prompt_shows_the_reference_model_as_a_read_only_fact():
+    """含真实 training.params.model 事实时：事实可见、参数列表不含它、写入被明确禁止。"""
+    prompt = decision_agent.build_tuning_decision_prompt(_model_fact_package())
+    # 参考模型仍是只读事实，不得为了让 token 检查通过而把它从事实包里删掉
+    assert "training.params.model" in prompt
+    assert "yolov8n.pt" in prompt
+
+    allowed = [line for line in prompt.splitlines() if line.startswith("- 可修改参数：")]
+    assert allowed, "提示词缺少可修改参数列表"
+    assert "model" not in allowed[0]
+
+    forbid = [line for line in prompt.splitlines()
+              if "禁止" in line
+              and "hyperparameter_changes" in line
+              and "training_overrides" in line]
+    assert forbid, "结构化提示词必须明确禁止把模型写入两个修改对象"
+    assert any("模型" in line or "权重" in line for line in forbid)
+
+
+def test_neither_decision_prompt_suggests_swapping_the_model():
+    """两套仍在使用的提示词都不得出现任何“建议换模型”的语义。"""
+    prompts = {
+        "legacy": decision_agent.build_decision_prompt("感知摘要"),
+        "structured": decision_agent.build_tuning_decision_prompt(_model_fact_package()),
+    }
+    for name, prompt in prompts.items():
+        for phrase in _MODEL_SWAP_PHRASES:
+            assert phrase not in prompt, f"{name} 提示词仍在建议 {phrase}"
+
+
+# ── 结构化调参请求的 JSON 输出约束与文本模型默认值 ──────────────────────────
+
+
+def _capture_payloads(monkeypatch, contents):
+    """真实走完 call_decision_llm，只把每次请求的 JSON body 记下来。"""
+    payloads = []
+    replies = iter(contents)
+
+    def fake_post(url, **kwargs):
+        payloads.append(kwargs["json"])
+        return _FakeResponse(
+            payload={"choices": [{"message": {"content": next(replies)}}]}
+        )
+
+    monkeypatch.setattr(decision_agent, "resolve_credential", lambda purpose: "resolved-secret")
+    monkeypatch.setattr(
+        decision_agent,
+        "validate_endpoint",
+        lambda endpoint, allow_private: "https://resolved.example/v1/chat/completions",
+    )
+    monkeypatch.setattr(decision_agent.requests, "post", fake_post)
+    return payloads
+
+
+def test_tuning_decision_request_carries_json_response_format(monkeypatch):
+    payloads = _capture_payloads(monkeypatch, [_tuning_json()])
+
+    result = decision_agent.decide_hyperparameters(_fact_package(), _tuning_config())
+
+    assert result["error"] is None
+    assert len(payloads) == 1
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_tuning_correction_retry_request_carries_json_response_format(monkeypatch):
+    bad = _tuning_json(evidence_ids={"lr0": ["invented.fact"]})
+    good = _tuning_json(evidence_ids={"lr0": ["training.issue.plateau"]})
+    payloads = _capture_payloads(monkeypatch, [bad, good])
+
+    result = decision_agent.decide_hyperparameters(_fact_package(), _tuning_config())
+
+    assert result["error"] is None
+    assert result["retried"] is True
+    assert len(payloads) == 2
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+
+
+def test_plain_text_decision_call_has_no_json_response_format(monkeypatch):
+    """终局摘要等纯文本调用不得被强制成 JSON 输出。"""
+    payloads = _capture_payloads(monkeypatch, ["本轮 lr0 调整有效"])
+
+    assert call_decision_llm("请用中文给出文本总结", _yaml_key_config()) == "本轮 lr0 调整有效"
+
+    assert "response_format" not in payloads[0]
+
+
+def test_decision_llm_default_text_model_is_deepseek_flash(monkeypatch):
+    payloads = _capture_payloads(monkeypatch, ["ok"])
+
+    call_decision_llm("prompt", {"llm": {"endpoint": "https://api.deepseek.com/v1/x"}})
+
+    assert payloads[0]["model"] == "deepseek-flash"
+
+
+def test_decision_llm_configured_model_still_wins(monkeypatch):
+    payloads = _capture_payloads(monkeypatch, ["ok"])
+
+    call_decision_llm("prompt", _yaml_key_config())
+
+    assert payloads[0]["model"] == "deepseek-v4-flash"
+
+
+_SUGGESTION_JSON = json.dumps({
+    "diagnosis": "学习率偏高",
+    "action": "降低学习率",
+    "hyperparameter_changes": {"lr0": 0.002},
+    "training_overrides": {},
+}, ensure_ascii=False)
+
+
+def test_generate_suggestion_request_carries_json_response_format(monkeypatch):
+    payloads = _capture_payloads(monkeypatch, [_SUGGESTION_JSON])
+
+    result = decision_agent.generate_suggestion("summary", None, _tuning_config())
+
+    assert result["error"] is None
+    assert len(payloads) == 1
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_generate_suggestion_json_fix_retry_carries_json_response_format(monkeypatch):
+    payloads = _capture_payloads(monkeypatch, ["完全不是 JSON {{", _SUGGESTION_JSON])
+
+    result = decision_agent.generate_suggestion("summary", None, _tuning_config())
+
+    assert result["error"] is None
+    assert result["retried"] is True
+    assert len(payloads) == 2
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+    # 纠错重试仍是同一个任务，只是要求重新输出合法 JSON
+    assert "JSON" in payloads[1]["messages"][1]["content"]

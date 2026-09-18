@@ -18,6 +18,30 @@ from auto_tune.modules.agent_engine.decision_contract import (
 )
 
 
+def test_truncated_response_is_reported_as_incomplete():
+    """被截断的响应必须与「根本不是 JSON」区分开。
+
+    实测中 ``DECISION_SCHEMA_INVALID`` 的一个真实成因是 provider 返回了半截
+    JSON（对象未闭合）：此时纠错提示若只说「请输出 JSON」，并没有对症。稳定
+    错误码不变，只把 detail 说得更准确，让纠错能针对「输出被截断」。
+    """
+    truncated = '{"schema_version": "1.0", "diagnosis": "指标偏高", "action": "adjust",'
+
+    with pytest.raises(DecisionContractError) as excinfo:
+        parse_tuning_decision_response(truncated)
+
+    assert excinfo.value.error_code == "DECISION_SCHEMA_INVALID"
+    assert "incomplete" in excinfo.value.detail
+
+
+def test_non_json_response_keeps_the_generic_detail():
+    with pytest.raises(DecisionContractError) as excinfo:
+        parse_tuning_decision_response("抱歉，我无法给出任何建议。")
+
+    assert excinfo.value.error_code == "DECISION_SCHEMA_INVALID"
+    assert "not a JSON object" in excinfo.value.detail
+
+
 PACKAGE = {
     "schema_version": "1.0",
     "fact_package_id": "sha256:abc",
@@ -124,6 +148,31 @@ def test_unknown_parameter_rejected():
         evidence_ids={"not_a_param": ["training.issue.overfitting"]},
     ))
     assert code == "DECISION_SCHEMA_INVALID"
+
+
+def test_model_is_not_a_tunable_parameter():
+    """大模型调优不得选择权重：model 从统一可调参数注册表移除。"""
+    from auto_tune.modules.agent_engine.parameter_registry import (
+        get_tunable_parameter_names,
+    )
+
+    assert "model" not in get_tunable_parameter_names()
+
+
+@pytest.mark.parametrize("bucket", ["hyperparameter_changes", "training_overrides"])
+def test_model_change_is_rejected_at_the_schema_boundary(bucket):
+    """违规 model 建议必须在结构契约阶段被拒，不进入语义校验或执行阶段。"""
+    overrides = {
+        "hyperparameter_changes": {},
+        "training_overrides": {},
+        "evidence_ids": {},
+        bucket: {"model": "yolo11n.pt"},
+    }
+    with pytest.raises(DecisionContractError) as excinfo:
+        _parse(**overrides)
+    assert excinfo.value.error_code == "DECISION_SCHEMA_INVALID"
+    assert "unknown parameter" in excinfo.value.detail
+    assert "model" in excinfo.value.detail
 
 
 def test_more_than_three_changes_rejected():

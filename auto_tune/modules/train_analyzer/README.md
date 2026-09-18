@@ -33,7 +33,7 @@ report = analyze_training_results("detect", config, enable_llm=False, enable_vis
 
 ### Stage 2：LLM 文本诊断
 将 Stage 1 的结构化数据发给 DeepSeek，返回自然语言诊断。
-- 模型：`deepseek-v4-flash`
+- 模型：`deepseek-flash`
 - 费用：约 200 tokens/次
 - 输出：`report["llm_analysis"][run_name]["llm_diagnosis"]`
 
@@ -50,7 +50,7 @@ report = analyze_training_results("detect", config, enable_llm=False, enable_vis
 llm:
   provider: deepseek
   api_key: sk-xxx
-  model: deepseek-v4-flash
+  model: deepseek-flash
   endpoint: https://api.deepseek.com/v1/chat/completions
   temperature: 0.3
   max_tokens: 2000
@@ -113,7 +113,7 @@ train_analyzer:
   "llm_analysis": {
     "train10": {
       "llm_diagnosis": "## 1. 质量评估...（中文自然语言）",
-      "model_used": "deepseek-v4-flash",
+      "model_used": "deepseek-flash",
       "error": null
     }
   },

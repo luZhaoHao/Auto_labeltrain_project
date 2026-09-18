@@ -248,14 +248,16 @@ def _finalize_counter():
                       tuning_context=None, **kw):
         calls.append(run_name)
         n = len(calls)
+        # 每轮都严格优于上一轮，且首轮已高于参考运行基线：多轮策略只在真改善后
+        # 才继续下一轮（见 round_policy），指标若不递增，第一轮就会被判无改善而终止。
         return {
             "run_id": f"tuning:{session_id}:{run_name}",
             "run_name": run_name,
             "source": "tuning",
             "status": "completed",
             "analysis_status": "completed",
-            "metrics": {"mAP50": n * 0.1, "mAP50_95": n * 0.05,
-                        "precision": n * 0.1, "recall": n * 0.1},
+            "metrics": {"mAP50": 0.20 + n * 0.10, "mAP50_95": 0.10 + n * 0.05,
+                        "precision": 0.20 + n * 0.10, "recall": 0.20 + n * 0.10},
             "epochs": {"configured": 100, "completed": 3, "best": 2},
             "artifacts": {"report_path": str(Path(log_dir) / f"{run_name}_report.json")},
             "analysis_error": None, "history_error": None, "index_error": None, "error": None,
@@ -267,8 +269,18 @@ def _finalize_counter():
 def _auto_loop_setup(monkeypatch, tmp_path):
     detect = _loop_setup(
         monkeypatch, tmp_path, _available_perception("train53"),
-        _decision(overrides={"epochs": 40, "patience": 30}),
+        _decision(overrides={"epochs": 35, "patience": 20}),
     )
+    # 多轮策略禁止重复同一组变更（重复即「无合理新动作」，应终止，见
+    # round_policy）。夹具因此逐轮给出不同的 epochs，让三轮各构成一次新调整。
+    rounds = []
+
+    def _next_decision(*_args, **_kwargs):
+        rounds.append(1)
+        return _decision(overrides={"epochs": 30 + 5 * len(rounds), "patience": 20})
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
+                        _next_decision)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.validate_training_preflight",
                         lambda *a, **k: [])
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_yolo_command",
@@ -325,8 +337,16 @@ def test_auto_loop_long_reference_does_not_grow_name(tmp_path, monkeypatch):
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_perception",
                         lambda **k: _available_perception(long_ref))
     _mock_fact_package(monkeypatch)
+    # 逐轮给出不同的 epochs：重复同一组实际参数会在训练前终止（见 round_policy），
+    # 那样就没有第二轮运行名可比对了。
+    rounds = []
+
+    def _decision_for_round(*_a, **_k):
+        rounds.append(1)
+        return _decision(overrides={"epochs": 30 + 10 * len(rounds), "patience": 30})
+
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.decide_hyperparameters",
-                        lambda *a, **k: _decision(overrides={"epochs": 40, "patience": 30}))
+                        _decision_for_round)
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.validate_training_preflight",
                         lambda *a, **k: [])
     monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_yolo_command",
@@ -387,7 +407,7 @@ def test_auto_loop_produces_final_summary_txt(tmp_path, monkeypatch):
     summary = result["final_summary"]
     assert summary["best_train_name"] == train_names[2]  # highest mAP50 wins
     assert summary["best_iteration"] == 3
-    assert summary["best_metrics"]["mAP50"] == pytest.approx(0.3)
+    assert summary["best_metrics"]["mAP50"] == pytest.approx(0.5)
     best_dir = tmp_path / "detect" / train_names[2]
     txt = best_dir / "tuning_final_summary.txt"
     assert txt.exists()

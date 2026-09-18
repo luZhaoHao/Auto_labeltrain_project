@@ -27,7 +27,6 @@ _BASE_FACTS = {
     "training.issue.early_stop_too_soon": True,
     "training.curve.val_box_loss": "rising",
     "training.curve.val_cls_loss": "rising",
-    "training.curve.mAP50": "saturated",
     "dataset.issue.tiny_bbox_high_ratio": True,
     "dataset.issue.long_tail_class": True,
     "dataset.issue.center_spatial_bias": True,

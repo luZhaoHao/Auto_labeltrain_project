@@ -45,8 +45,10 @@ class ManualRunController:
         finalize_cb,
         broker,
         manager,
+        reservation_token=None,
     ):
         self.run_id = run_state.run_id
+        self.reservation_token = reservation_token
         self.run_state = run_state
         self.state_file = state_file
         self.cmd = cmd
@@ -336,3 +338,20 @@ class ManualRunController:
                 self.manager.retain(self.run_id, self)
             except Exception:
                 pass
+            self._release_reservation()
+
+    def _release_reservation(self) -> None:
+        """Free the training slot only after the controller truly finished.
+
+        A foreign/expired token must never release someone else's slot, so any
+        mismatch is swallowed here (the slot belongs to a different owner).
+        """
+        token = self.reservation_token
+        if token is None:
+            return
+        try:
+            self.manager.release(token)
+        except Exception:
+            pass
+        finally:
+            self.reservation_token = None

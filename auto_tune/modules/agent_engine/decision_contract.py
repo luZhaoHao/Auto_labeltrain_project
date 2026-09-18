@@ -54,6 +54,16 @@ def _schema_error(detail: str):
     raise DecisionContractError("DECISION_SCHEMA_INVALID", detail)
 
 
+def _looks_truncated(text: str) -> bool:
+    """回应里出现了对象起始但括号未闭合——典型的被截断响应。
+
+    与「根本没输出 JSON」是两类不同故障：前者对症的纠错是「输出更短且完整
+    闭合」，后者是「请输出 JSON」。实测中两者都出现过，稳定错误码相同，只靠
+    detail 区分。
+    """
+    return text.count("{") > text.count("}")
+
+
 def parse_tuning_decision_response(text: str) -> dict:
     """Parse and structurally validate one TuningDecision v1 response.
 
@@ -65,6 +75,8 @@ def parse_tuning_decision_response(text: str) -> dict:
         _schema_error("response must be text")
     parsed = _extract_json(text)
     if not isinstance(parsed, dict):
+        if _looks_truncated(text):
+            _schema_error("response JSON is incomplete: the object was never closed")
         _schema_error("response is not a JSON object")
 
     if set(parsed) != ROOT_FIELDS:
