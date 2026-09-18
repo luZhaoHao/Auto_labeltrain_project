@@ -1,5 +1,6 @@
 """H1.1 HpoService 组合与恢复幂等测试 — 合成快照/模型，无训练/LLM/网络。"""
 
+import json
 import os
 import uuid
 from pathlib import Path
@@ -583,3 +584,74 @@ def test_success_without_mode_fields_still_accepted_for_legacy_studies(root, hpo
                                       evidence=_evidence(1, epoch=2)))
     assert stored.result.evidence.evaluation_mode is None
     assert stored.result.value == 0.42
+
+
+# ── F1.1-A 复审 Task 3：新研究冻结模型 mtime ───────────────────────────
+
+
+def _drop_model_mtime_ns(study_json: Path) -> None:
+    """把 study.json 改写成缺少 model_mtime_ns 的旧 hpo-study-v1 记录。"""
+    payload = json.loads(study_json.read_text(encoding="utf-8"))
+    assert "model_mtime_ns" in payload["model_binding"]
+    payload["model_binding"].pop("model_mtime_ns")
+    study_json.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                          encoding="utf-8")
+
+
+def _bump_mtime(path: Path, delta_ns: int) -> None:
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + delta_ns))
+
+
+def test_new_study_freezes_the_model_mtime(root, hpo_inputs):
+    snapshot, model = hpo_inputs
+    service = HpoService(root)
+    study = service.create_study(StudyConfig(budget=1), snapshot_dir=snapshot,
+                                 model_path=model)
+
+    assert study.model_binding.model_mtime_ns == model.stat().st_mtime_ns
+    # 持久化并重新打开后 mtime 不丢失
+    reopened = HpoService(root).load_study(study.study_id)
+    assert reopened.model_binding.model_mtime_ns == model.stat().st_mtime_ns
+    assert reopened.model_binding.model_bytes == model.stat().st_size
+
+
+def test_mtime_only_change_gives_binding_mismatch(root, hpo_inputs):
+    snapshot, model = hpo_inputs
+    service = HpoService(root)
+    study = service.create_study(StudyConfig(budget=2), snapshot_dir=snapshot,
+                                 model_path=model)
+    target = root / study.study_id / "study.json"
+    before = target.read_bytes()
+
+    _bump_mtime(model, 1_000_000)
+    # 只有 mtime 变了：内容与大小都不变
+    assert model.stat().st_size == study.model_binding.model_bytes
+
+    with pytest.raises(HpoError) as err:
+        service.validate_binding(study.study_id)
+    assert err.value.code == "HPO_BINDING_MISMATCH"
+    assert target.read_bytes() == before
+
+
+def test_legacy_study_without_mtime_keeps_the_old_binding_contract(root, hpo_inputs):
+    snapshot, model = hpo_inputs
+    service = HpoService(root)
+    study = service.create_study(StudyConfig(budget=1), snapshot_dir=snapshot,
+                                 model_path=model)
+    _drop_model_mtime_ns(root / study.study_id / "study.json")
+
+    # 缺少该字段的旧记录仍可读取，值为 None，不算损坏
+    reopened = HpoService(root).load_study(study.study_id)
+    assert reopened.model_binding.model_mtime_ns is None
+    assert reopened.model_binding.model_bytes == model.stat().st_size
+
+    # 旧契约不冻结 mtime：只改 mtime 仍可通过
+    _bump_mtime(model, 5_000_000)
+    service.validate_binding(study.study_id)
+
+    # 但内容变化仍然必须失败
+    model.write_bytes(b"legacy-model-tampered")
+    with pytest.raises(HpoError) as err:
+        service.validate_binding(study.study_id)
+    assert err.value.code == "HPO_BINDING_MISMATCH"

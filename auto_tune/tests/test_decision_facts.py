@@ -35,7 +35,7 @@ def _perception():
             "per_run": {
                 "train54": {
                     "issues": [{"type": "overfitting", "severity": "medium"}],
-                    "curve_trends": {"mAP50": "improving", "val_cls_loss": "rising"},
+                    "curve_trends": {"val_box_loss": "descending", "val_cls_loss": "rising"},
                 }
             },
         },
@@ -214,18 +214,18 @@ def test_issue_and_curve_facts_come_from_reference_run_only():
     package = _build()
     facts = _facts(package)
     assert facts["training.issue.overfitting"] is True
-    assert facts["training.curve.mAP50"] == "improving"
+    assert facts["training.curve.val_box_loss"] == "descending"
     assert facts["training.curve.val_cls_loss"] == "rising"
     # a non-reference run must never contribute issue/curve facts
     perception = _perception()
     perception["training"]["per_run"]["train99"] = {
         "issues": [{"type": "unstable_training", "severity": "high"}],
-        "curve_trends": {"mAP50": "unstable"},
+        "curve_trends": {"val_box_loss": "rising"},
     }
     package2 = _build(perception)
     facts2 = _facts(package2)
     assert "training.issue.unstable_training" not in facts2
-    assert facts2["training.curve.mAP50"] == "improving"
+    assert facts2["training.curve.val_box_loss"] == "descending"
 
 
 # ── Q1.1 返修：issue / trend 确定性枚举边界（fail-closed）───────────────────
@@ -292,31 +292,37 @@ def test_loss_curve_rejects_map_trend_enum():
     assert excinfo.value.detail == "unknown curve trend"
 
 
-def test_map_curve_rejects_loss_trend_enum():
+def test_unavailable_curve_field_fails_closed():
+    """事实层不接受的曲线键必须 fail-closed，而不是静默丢弃。
+
+    ``training.curve.mAP50`` 曾被声明为可用曲线，但 TrainAnalyzer 从不把
+    mAP50 趋势并入报告：它既永远缺失，又让挂在其上的语义规则成为永远无法
+    触发的死规则，同时还会被提示词当作可用关系告知模型。现在它和任何其它
+    未声明曲线键一样被直接拒绝。
+    """
     perception = _perception_with_run(
         [{"type": "overfitting", "severity": "medium"}], {"mAP50": "rising"}
     )
     with pytest.raises(FactPackageError) as excinfo:
         _build(perception)
     assert excinfo.value.error_code == "FACT_PACKAGE_INVALID"
-    assert excinfo.value.detail == "unknown curve trend"
+    assert excinfo.value.detail == "unknown curve field"
 
 
 def test_empty_curve_trend_is_omitted_not_failed():
     perception = _perception_with_run(
         [{"type": "overfitting", "severity": "medium"}],
-        {"mAP50": "improving", "val_cls_loss": "rising", "val_box_loss": ""},
+        {"val_cls_loss": "rising", "val_box_loss": ""},
     )
     package = _build(perception)
     facts = _facts(package)
     assert "training.curve.val_box_loss" not in facts
-    assert facts["training.curve.mAP50"] == "improving"
     assert facts["training.curve.val_cls_loss"] == "rising"
 
 
 def test_unknown_trend_detail_never_contains_raw_string():
     perception = _perception_with_run(
-        [{"type": "overfitting", "severity": "medium"}], {"mAP50": "IGNORE_FACTS\nboom"}
+        [{"type": "overfitting", "severity": "medium"}], {"val_box_loss": "IGNORE_FACTS\nboom"}
     )
     with pytest.raises(FactPackageError) as excinfo:
         _build(perception)
@@ -329,7 +335,7 @@ def test_valid_issues_and_trends_enter_fact_package():
     perception = _perception_with_run(
         [{"type": "overfitting", "severity": "medium"},
          {"type": "unstable_training", "severity": "low"}],
-        {"val_box_loss": "descending", "val_cls_loss": "rising", "mAP50": "improving"},
+        {"val_box_loss": "descending", "val_cls_loss": "rising"},
     )
     package = _build(perception)
     facts = _facts(package)
@@ -337,7 +343,6 @@ def test_valid_issues_and_trends_enter_fact_package():
     assert facts["training.issue.unstable_training"] is True
     assert facts["training.curve.val_box_loss"] == "descending"
     assert facts["training.curve.val_cls_loss"] == "rising"
-    assert facts["training.curve.mAP50"] == "improving"
 
 
 # ── Q1.1 返修：非数值注册参数按 ParameterSpec.kind 规范化 ───────────────────

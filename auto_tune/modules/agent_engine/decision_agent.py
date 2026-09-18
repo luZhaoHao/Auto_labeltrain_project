@@ -135,7 +135,9 @@ def build_decision_prompt(
 
 ### 规则8：欠拟合（所有指标偏低）
 - 现象：mAP50 < 0.3, Recall < 0.4
-- 动作：换更大模型, imgsz 提升, lr0 适当提高, 增加 epochs
+- 动作：增加 epochs（不超过当前值的 2 倍）；当前 weight_decay > 0 时减小 weight_decay（不低于当前值的 25%）
+- 可选（仅当同时存在小目标占比高时）：imgsz 或 box 提升（不超过当前值的 2 倍）
+- 约束：模型与初始权重是参考运行的不可变条件，禁止更换；它们不得出现在 hyperparameter_changes 或 training_overrides 中
 """
 
     prompt = f"""你是YOLOv8超参数优化专家。你的任务是基于数据集分析和训练结果，给出精确的超参数调整建议。
@@ -162,7 +164,7 @@ def build_decision_prompt(
 ```
 
 - `hyperparameter_changes`: 只包含需要**修改**的参数（从当前值改为新值）
-- `training_overrides`: 训练配置层面的修改（epochs, patience, imgsz, optimizer, model等）
+- `training_overrides`: 训练配置层面的修改（epochs, patience, imgsz, optimizer等）
 - 只修改必要的参数，不要一次性改太多（正常模式每轮最多修改 3 个参数）
 - 如果判断当前无需调整超参数，`action` 必须为 `keep_params`，此时两个参数对象都为空
 
@@ -211,12 +213,15 @@ def build_decision_prompt(
     return prompt
 
 
-def call_decision_llm(prompt: str, config: dict) -> str:
+def call_decision_llm(prompt: str, config: dict, json_mode: bool = False) -> str:
     """Call DeepSeek API for decision using the resolved text credential.
 
     Args:
         prompt: the decision prompt.
         config: full config dict (uses llm section).
+        json_mode: request a strict JSON object response. Only structured
+            decision requests set this; plain-text calls (e.g. the closing
+            summary) must leave it off so the model can answer in prose.
 
     Returns:
         Raw response text.
@@ -237,7 +242,7 @@ def call_decision_llm(prompt: str, config: dict) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": llm_cfg.get("model", "deepseek-v4-flash"),
+        "model": llm_cfg.get("model", "deepseek-flash"),
         "messages": [
             {"role": "system", "content": "你是YOLOv8超参数优化专家。输出严格的JSON格式，不要包含JSON之外的文本。"},
             {"role": "user", "content": prompt},
@@ -245,6 +250,8 @@ def call_decision_llm(prompt: str, config: dict) -> str:
         "temperature": 0.3,
         "max_tokens": 2000,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
 
     try:
         resp = requests.post(
@@ -271,7 +278,6 @@ def build_tuning_decision_prompt(fact_package: dict) -> str:
     the package.
     """
     package_json = json.dumps(fact_package, ensure_ascii=False, sort_keys=True)
-    allowed = ", ".join(sorted(get_tunable_parameter_names()))
     semantic_summary = build_semantic_rule_summary()
     return f"""你是YOLOv8超参数优化专家。你只能依据下方"事实包"中给出的真实事实做决策，禁止编造事实。
 
@@ -299,7 +305,7 @@ def build_tuning_decision_prompt(fact_package: dict) -> str:
 
 ## 规则
 
-1. 只允许调整以下参数：{allowed}
+1. 只能从下方「允许的超参数修改关系」中的「可修改参数」里选参数；「禁止修改参数」一律不可写入 hyperparameter_changes 或 training_overrides。
 2. hyperparameter_changes 与 training_overrides 合并后必须有 1-3 个参数；若判断无需调整，action 必须为 keep_params 且两个参数对象与 evidence_ids 都为空。
 3. 每个修改参数必须在 evidence_ids 中给出至少一个 fact_id；evidence_ids 的键必须与本次修改的参数完全一致。
 4. 只能引用上方事实包中真实存在的 fact_id，禁止编造事实。
@@ -307,7 +313,10 @@ def build_tuning_decision_prompt(fact_package: dict) -> str:
 6. 每个修改参数必须符合下方"允许的超参数修改关系"：引用的证据必须能支持该参数，方向与幅度必须匹配；不满足任何关系、方向相反或幅度越界的修改会导致本轮失败。
 7. 系统不会为你提供或猜测替代参数值。你必须依据同一事实包及上述语义规则，自行输出完整且合法的 TuningDecision v1。
 
-## 允许的超参数修改关系（唯一事实—参数映射）
+## 不可修改的参考条件
+
+参考运行已经使用的模型与初始权重属于**不可变条件**：事实包中的参考模型事实只是只读事实，用于理解当前基线，不构成可调参数。
+禁止把模型或权重（含模型文件名）写入 hyperparameter_changes 或 training_overrides；这类输出会在结构校验阶段以未知参数被拒绝，本轮调优随即失败且不会启动任何训练。
 
 {semantic_summary}
 """
@@ -496,7 +505,7 @@ def _run_tuning_decision_with_retry(
     carries the stable code.
     """
     try:
-        raw = call_decision_llm(prompt, config)
+        raw = call_decision_llm(prompt, config, json_mode=True)
     except Exception as e:
         return None, str(e), _default_tuning_validation(False)
 
@@ -514,7 +523,7 @@ def _run_tuning_decision_with_retry(
         correction = build_tuning_correction_prompt(
             prompt, fact_package, validation["error_code"], validation["error_detail"])
     try:
-        raw2 = call_decision_llm(correction, config)
+        raw2 = call_decision_llm(correction, config, json_mode=True)
     except Exception as e:
         return raw, str(e), _default_tuning_validation(True)
 
@@ -566,7 +575,7 @@ def _run_decision_with_retry(prompt: str, config: dict) -> tuple[str | None, dic
     Returns (raw_response, parsed_dict | stable_error_str, retried).
     """
     try:
-        raw = call_decision_llm(prompt, config)
+        raw = call_decision_llm(prompt, config, json_mode=True)
     except Exception as e:
         return None, str(e), False
 
@@ -576,7 +585,7 @@ def _run_decision_with_retry(prompt: str, config: dict) -> tuple[str | None, dic
 
     fix_prompt = build_json_fix_prompt(prompt, parsed["error"])
     try:
-        raw2 = call_decision_llm(fix_prompt, config)
+        raw2 = call_decision_llm(fix_prompt, config, json_mode=True)
     except Exception as e:
         return raw, str(e), True
 

@@ -288,7 +288,8 @@ def test_training_start_uses_snapshot_data_yaml(tmp_path, monkeypatch):
     _capture_subprocess(monkeypatch, captured, tmp_path)
     app_mod._running_training.clear()
     try:
-        resp = client.post("/api/training/start", json={"epochs": 1, "model": "yolov8n.pt"})
+        # 客户端不再提交 model：初始权重由受控权重库按配置 basename 解析
+        resp = client.post("/api/training/start", json={"epochs": 1})
         assert resp.status_code == 200
         cmd = captured.get("cmd") or []
         data_args = [a for a in cmd if str(a).startswith("data=")]

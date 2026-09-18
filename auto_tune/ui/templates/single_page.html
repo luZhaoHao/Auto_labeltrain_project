@@ -287,6 +287,36 @@
   }
   .browse-current-dir:hover { background: #EFF6FF; }
 
+  /* HPO 试验状态轨道：每格只按状态着色；class 集合固定为
+     waiting/running/success/failed/cancelled/interrupted。 */
+  .hpo-trial-rail {
+    display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px;
+  }
+  .hpo-trial-rail .hpo-trial-cell {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 11px;
+    padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--surface, #fff); color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .hpo-trial-rail .hpo-trial-cell.waiting { border-color: var(--muted); }
+  .hpo-trial-rail .hpo-trial-cell.running {
+    border-color: var(--primary); color: var(--primary); font-weight: 600;
+  }
+  .hpo-trial-rail .hpo-trial-cell.success {
+    border-color: var(--success); color: var(--success);
+  }
+  .hpo-trial-rail .hpo-trial-cell.failed {
+    border-color: var(--destructive); color: var(--destructive);
+  }
+  .hpo-trial-rail .hpo-trial-cell.cancelled,
+  .hpo-trial-rail .hpo-trial-cell.interrupted {
+    border-color: var(--warning); color: var(--warning);
+  }
+  .hpo-recent-events {
+    margin-top: 6px; font-size: 12px; color: var(--text-secondary);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+
   @media (max-width: 768px) {
     body { padding: 12px; }
     .tabs .tab { font-size: 12px; padding: 8px 12px; }
@@ -859,19 +889,20 @@
 <div class="card" id="tuningCommonControlsCard" style="margin-bottom:16px;">
   <div id="tuningCommonControls">
     <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Mode") }}</label>
-    <select name="mode" id="tuningModeSelect" onchange="window.onTuningModeChange && window.onTuningModeChange(this.value)" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+    {# 本选择器渲染在 #tuningForm 之外，必须用 form="tuningForm" 显式关联，
+       否则 new FormData(tuningForm).get('mode') 得到 null。 #}
+    {# 已批准规格要求四种模式：dry_run / keep_params / hpo / full（顺序冻结）。
+       干运行只生成训练计划、不启动训练；后端 /tuning/start 的 dry-run 语义与页面一致。
+       四个选项都不带 selected，浏览器默认选中第一个（dry_run）。 #}
+    <select name="mode" id="tuningModeSelect" form="tuningForm" onchange="window.onTuningModeChange && window.onTuningModeChange(this.value)" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
       <option value="dry_run">{{ _("Dry-Run (generate plan only)") }}</option>
       <option value="keep_params">{{ _("Train with Original Parameters") }}</option>
       <option value="hpo">{{ _("HPO Algorithm Tuning") }}</option>
       <option value="full">{{ _("LLM Parameter Tuning") }}</option>
     </select>
+    {# 主操作已回到各自配置区末尾（#llmPrimaryActionHost / #hpoPrimaryActionHost），
+       本区只保留运行期才出现的停止按钮，位置不随模式迁移。 #}
     <div style="display:flex; gap:8px; margin-top:10px;">
-      <button type="submit" form="tuningForm" class="btn btn-primary non-hpo-only" style="flex:1;" id="startTuningBtn">
-        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        {{ _("Confirm & Start Training") }}
-      </button>
-      {# 创建所需事实（服务端默认/数据快照/初始权重/设备）全部加载并合法后才允许创建 #}
-      <button type="button" class="btn btn-primary hpo-only hpo-mode hidden" style="flex:1;" id="hpoCreateAndStartBtn" onclick="hpoCreateAndStart()" disabled>{{ _("Create & Start Tuning") }}</button>
       <button type="button" class="btn btn-danger btn-sm" style="display:none;" id="stopTuningBtn" onclick="stopTuning()">
         <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
         {{ _("停止") }}
@@ -956,12 +987,12 @@
             <span style="font-weight:400; font-size:11px; color:var(--text-muted);">({{ diag.model_used }})</span>
             {% endif %}
           </div>
-          <div style="font-size:13px; line-height:1.8; white-space:pre-wrap;">{{ diag.llm_diagnosis }}</div>
+          <div style="font-size:13px; line-height:1.8; white-space:pre-wrap;">{{ diag.llm_diagnosis|e }}</div>
         </div>
         {% elif diag is mapping and diag.get("error") %}
         <div class="callout" style="background:var(--destructive-bg); border:1px solid #FECACA;">
           <div class="callout-label" style="color:var(--destructive);">{{ _("Error") }}</div>
-          <div style="font-size:13px;">{{ diag.error }}</div>
+          <div style="font-size:13px;">{{ diag.error|e }}</div>
         </div>
         {% endif %}
       {% endfor %}
@@ -1041,7 +1072,7 @@
         <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         {{ _("Diagnosis") }}
       </div>
-      <div>{{ latest_suggestion.diagnosis }}</div>
+      <div>{{ latest_suggestion.diagnosis|e }}</div>
     </div>
   </div>
   <div class="col">
@@ -1050,7 +1081,7 @@
         <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         {{ _("Rationale") }}
       </div>
-      <div>{% if latest_suggestion.action == 'keep_params' %}{{ _("Keep Original Parameters") }}{% else %}{{ latest_suggestion.rationale }}{% endif %}</div>
+      <div>{% if latest_suggestion.action == 'keep_params' %}{{ _("Keep Original Parameters") }}{% else %}{{ latest_suggestion.rationale|e }}{% endif %}</div>
     </div>
   </div>
 </div>
@@ -1062,7 +1093,7 @@
     <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
     {{ _("Suggestion generation failed") }}
   </div>
-  <div style="font-size:13px;">{{ latest_suggestion.error }}</div>
+  <div style="font-size:13px;">{{ latest_suggestion.error|e }}</div>
 </div>
 {% endif %}
 
@@ -1132,7 +1163,307 @@
   </div>
 </div>
 
-{# ── HPO 内容区 1：搜索配置与评价方式（与 LLM 建议区同一位置） ── #}
+{# ── 区域 2：HPO 创建控制（左）与 HPO 进度（右）─────────────────────
+   同一主要操作区：左列是自动调优控制/新建搜索草稿/数据快照/初始权重/预算/轮数/
+   高级技术选项与“创建并开始调优”，右列是 HPO 进度、轨道、计数、当前最佳与
+   停止恢复操作。窄屏（<=768px）下 .col 占满整行，纵向顺序即“创建在前、进度在后”。
+   区域 3（搜索条件）与区域 4（最佳结果/正式训练/监控）排在容器之后。 #}
+<div class="row" id="hpoWorkArea">
+  <div class="col" style="flex: 1;">
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span style="font-weight:600; font-size:14px;">{{ _("Auto-Tuning Controls") }}</span>
+      </div>
+      <form id="tuningForm">
+        {# 模式选择与主操作已上移到页面顶部的共同控制区（见 #tuningCommonControlsCard），
+           本表单只保留按下拉模式切换的数据/配置区。 #}
+        {# ── HPO 新建草稿：主区只留预算/轮数 + 摘要；选择器与路径放折叠绑定区 ── #}
+        <div class="hpo-only hpo-mode hidden" id="hpoCreateDraft" style="margin-bottom:12px;">
+          <div style="font-weight:600; font-size:13px; margin-bottom:6px;">{{ _("New Search Draft") }}</div>
+          <div id="hpoCreateConfirm" style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;"></div>
+          {# 绑定缺失/不合法/需确认时的原因，始终显示在主区（不放进折叠区） #}
+          <div id="hpoBindingNotice" class="hidden" style="font-size:12px; color:var(--destructive); margin-bottom:6px;"></div>
+          {# 主区只留试验次数与每次训练轮数；采样器/评价方式/计算设备/图像尺寸/Batch
+             这五项属于技术设置，统一收进下方“高级技术选项”折叠区（同一套控件，
+             不复制第二份；默认值、探测、校验与提交字段都不变）。 #}
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+            <div><label style="font-size:12px;">{{ _("Trial Count (includes failed/cancelled slots)") }}</label><input type="number" id="hpoBudget" name="budget" value="10" min="1" max="100" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+            <div><label style="font-size:12px;">{{ _("Epochs per Trial") }}</label><input type="number" id="hpoEpochs" name="epochs" value="30" min="1" max="1000" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+          </div>
+          {# 数据与权重：直接可见、可直接操作。提交值只能来自受控列表选项，
+             HPO 主界面不提供可编辑的物理路径输入。 #}
+          <div style="margin-top:10px;">
+            <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Published Dataset Snapshot") }}</label>
+            <div style="display:flex; gap:6px;">
+              <select id="hpoSnapshotSelect" style="flex:1; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit;">
+                <option value="">{{ _("Select a published snapshot") }}</option>
+              </select>
+              <button type="button" class="btn btn-sm" id="hpoSelectBtn" onclick="hpoLoadSnapshots()">{{ _("Reload") }}</button>
+            </div>
+            <div id="hpoDatasetSummary" style="font-size:12px; margin-top:4px;"></div>
+            <div id="hpoSnapshotHint" class="text-muted" style="font-size:12px; margin-top:3px;"></div>
+          </div>
+          <div style="margin-top:8px;">
+            <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Local Initial Weights") }}</label>
+            <div style="display:flex; gap:6px;">
+              <select id="hpoModelSelect" style="flex:1; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit;">
+                <option value="">{{ _("Select a weight from the controlled library") }}</option>
+              </select>
+              <button type="button" class="btn btn-sm" id="hpoModelSelectBtn" onclick="hpoLoadLocalModels()">{{ _("Reload") }}</button>
+            </div>
+            <div id="hpoModelSummary" style="font-size:12px; margin-top:4px;"></div>
+            {# 受控权重库的唯一上传入口：单文件控件 + 单按钮，绝不复制出第二份 DOM ID。
+               上传只安全保存 .pt，不反序列化、不执行、不下载；成功后两个选择器
+               （#hpoModelSelect 与直接训练的 #trainModelSelect）一起刷新并选中新权重。 #}
+            <div id="modelUploadBlock" style="margin-top:8px;">
+              <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Upload Weight File") }}</label>
+              <div style="display:flex; gap:6px; align-items:center;">
+                <input type="file" id="modelUploadInput" accept=".pt" style="flex:1; min-width:0; font-size:12px;">
+                <button type="button" class="btn btn-sm" id="modelUploadBtn" onclick="uploadModelFile()">{{ _("Upload Weight") }}</button>
+              </div>
+              <div id="modelUploadStatus" style="font-size:12px; margin-top:4px;"></div>
+            </div>
+          </div>
+          <details id="hpoDraftDetails" style="margin-top:10px;">
+            <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Advanced Technical Options") }}</summary>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:8px;">
+              <div>
+                <label style="font-size:12px;">{{ _("Sampler") }}</label>
+                <select id="hpoSampler" name="sampler" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;">
+                  <option value="tpe">TPE</option>
+                  <option value="random">{{ _("Random Search") }}</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:12px;">{{ _("Evaluation Mode") }}</label>
+                {# 新建研究只允许全面/快速两种确定性评价模式；旧版单指标只能被
+                   读取、恢复与展示（旧研究详情与 HPO 历史里仍显示该标签）。 #}
+                <select id="hpoEvaluationMode" name="evaluation_mode" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;">
+                  <option value="comprehensive">{{ _("Comprehensive (four metrics)") }}</option>
+                  <option value="quick">{{ _("Quick (two metrics)") }}</option>
+                </select>
+              </div>
+              {# 设备是明确选择控件（不是自由文本）：选项由服务端探测结果填充——
+                 已探测到的 GPU 编号 + CPU。defaults 到达前保持占位，可提交表单里
+                 因此不存在一个被当成暂存默认值的 cpu。 #}
+              <div><label style="font-size:12px;">{{ _("Compute Device") }}</label><select id="hpoDevice" name="device" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"><option value="">{{ _("Loading...") }}</option></select></div>
+              <div><label style="font-size:12px;">{{ _("Image Size") }}</label><input type="number" id="hpoImgsz" name="imgsz" value="640" min="32" max="2048" step="32" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+              <div><label style="font-size:12px;">Batch</label><input type="number" id="hpoBatch" name="batch" value="16" min="1" max="256" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+              <div><label style="font-size:12px;">{{ _("Seed") }}</label><input type="number" id="hpoSeed" name="seed" value="42" min="0" max="2147483647" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+              <div><label style="font-size:12px;">{{ _("Single-trial Timeout (s)") }}</label><input type="number" id="hpoTimeout" name="timeout_seconds" value="3600" min="1" max="86400" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
+            </div>
+            {# 完整快照 ID 等内部身份只在此技术折叠区展示，不进主界面 #}
+            <div id="hpoCreateConfirmDetail" class="text-muted" style="font-size:12px; margin-top:8px;"></div>
+          </details>
+          <div id="hpoFieldError" class="hidden" style="margin-top:6px; font-size:12px; color:var(--destructive);"></div>
+          {# HPO 主操作：新建搜索草稿配置底部、当前任务区域之前。
+             创建所需事实（服务端默认/数据快照/初始权重/设备）全部加载并合法后才允许创建 #}
+          <div id="hpoPrimaryActionHost" class="hpo-only hpo-mode hidden" style="margin-top:12px;">
+            <button type="button" class="btn btn-primary hpo-only hpo-mode hidden" style="width:100%;" id="hpoCreateAndStartBtn" onclick="hpoCreateAndStart()" disabled>{{ _("Create & Start Tuning") }}</button>
+          </div>
+        </div>
+        <div class="llm-only" style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Reference Run") }}</label>
+          <select name="reference_run" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+            <option value="">{{ _("Auto-detect") }}</option>
+            {% for rn in training.runs.keys() %}
+            <option value="{{ rn }}">{{ rn }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="llm-only" style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Max Retries") }}</label>
+          <input type="number" name="max_retries" value="3" min="1" max="10" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+        </div>
+        <div class="llm-only" style="margin-bottom:12px;">
+          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Evaluation Mode") }}</label>
+          <div style="display:flex; gap:12px;">
+            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+              <input type="radio" name="eval_mode" value="comprehensive" checked> {{ _("Comprehensive (+Precision+Recall)") }}
+            </label>
+            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+              <input type="radio" name="eval_mode" value="quick"> {{ _("Quick (mAP50+mAP50-95)") }}
+            </label>
+          </div>
+        </div>
+        {# 按原参数训练/大模型调优共用的唯一主操作：位于“评估模式”下方，
+           即 LLM 配置区末尾。按钮用 form="tuningForm" 关联共用表单。 #}
+        <div id="llmPrimaryActionHost" class="non-hpo-only" style="margin-top:12px;">
+          <button type="submit" form="tuningForm" class="btn btn-primary non-hpo-only" style="width:100%;" id="startTuningBtn">
+            <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            {{ _("Confirm & Start Training") }}
+          </button>
+        </div>
+        {# ── HPO 当前任务详情：与草稿分离，展示权威冻结值 ── #}
+        <div id="hpoPanel" class="hpo-only hpo-mode hidden">
+          <div id="hpoStudyDetail" style="margin-top:14px; border-top:1px solid var(--muted); padding-top:12px;">
+            <div style="font-weight:600; font-size:13px; margin-bottom:6px;">{{ _("Current Task (Frozen Facts)") }}</div>
+            <div id="hpoStatusText" class="text-muted" style="font-size:12px;">{{ _("No task selected") }}</div>
+            <div id="hpoStudyMeta" style="font-size:12px; color:var(--text-secondary); margin-top:4px;"></div>
+            {# 冻结完整值（含完整 snapshot ID）默认折叠，避免主界面堆技术细节 #}
+            <details id="hpoFrozenDetails" style="margin-top:8px;">
+              <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Frozen Details") }}</summary>
+              <table class="param-table" id="hpoFrozenSummary" style="margin-top:8px;">
+                <thead><tr><th style="width:150px;">{{ _("Frozen Field") }}</th><th>{{ _("Value") }}</th></tr></thead>
+                <tbody id="hpoFrozenSummaryBody"></tbody>
+              </table>
+            </details>
+            {# 停止/恢复/启动已有 READY 任务按适用状态出现；无任务或不适用时隐藏，
+               不留下永远禁用的按钮。 #}
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+              <button type="button" class="btn btn-primary btn-sm hidden" id="hpoStartBtn" onclick="hpoStartStudy()" disabled>{{ _("Start This Task") }}</button>
+              <button type="button" class="btn btn-danger btn-sm hidden" id="hpoStopBtn" onclick="hpoStopStudy()" disabled>{{ _("停止") }}</button>
+              <button type="button" class="btn btn-sm hidden" id="hpoResumeBtn" onclick="hpoResumeStudy()" disabled>{{ _("检查并恢复") }}</button>
+              <button type="button" class="btn btn-sm" id="hpoRefreshBtn" onclick="hpoRefresh()">{{ _("刷新") }}</button>
+            </div>
+            <div id="hpoStudyDetailError" class="hidden" style="margin-top:6px; font-size:12px; color:var(--destructive);"></div>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="col" style="flex: 1;">
+    {# 大模型调优进度卡（五阶段 / LLM 日志 / 最佳迭代）只属于非 HPO 模式：
+       hidden 类只在运行期揭示它，模式契约必须由 non-hpo-only 独立保证——否则
+       LLM 调优跑过一次后切到 HPO，整块进度与最佳迭代仍会留在页面上。 #}
+    <div class="card non-hpo-only hidden" id="tuningProgress">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span style="font-weight:600; font-size:14px;">{{ _("Tuning Progress") }}</span>
+      </div>
+      <div id="tuningStatus" class="text-muted mb-2">{{ _("Initializing...") }}</div>
+      <div class="pipeline" id="pipelineIndicator">
+        <span class="pipeline-step" data-step="perception">1. {{ _("感知") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="decision">2. {{ _("决策") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="guardrails">3. {{ _("护栏") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="execute">4. {{ _("执行") }}</span>
+        <span class="pipeline-arrow">→</span>
+        <span class="pipeline-step" data-step="probe">5. {{ _("探针") }}</span>
+      </div>
+      <div id="referenceDatasetInfo" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px; font-size:13px;">
+        <div style="font-weight:600; margin-bottom:6px;">{{ _("参考数据集已绑定") }}</div>
+        <div><span class="text-muted">{{ _("参考训练") }}:</span> <strong id="refDsRun"></strong></div>
+        <div><span class="text-muted">{{ _("关联数据集") }}:</span> <span id="refDsName"></span></div>
+        <div><span class="text-muted">{{ _("快照") }}:</span> <span id="refDsSnapshot"></span></div>
+        <div><span class="text-muted">{{ _("解析来源") }}:</span> <span id="refDsSource"></span></div>
+      </div>
+      <div id="referenceDatasetError" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--warning-bg); border:1px solid var(--warning); border-radius:8px; font-size:13px;">
+        <div style="font-weight:600; margin-bottom:4px;">{{ _("参考数据集未解析，计划不可执行") }}</div>
+        <div id="referenceDatasetErrorText" class="text-muted"></div>
+      </div>
+      <div class="param-changes hidden" id="paramChanges">
+        <div style="font-weight:600; margin-bottom:4px; color:var(--accent);">{{ _("参数变更") }}:</div>
+        <div id="paramChangesContent"></div>
+      </div>
+      <div class="console-log" id="tuningLog">
+        <div class="dim">{{ _("Waiting to start...") }}</div>
+      </div>
+      <div style="margin-top:8px;">
+        <button type="button" class="btn btn-outline btn-sm" id="toggleTuningFullLog" onclick="toggleFullLog('tuningFullLog', this)">
+          <span class="expand-label">{{ _("展开完整日志") }}</span>
+          <span class="collapse-label hidden">{{ _("收起完整日志") }}</span>
+        </button>
+      </div>
+      <div class="console-log hidden" id="tuningFullLog" style="max-height:400px;"></div>
+      <div id="bestResult" class="hidden" style="margin-top:12px; padding:12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px;">
+        <div id="bestResultTitle" style="font-weight:700; font-size:14px; margin-bottom:8px;">⭐ {{ _("Best Iteration") }}</div>
+        <div id="bestResultContent"></div>
+      </div>
+    </div>
+
+    {# ── HPO 进度与结果（与调优进度卡片同一位置、同一卡片样式） ── #}
+    <div class="card hpo-only hidden" id="hpoProgressCard">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span style="font-weight:600; font-size:14px;">{{ _("HPO Progress") }}</span>
+        <span class="badge badge-blue" id="hpoProgressStatus">{{ _("No task selected") }}</span>
+      </div>
+      {# 进度只来自服务端权威事实：已完成/预算、百分比进度条、当前试验、四态数量、
+         当前最佳。完整 Trial 表已从主界面移除（数据与 API 保留）。 #}
+      <div id="hpoProgress" class="hidden">
+        <div style="display:flex; justify-content:space-between; font-size:12px;">
+          <span id="hpoProgressCounts">—</span>
+          <span id="hpoProgressPercent">—</span>
+        </div>
+        <div style="height:8px; background:var(--muted); border-radius:4px; margin-top:6px; overflow:hidden;">
+          <div id="hpoProgressBar" style="height:100%; width:0%; background:var(--primary);"></div>
+        </div>
+        {# 按预算排列的试验状态轨道与最近三条关键事件：全部由服务端持久事实投影，
+           每次轮询整体重建（不做 append-only 内存队列），因此重复/乱序响应幂等。 #}
+        <div id="hpoTrialRail" class="hpo-trial-rail" aria-label="试验状态轨道"></div>
+        <div id="hpoRecentEvents" class="hpo-recent-events" aria-live="polite"></div>
+        <div id="hpoProgressCurrent" style="font-size:12px; margin-top:8px;"></div>
+        <div id="hpoProgressTally" style="font-size:12px; margin-top:4px;"></div>
+        <div id="hpoProgressBest" style="font-size:12px; margin-top:4px;"></div>
+        <div id="hpoProgressMessage" style="font-size:13px; margin-top:8px; font-weight:600;"></div>
+        <div id="hpoRanking" style="margin-top:6px; font-size:12px;"></div>
+        <div id="hpoRankingNote" class="text-muted" style="font-size:12px; margin-top:4px;"></div>
+      </div>
+      <div id="hpoRunNote" class="hidden" style="font-size:12px; margin-top:6px;"></div>
+      {# 关联正式训练结果集中在“最佳结果与参数使用”卡片一处，此处不再重复空区 #}
+    </div>
+
+    {% if tuning_history %}
+    {# 逐项 LLM 调优历史只属于非 HPO 模式；HPO 的研究级历史见下方 HPO History #}
+    <div class="card non-hpo-only" id="tuningHistoryCard">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("Tuning History") }}</div>
+      {% for attempt in tuning_history|reverse %}
+      <div style="padding:8px 0; border-bottom:1px solid var(--muted); font-size:13px;">
+        <div class="flex">
+          <span class="badge badge-blue">#{{ attempt.iteration }}</span>
+          {% if attempt.error %}
+          <span class="badge badge-red">{{ _("Failed") }}</span>
+          {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
+          <span class="badge badge-green">{{ _("Passed") }}</span>
+          {% else %}
+          <span class="badge badge-yellow">{{ _("Retry") }}</span>
+          {% endif %}
+          <span class="text-muted" style="font-size:12px;">{{ attempt.timestamp[:10] }}</span>
+        </div>
+        {% if attempt.decision.diagnosis %}
+        <div style="margin-top:4px; color:var(--text-secondary);">{{ attempt.decision.diagnosis[:80] }}{% if attempt.decision.diagnosis|length > 80 %}...{% endif %}</div>
+        {% endif %}
+        {% if attempt.decision.hyperparameter_changes %}
+        <div style="margin-top:4px; font-size:12px; color:var(--text-muted);">
+          {{ _("参数") }}: {% for k, v in attempt.decision.hyperparameter_changes.items() %}{{ k }}={{ v }} {% endfor %}
+        </div>
+        {% endif %}
+        {% set _mAP50 = attempt.get('result_mAP50') %}
+        {% set _mAP50_95 = attempt.get('result_mAP50_95') %}
+        {% set _precision = attempt.get('result_precision') %}
+        {% set _recall = attempt.get('result_recall') %}
+        {% if _mAP50 is not none %}
+        <div style="margin-top:4px; font-size:12px; display:flex; gap:10px; flex-wrap:wrap;">
+          <span>mAP50: <strong>{{ "%.4f"|format(_mAP50) }}</strong></span>
+          {% if _mAP50_95 is not none %}<span>mAP50-95: <strong>{{ "%.4f"|format(_mAP50_95) }}</strong></span>{% endif %}
+          {% if _precision is not none %}<span>Precision: <strong>{{ "%.4f"|format(_precision) }}</strong></span>{% endif %}
+          {% if _recall is not none %}<span>Recall: <strong>{{ "%.4f"|format(_recall) }}</strong></span>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {# ── HPO 历史（默认收起，由 #hpoHistoryToggle 展开；分页与选择功能保留） ── #}
+    <div class="card hpo-only hidden" id="hpoHistorySection">
+      <div class="card-title" style="margin-bottom:10px;">{{ _("HPO History") }}</div>
+      <div id="hpoHistoryList" style="font-size:12px;"></div>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:10px;">
+        <button type="button" class="btn btn-sm" id="hpoStudyPagePrev" onclick="hpoHistoryPage(-1)">{{ _("Previous page") }}</button>
+        <span id="hpoStudyPageInfo" class="text-muted" style="font-size:12px;">—</span>
+        <button type="button" class="btn btn-sm" id="hpoStudyPageNext" onclick="hpoHistoryPage(1)">{{ _("Next page") }}</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ── 区域 3：搜索条件与评价方式 ──────────────────────────────────
+   排在 HPO 创建/进度容器之后、最佳结果之前；搜索范围/固定条件/错误提示都在这里。 #}
 <div class="suggestion-card hpo-only hidden" id="hpoSearchConfig">
   <div class="suggestion-header">
     <h3>{{ _("Search Configuration & Objective") }}</h3>
@@ -1160,7 +1491,9 @@
   <div id="hpoSearchError" class="hidden" style="margin-top:8px; font-size:12px; color:var(--destructive);"></div>
 </div>
 
-{# ── HPO 内容区 2：最佳结果与参数使用（与 LLM 诊断/理由区同一位置） ── #}
+{# ── 区域 4：最佳结果、正式训练与监控 ──────────────────────────────
+   最佳试验与综合分数、最佳参数、正式训练提交、同条件验证（次要折叠入口）、
+   关联正式训练与最终模型、结果操作，以及公共正式训练监控宿主。 #}
 <div class="suggestion-card hpo-only hidden" id="hpoBestArea">
   <div class="suggestion-header">
     <h3>{{ _("Best Result & Parameter Use") }}</h3>
@@ -1234,270 +1567,6 @@
   <div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--muted);">
     <div style="font-weight:600; font-size:13px; margin-bottom:6px;">{{ _("Formal Training Monitor") }}</div>
     <div id="hpoFormalMonitorHost"></div>
-  </div>
-</div>
-
-<div class="row">
-  <div class="col" style="flex: 1;">
-    <div class="card">
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:12px;">
-        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span style="font-weight:600; font-size:14px;">{{ _("Auto-Tuning Controls") }}</span>
-      </div>
-      <form id="tuningForm">
-        {# 模式选择与主操作已上移到页面顶部的共同控制区（见 #tuningCommonControlsCard），
-           本表单只保留按下拉模式切换的数据/配置区。 #}
-        {# ── HPO 新建草稿：主区只留预算/轮数 + 摘要；选择器与路径放折叠绑定区 ── #}
-        <div class="hpo-only hpo-mode hidden" id="hpoCreateDraft" style="margin-bottom:12px;">
-          <div style="font-weight:600; font-size:13px; margin-bottom:6px;">{{ _("New Search Draft") }}</div>
-          <div id="hpoCreateConfirm" style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;"></div>
-          {# 绑定缺失/不合法/需确认时的原因，始终显示在主区（不放进折叠区） #}
-          <div id="hpoBindingNotice" class="hidden" style="font-size:12px; color:var(--destructive); margin-bottom:6px;"></div>
-          {# 主区只留试验次数与每次训练轮数；采样器/评价方式/计算设备/图像尺寸/Batch
-             这五项属于技术设置，统一收进下方“高级技术选项”折叠区（同一套控件，
-             不复制第二份；默认值、探测、校验与提交字段都不变）。 #}
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-            <div><label style="font-size:12px;">{{ _("Trial Count (includes failed/cancelled slots)") }}</label><input type="number" id="hpoBudget" name="budget" value="10" min="1" max="100" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-            <div><label style="font-size:12px;">{{ _("Epochs per Trial") }}</label><input type="number" id="hpoEpochs" name="epochs" value="30" min="1" max="1000" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-          </div>
-          {# 数据与权重：直接可见、可直接操作。提交值只能来自受控列表选项，
-             HPO 主界面不提供可编辑的物理路径输入。 #}
-          <div style="margin-top:10px;">
-            <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Published Dataset Snapshot") }}</label>
-            <div style="display:flex; gap:6px;">
-              <select id="hpoSnapshotSelect" style="flex:1; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit;">
-                <option value="">{{ _("Select a published snapshot") }}</option>
-              </select>
-              <button type="button" class="btn btn-sm" id="hpoSelectBtn" onclick="hpoLoadSnapshots()">{{ _("Reload") }}</button>
-            </div>
-            <div id="hpoDatasetSummary" style="font-size:12px; margin-top:4px;"></div>
-            <div id="hpoSnapshotHint" class="text-muted" style="font-size:12px; margin-top:3px;"></div>
-          </div>
-          <div style="margin-top:8px;">
-            <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Local Initial Weights") }}</label>
-            <div style="display:flex; gap:6px;">
-              <select id="hpoModelSelect" style="flex:1; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:inherit;">
-                <option value="">{{ _("Select a local .pt file") }}</option>
-              </select>
-              <button type="button" class="btn btn-sm" id="hpoModelSelectBtn" onclick="hpoLoadLocalModels()">{{ _("Reload") }}</button>
-            </div>
-            <div id="hpoModelSummary" style="font-size:12px; margin-top:4px;"></div>
-          </div>
-          <details id="hpoDraftDetails" style="margin-top:10px;">
-            <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Advanced Technical Options") }}</summary>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:8px;">
-              <div>
-                <label style="font-size:12px;">{{ _("Sampler") }}</label>
-                <select id="hpoSampler" name="sampler" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;">
-                  <option value="tpe">TPE</option>
-                  <option value="random">{{ _("Random Search") }}</option>
-                </select>
-              </div>
-              <div>
-                <label style="font-size:12px;">{{ _("Evaluation Mode") }}</label>
-                {# 新建研究只允许全面/快速两种确定性评价模式；旧版单指标只能被
-                   读取、恢复与展示（旧研究详情与 HPO 历史里仍显示该标签）。 #}
-                <select id="hpoEvaluationMode" name="evaluation_mode" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;">
-                  <option value="comprehensive">{{ _("Comprehensive (four metrics)") }}</option>
-                  <option value="quick">{{ _("Quick (two metrics)") }}</option>
-                </select>
-              </div>
-              {# 设备是明确选择控件（不是自由文本）：选项由服务端探测结果填充——
-                 已探测到的 GPU 编号 + CPU。defaults 到达前保持占位，可提交表单里
-                 因此不存在一个被当成暂存默认值的 cpu。 #}
-              <div><label style="font-size:12px;">{{ _("Compute Device") }}</label><select id="hpoDevice" name="device" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"><option value="">{{ _("Loading...") }}</option></select></div>
-              <div><label style="font-size:12px;">{{ _("Image Size") }}</label><input type="number" id="hpoImgsz" name="imgsz" value="640" min="32" max="2048" step="32" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-              <div><label style="font-size:12px;">Batch</label><input type="number" id="hpoBatch" name="batch" value="16" min="1" max="256" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-              <div><label style="font-size:12px;">{{ _("Seed") }}</label><input type="number" id="hpoSeed" name="seed" value="42" min="0" max="2147483647" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-              <div><label style="font-size:12px;">{{ _("Single-trial Timeout (s)") }}</label><input type="number" id="hpoTimeout" name="timeout_seconds" value="3600" min="1" max="86400" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;"></div>
-            </div>
-            {# 完整快照 ID 等内部身份只在此技术折叠区展示，不进主界面 #}
-            <div id="hpoCreateConfirmDetail" class="text-muted" style="font-size:12px; margin-top:8px;"></div>
-          </details>
-          <div id="hpoFieldError" class="hidden" style="margin-top:6px; font-size:12px; color:var(--destructive);"></div>
-        </div>
-        <div class="llm-only" style="margin-bottom:12px;">
-          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Reference Run") }}</label>
-          <select name="reference_run" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
-            <option value="">{{ _("Auto-detect") }}</option>
-            {% for rn in training.runs.keys() %}
-            <option value="{{ rn }}">{{ rn }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="llm-only" style="margin-bottom:12px;">
-          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Max Retries") }}</label>
-          <input type="number" name="max_retries" value="3" min="1" max="10" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
-        </div>
-        <div class="llm-only" style="margin-bottom:12px;">
-          <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Evaluation Mode") }}</label>
-          <div style="display:flex; gap:12px;">
-            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
-              <input type="radio" name="eval_mode" value="comprehensive" checked> {{ _("Comprehensive (+Precision+Recall)") }}
-            </label>
-            <label style="font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer;">
-              <input type="radio" name="eval_mode" value="quick"> {{ _("Quick (mAP50+mAP50-95)") }}
-            </label>
-          </div>
-        </div>
-        {# 模式选择与主操作已统一到本表单顶部的共同控制区，不再随模式迁移位置。 #}
-        {# ── HPO 当前任务详情：与草稿分离，展示权威冻结值 ── #}
-        <div id="hpoPanel" class="hpo-only hpo-mode hidden">
-          <div id="hpoStudyDetail" style="margin-top:14px; border-top:1px solid var(--muted); padding-top:12px;">
-            <div style="font-weight:600; font-size:13px; margin-bottom:6px;">{{ _("Current Task (Frozen Facts)") }}</div>
-            <div id="hpoStatusText" class="text-muted" style="font-size:12px;">{{ _("No task selected") }}</div>
-            <div id="hpoStudyMeta" style="font-size:12px; color:var(--text-secondary); margin-top:4px;"></div>
-            {# 冻结完整值（含完整 snapshot ID）默认折叠，避免主界面堆技术细节 #}
-            <details id="hpoFrozenDetails" style="margin-top:8px;">
-              <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Frozen Details") }}</summary>
-              <table class="param-table" id="hpoFrozenSummary" style="margin-top:8px;">
-                <thead><tr><th style="width:150px;">{{ _("Frozen Field") }}</th><th>{{ _("Value") }}</th></tr></thead>
-                <tbody id="hpoFrozenSummaryBody"></tbody>
-              </table>
-            </details>
-            {# 停止/恢复/启动已有 READY 任务按适用状态出现；无任务或不适用时隐藏，
-               不留下永远禁用的按钮。 #}
-            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-              <button type="button" class="btn btn-primary btn-sm hidden" id="hpoStartBtn" onclick="hpoStartStudy()" disabled>{{ _("Start This Task") }}</button>
-              <button type="button" class="btn btn-danger btn-sm hidden" id="hpoStopBtn" onclick="hpoStopStudy()" disabled>{{ _("停止") }}</button>
-              <button type="button" class="btn btn-sm hidden" id="hpoResumeBtn" onclick="hpoResumeStudy()" disabled>{{ _("检查并恢复") }}</button>
-              <button type="button" class="btn btn-sm" id="hpoRefreshBtn" onclick="hpoRefresh()">{{ _("刷新") }}</button>
-            </div>
-            <div id="hpoStudyDetailError" class="hidden" style="margin-top:6px; font-size:12px; color:var(--destructive);"></div>
-          </div>
-        </div>
-      </form>
-    </div>
-  </div>
-  <div class="col" style="flex: 1;">
-    <div class="card hidden" id="tuningProgress">
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
-        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        <span style="font-weight:600; font-size:14px;">{{ _("Tuning Progress") }}</span>
-      </div>
-      <div id="tuningStatus" class="text-muted mb-2">{{ _("Initializing...") }}</div>
-      <div class="pipeline" id="pipelineIndicator">
-        <span class="pipeline-step" data-step="perception">1. {{ _("感知") }}</span>
-        <span class="pipeline-arrow">→</span>
-        <span class="pipeline-step" data-step="decision">2. {{ _("决策") }}</span>
-        <span class="pipeline-arrow">→</span>
-        <span class="pipeline-step" data-step="guardrails">3. {{ _("护栏") }}</span>
-        <span class="pipeline-arrow">→</span>
-        <span class="pipeline-step" data-step="execute">4. {{ _("执行") }}</span>
-        <span class="pipeline-arrow">→</span>
-        <span class="pipeline-step" data-step="probe">5. {{ _("探针") }}</span>
-      </div>
-      <div id="referenceDatasetInfo" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px; font-size:13px;">
-        <div style="font-weight:600; margin-bottom:6px;">{{ _("参考数据集已绑定") }}</div>
-        <div><span class="text-muted">{{ _("参考训练") }}:</span> <strong id="refDsRun"></strong></div>
-        <div><span class="text-muted">{{ _("关联数据集") }}:</span> <span id="refDsName"></span></div>
-        <div><span class="text-muted">{{ _("快照") }}:</span> <span id="refDsSnapshot"></span></div>
-        <div><span class="text-muted">{{ _("解析来源") }}:</span> <span id="refDsSource"></span></div>
-      </div>
-      <div id="referenceDatasetError" class="hidden" style="margin:8px 0; padding:10px 12px; background:var(--warning-bg); border:1px solid var(--warning); border-radius:8px; font-size:13px;">
-        <div style="font-weight:600; margin-bottom:4px;">{{ _("参考数据集未解析，计划不可执行") }}</div>
-        <div id="referenceDatasetErrorText" class="text-muted"></div>
-      </div>
-      <div class="param-changes hidden" id="paramChanges">
-        <div style="font-weight:600; margin-bottom:4px; color:var(--accent);">{{ _("参数变更") }}:</div>
-        <div id="paramChangesContent"></div>
-      </div>
-      <div class="console-log" id="tuningLog">
-        <div class="dim">{{ _("Waiting to start...") }}</div>
-      </div>
-      <div style="margin-top:8px;">
-        <button type="button" class="btn btn-outline btn-sm" id="toggleTuningFullLog" onclick="toggleFullLog('tuningFullLog', this)">
-          <span class="expand-label">{{ _("展开完整日志") }}</span>
-          <span class="collapse-label hidden">{{ _("收起完整日志") }}</span>
-        </button>
-      </div>
-      <div class="console-log hidden" id="tuningFullLog" style="max-height:400px;"></div>
-      <div id="bestResult" class="hidden" style="margin-top:12px; padding:12px; background:var(--accent-bg); border:1px solid var(--accent); border-radius:8px;">
-        <div style="font-weight:700; font-size:14px; margin-bottom:8px;">⭐ {{ _("Best Iteration") }}</div>
-        <div id="bestResultContent"></div>
-      </div>
-    </div>
-
-    {# ── HPO 进度与结果（与调优进度卡片同一位置、同一卡片样式） ── #}
-    <div class="card hpo-only hidden" id="hpoProgressCard">
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
-        <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none;" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        <span style="font-weight:600; font-size:14px;">{{ _("HPO Progress") }}</span>
-        <span class="badge badge-blue" id="hpoProgressStatus">{{ _("No task selected") }}</span>
-      </div>
-      {# 进度只来自服务端权威事实：已完成/预算、百分比进度条、当前试验、四态数量、
-         当前最佳。完整 Trial 表已从主界面移除（数据与 API 保留）。 #}
-      <div id="hpoProgress" class="hidden">
-        <div style="display:flex; justify-content:space-between; font-size:12px;">
-          <span id="hpoProgressCounts">—</span>
-          <span id="hpoProgressPercent">—</span>
-        </div>
-        <div style="height:8px; background:var(--muted); border-radius:4px; margin-top:6px; overflow:hidden;">
-          <div id="hpoProgressBar" style="height:100%; width:0%; background:var(--primary);"></div>
-        </div>
-        <div id="hpoProgressCurrent" style="font-size:12px; margin-top:8px;"></div>
-        <div id="hpoProgressTally" style="font-size:12px; margin-top:4px;"></div>
-        <div id="hpoProgressBest" style="font-size:12px; margin-top:4px;"></div>
-        <div id="hpoProgressMessage" style="font-size:13px; margin-top:8px; font-weight:600;"></div>
-        <div id="hpoRanking" style="margin-top:6px; font-size:12px;"></div>
-        <div id="hpoRankingNote" class="text-muted" style="font-size:12px; margin-top:4px;"></div>
-      </div>
-      <div id="hpoRunNote" class="hidden" style="font-size:12px; margin-top:6px;"></div>
-      {# 关联正式训练结果集中在“最佳结果与参数使用”卡片一处，此处不再重复空区 #}
-    </div>
-
-    {% if tuning_history %}
-    {# 逐项 LLM 调优历史只属于非 HPO 模式；HPO 的研究级历史见下方 HPO History #}
-    <div class="card non-hpo-only" id="tuningHistoryCard">
-      <div class="card-title" style="margin-bottom:10px;">{{ _("Tuning History") }}</div>
-      {% for attempt in tuning_history|reverse %}
-      <div style="padding:8px 0; border-bottom:1px solid var(--muted); font-size:13px;">
-        <div class="flex">
-          <span class="badge badge-blue">#{{ attempt.iteration }}</span>
-          {% if attempt.error %}
-          <span class="badge badge-red">{{ _("Failed") }}</span>
-          {% elif attempt.probe_decision and attempt.probe_decision.verdict == "continue" %}
-          <span class="badge badge-green">{{ _("Passed") }}</span>
-          {% else %}
-          <span class="badge badge-yellow">{{ _("Retry") }}</span>
-          {% endif %}
-          <span class="text-muted" style="font-size:12px;">{{ attempt.timestamp[:10] }}</span>
-        </div>
-        {% if attempt.decision.diagnosis %}
-        <div style="margin-top:4px; color:var(--text-secondary);">{{ attempt.decision.diagnosis[:80] }}{% if attempt.decision.diagnosis|length > 80 %}...{% endif %}</div>
-        {% endif %}
-        {% if attempt.decision.hyperparameter_changes %}
-        <div style="margin-top:4px; font-size:12px; color:var(--text-muted);">
-          {{ _("参数") }}: {% for k, v in attempt.decision.hyperparameter_changes.items() %}{{ k }}={{ v }} {% endfor %}
-        </div>
-        {% endif %}
-        {% set _mAP50 = attempt.get('result_mAP50') %}
-        {% set _mAP50_95 = attempt.get('result_mAP50_95') %}
-        {% set _precision = attempt.get('result_precision') %}
-        {% set _recall = attempt.get('result_recall') %}
-        {% if _mAP50 is not none %}
-        <div style="margin-top:4px; font-size:12px; display:flex; gap:10px; flex-wrap:wrap;">
-          <span>mAP50: <strong>{{ "%.4f"|format(_mAP50) }}</strong></span>
-          {% if _mAP50_95 is not none %}<span>mAP50-95: <strong>{{ "%.4f"|format(_mAP50_95) }}</strong></span>{% endif %}
-          {% if _precision is not none %}<span>Precision: <strong>{{ "%.4f"|format(_precision) }}</strong></span>{% endif %}
-          {% if _recall is not none %}<span>Recall: <strong>{{ "%.4f"|format(_recall) }}</strong></span>{% endif %}
-        </div>
-        {% endif %}
-      </div>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    {# ── HPO 历史（默认收起，由 #hpoHistoryToggle 展开；分页与选择功能保留） ── #}
-    <div class="card hpo-only hidden" id="hpoHistorySection">
-      <div class="card-title" style="margin-bottom:10px;">{{ _("HPO History") }}</div>
-      <div id="hpoHistoryList" style="font-size:12px;"></div>
-      <div style="display:flex; align-items:center; gap:8px; margin-top:10px;">
-        <button type="button" class="btn btn-sm" id="hpoStudyPagePrev" onclick="hpoHistoryPage(-1)">{{ _("Previous page") }}</button>
-        <span id="hpoStudyPageInfo" class="text-muted" style="font-size:12px;">—</span>
-        <button type="button" class="btn btn-sm" id="hpoStudyPageNext" onclick="hpoHistoryPage(1)">{{ _("Next page") }}</button>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -1670,7 +1739,16 @@
       </tr>
       <tr>
         <td>{{ _("Model") }}</td>
-        <td><input id="trainModel" value="{{ project.get("model", training_config.get("model", "yolov8n.pt")) }}" placeholder="yolov8n.pt" style="width:100%; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px;"></td>
+        <td>
+          {# 初始权重只能从受控权重库选择：value 只允许是 model_id，绝不接受可编辑路径 #}
+          <div style="display:flex; gap:6px;">
+            <select id="trainModelSelect" style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:4px; font-size:13px; font-family:inherit;">
+              <option value="">{{ _("Loading...") }}</option>
+            </select>
+            <button type="button" class="btn btn-sm" id="trainModelReloadBtn" onclick="refreshModelLibrary()">{{ _("Reload") }}</button>
+          </div>
+          <div id="trainModelHint" style="font-size:12px; margin-top:4px; color:var(--text-muted);"></div>
+        </td>
       </tr>
       <tr>
         <td>{{ _("Epochs") }}</td>
@@ -4580,22 +4658,54 @@ function makeSseConsumer() {
               if (result.best_iteration != null) {
                 var bestDiv = document.getElementById('bestResult');
                 var bestContent = document.getElementById('bestResultContent');
+                var bestTitle = document.getElementById('bestResultTitle');
                 var metrics = result.best_metrics || {};
                 var evalLabel = result.eval_mode === 'quick' ? '{{ _("综合评分（快速）") }}' : '{{ _("综合评分（全面）") }}';
-                var cs = 0;
-                if (result.eval_mode === 'quick') {
+                // 后端契约：kept_reference_baseline === true 表示没有任何调优轮次
+                // 严格超过会话开始时的原参考训练，总体最佳仍是原参考运行。
+                // 此时不得把 best_train_name 当成总体最佳展示或绑定；它只能作为
+                // “本次调优轮次中最佳”的次级信息出现。
+                var refInfo = result.reference_baseline || {};
+                var keptBaseline = result.kept_reference_baseline === true;
+                var overallName = keptBaseline
+                  ? (refInfo.run_name || result.baseline_run || '')
+                  : (result.best_train_name || '');
+                // 运行名是后端返回的动态文本：校验只拒绝路径分隔符、冒号、方括号和
+                // 空字符，`<>` 与引号都可能出现。正文只插入转义后的文本；按钮目标
+                // （data-train-name）继续用原始值，绝不把转义后的实体写回目标。
+                var overallNameHtml = _escapeHtml(overallName);
+                var bestTrainNameHtml = _escapeHtml(result.best_train_name || '');
+                var cs = null;
+                if (keptBaseline) {
+                  // 原参考分数优先；缺失时为 null → 显示 '-'，绝不伪造 0
+                  cs = (refInfo.score != null) ? refInfo.score : result.baseline_score;
+                } else if (result.eval_mode === 'quick') {
                   cs = (metrics.mAP50 || 0) * 0.6 + (metrics.mAP50_95 || 0) * 0.4;
                 } else {
                   cs = (metrics.mAP50 || 0) * 0.35 + (metrics.mAP50_95 || 0) * 0.25 + (metrics.precision || 0) * 0.20 + (metrics.recall || 0) * 0.20;
                 }
+                if (bestTitle) {
+                  bestTitle.textContent = keptBaseline
+                    ? '⭐ {{ _("Overall best: original reference run") }}'
+                    : '⭐ {{ _("Best Iteration") }}';
+                }
                 bestContent.innerHTML =
                   '<div style="margin-bottom:6px;">' +
-                    '<span style="font-weight:600;">{{ _("Iteration") }} #' + result.best_iteration + '</span>' +
-                    '<span class="text-muted" style="margin-left:8px;">(' + result.best_train_name + ')</span>' +
+                    (keptBaseline
+                      ? '<span style="font-weight:600;">{{ _("Overall best: original reference run") }}</span>' +
+                        '<span style="margin-left:8px;">' + overallNameHtml + '</span>'
+                      : '<span style="font-weight:600;">{{ _("Iteration") }} #' + result.best_iteration + '</span>' +
+                        '<span class="text-muted" style="margin-left:8px;">(' + bestTrainNameHtml + ')</span>') +
                   '</div>' +
                   '<div style="margin-bottom:6px;">' +
-                    '<span style="font-weight:600;">' + evalLabel + ':</span> ' + cs.toFixed(4) +
+                    '<span style="font-weight:600;">' + evalLabel + ':</span> ' + (cs != null ? Number(cs).toFixed(4) : '-') +
                   '</div>' +
+                  (keptBaseline
+                    ? '<div style="font-size:12px; margin-bottom:4px;" class="text-muted">' +
+                        '{{ _("Best tuning round") }}: {{ _("Iteration") }} #' + result.best_iteration +
+                        ' (' + bestTrainNameHtml + ')' +
+                      '</div>'
+                    : '') +
                   '<div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; margin-bottom:8px; font-size:13px;">' +
                     '<div><span class="text-muted">mAP50:</span> <strong>' + (metrics.mAP50 != null ? metrics.mAP50.toFixed(4) : '-') + '</strong></div>' +
                     '<div><span class="text-muted">mAP50-95:</span> <strong>' + (metrics.mAP50_95 != null ? metrics.mAP50_95.toFixed(4) : '-') + '</strong></div>' +
@@ -4606,9 +4716,9 @@ function makeSseConsumer() {
                     '<span class="text-muted">{{ _("Final summary TXT") }}:</span> ' + (result.final_summary_status === 'generated' ? '{{ _("TXT saved") }}' : (result.final_summary_status === 'failed' ? '{{ _("TXT save failed") }}' : '{{ _("Not generated") }}')) +
                     '<span style="margin-left:14px;" class="text-muted">{{ _("AI closing summary") }}:</span> ' + (result.llm_summary_status === 'ok' ? '{{ _("AI summary available") }}' : (result.llm_summary_status === 'failed' ? '{{ _("AI summary unavailable") }}' : '{{ _("Not generated") }}')) +
                   '</div>' +
-                  '<button class="btn btn-outline btn-sm" data-train-name="' + encodeURIComponent(result.best_train_name || '') + '" onclick="loadBestReport(decodeURIComponent(this.dataset.trainName))">{{ _("View full analysis") }}</button>';
+                  '<button class="btn btn-outline btn-sm" data-train-name="' + encodeURIComponent(overallName) + '" onclick="loadBestReport(decodeURIComponent(this.dataset.trainName))">{{ _("View full analysis") }}</button>';
                 var saveBtn = document.getElementById('saveReportBtn');
-                if (saveBtn) saveBtn.setAttribute('data-train-name', result.best_train_name || '');
+                if (saveBtn) saveBtn.setAttribute('data-train-name', overallName);
                 bestDiv.classList.remove('hidden');
               }
             } else if (data.status === 'running') {
@@ -4817,6 +4927,8 @@ function analyzeTrainingFolder() {
 function showTrainModal() {
   var modal = document.getElementById('trainModal');
   if (modal) modal.style.display = 'flex';
+  // 打开时从受控权重库刷新可选初始权重（服务器重启后必须先重新取列表）
+  if (window.refreshModelLibrary) window.refreshModelLibrary();
 }
 function hideTrainModal() {
   var modal = document.getElementById('trainModal');
@@ -4843,9 +4955,13 @@ function stopFirstTraining() {
 function startTraining() {
   var dataYaml = document.getElementById('trainDataYaml').value.trim();
   if (!dataYaml) { alert('data.yaml path is required'); return; }
+  // 初始权重只提交受控模型标识；服务器端再解析成文件并复核存在性与哈希。
+  // 不提交 model/路径字段（后端会以 MODEL_PATH_FORBIDDEN 拒绝）。
+  var modelId = (document.getElementById('trainModelSelect') || {}).value || '';
+  if (!modelId) { alert('{{ _("Please select an initial weight from the controlled library.") }}'); return; }
   var body = JSON.stringify({
     data_yaml: dataYaml,
-    model: document.getElementById('trainModel').value.trim() || 'yolov8n.pt',
+    model_id: modelId,
     epochs: parseInt(document.getElementById('trainEpochs').value) || 100,
     imgsz: parseInt(document.getElementById('trainImgsz').value) || 640,
     batch: parseInt(document.getElementById('trainBatch').value) || 16,

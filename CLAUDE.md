@@ -33,7 +33,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Claude Code 只编写业务代码和对应测试**；不修改 README、路线图、规格、实施计划或发布说明（这些由 Codex 维护，见 `docs/development_handoff_20260814.md` 启动检查清单）。
 - **本文件 CLAUDE.md 由 Claude Code 维护**（Codex 不编写）。编码期间发现的文档/规范问题，在交付时口头提示即可。
 - 测试结果以 **Codex 的验证为准**；Claude Code 完成编码后不得宣称"已验证通过"，须等 Codex 测试确认。
-- **当前已发布稳定版本为 v0.2**；Studio S1.1–S1.5、S2.0–S2.4 与体验修复 P1–P5 **均已独立验收**（S2.0/S2.1–S2.4 实验管理闭环、P1 真实三轮调优、P2 参考快照绑定、P3 最近训练、P4 中英文展示、P5 报告/审计表格视图）；**Q1 LLM 可信度 MVP（Q1.1/Q1.2）已完成 Codex 独立验收并经 GitHub PR #10 合并至 main**。当前正式任务仍为 **YOLOv8 Detect**（后续已规划业务仅支持 Detect，不再开发 YOLOv5 Detect）；**H1.1 搜索契约与持久化基础（2026-09-08）、H1.2 训练执行与恢复闭环（2026-09-09）与 H1.3 Studio 接入（2026-09-16）均已通过验收**。当前顺序为 **F1.1 产品优化与稳定版本冻结 → F1.2 Windows、Docker 与 API 交付适配**；不设置 H1.4。发布状态与下一批范围以交接记录和艾卡的新批准为准。每次只选择一个经艾卡批准的小批次，不要同时展开多个方向。
+- **当前已发布稳定版本为 v0.2**；Studio S1.1–S1.5、S2.0–S2.4、体验修复 P1–P5、Q1、H1 与 **F1.1 产品优化与稳定版本冻结**均已完成独立验收。艾卡于 2026-09-18 确认 F1.1-A、F1.1-B、F1.1-C 整体验收通过；最终完整自动化为 **2738 passed / 2 warnings**，两条 warning 均为既有 sklearn PCA warning。F1.1 已恢复四模式、修正总体最佳展示与目标绑定、完成动态运行名转义、LLM 报告绑定与结构化输出约束，并保持已验收训练/HPO/LLM 协议不变。当前正式任务仍为 **YOLOv8 Detect**，下一入口为 **F1.2 Windows、单 Docker 镜像与 API 交付适配**；不设置 H1.4。软件操作手册已完成，软件安装手册待下一 Part 完成验收后编写。发布状态与下一批范围以交接记录和艾卡的新批准为准。每次只选择一个经艾卡批准的小批次，不要同时展开多个方向。
 - 每次测试完后杀死测试用的服务器进程，让用户自己开启服务器自己测试。
 - **测试运行内存约束**：不要一次并行跑多个测试文件；逐个文件运行以节省本机内存（完整套件 `pytest auto_tune/tests` 除外）。
 
@@ -43,7 +43,7 @@ YOLOv8 Auto-Tuning Agent — a three-module closed-loop system for automated YOL
 - **Module B (Train Analyzer)**: Three-stage training diagnosis pipeline (Python metrics → LLM text diagnosis → Qwen-VL vision analysis)
 - **Module C (Agent Engine)**: Perception → Decision (LLM) → Guardrails → Execute → Probe Monitor auto-tuning loop
 
-> **当前已发布版本 v0.2**（含 Studio S1.1 训练日志分层）。S1.2 不可变数据集快照、S1.3 API 凭据安全、S1.4 目录输入安全、S1.5 运行状态与重连、S2.0–S2.4 本地 SQLite 实验索引、P1–P5 体验修复均已完成独立验收；**Q1.1/Q1.2（LLM 可信度 MVP）已完成独立验收并随 GitHub PR #10 合并至 main**（Q1 后官方基线完整套件 1484 passed / 2 PCA warnings / 0 skipped；H1.1 验收后完整回归本地 1672 passed；H1.2 验收后 1837 passed；H1.3 最终本地 2426 passed / 2 PCA warnings / 0 skipped，均为 2 条既有 sklearn PCA 警告）。**H1.1（2026-09-08）、H1.2（2026-09-09）与 H1.3 Studio 接入（2026-09-16）均已通过验收**；当前顺序为 **F1.1 产品优化与稳定版本冻结 → F1.2 Windows、Docker 与 API 交付适配**（Research R1 与 Cloud 暂不排期、不自动衔接启动）。是否发布以交接记录为准。已验证环境：Windows、Python 3.10、Ultralytics YOLOv8 detection；F1.2 计划采用 **Windows 桌面安装 + 单 Docker 容器 + 版本化 API 交付**；API 覆盖核心单用户业务流程、OpenAPI 文档、健康检查、调用示例与端到端集成验证，公司平台深度接入另行立项。Segment/OBB/Pose/YOLO11/26 与 YOLOv5 Detect 不在当前计划。
+> **当前已发布版本 v0.2**。S1.1–S1.5、S2.0–S2.4、P1–P5、Q1、H1 与 F1.1 均已完成独立验收；F1.1 最终基线为 **2738 passed / 2 warnings**。艾卡于 2026-09-18 确认 F1.1 整体验收通过并冻结，下一入口为 **F1.2 Windows、单 Docker 镜像与版本化 API 交付适配**。Research R1 与 Cloud 暂不排期、不自动启动。已验证环境为 Windows、Python 3.10 和 Ultralytics YOLOv8 Detect；Segment、OBB、Pose、YOLO11/26 与 YOLOv5 Detect 不在当前计划。
 
 ## Commands
 
@@ -76,6 +76,7 @@ python -m auto_tune.main --train
 # Full suite（正式基线见 docs/development_handoff_20260814.md）
 # 最近官方验收基线：1484 passed / 2 PCA warnings / 0 skipped（Q1.1/Q1.2 验收后完整套件）
 # H1.1 新增 modules/hpo 模块与 6 个测试文件（test_hpo_*.py），已通过 Codex 验收（2026-09-08）；H1.1 验收后完整套件本地 1672 passed / 2 PCA warnings / 0 skipped
+# 最新完整基线：F1.1 验收冻结后 2738 passed / 2 warnings（此前本地运行：H1.3 后 2426、F1.1-A 页面返修后 2616、F1.1-B 后 2732）
 # 内存约束：新批次定向测试请逐个文件运行，不要一次并行跑多个测试文件
 python -m pytest auto_tune\tests -q -p no:cacheprovider
 
@@ -369,6 +370,8 @@ All reports stored in `log/`:
 - **SQLite 只作可重建查询索引**：JSON 审计/报告/运行状态仍是事实来源；SQLite 故障不得改变训练/调优真实终态，损坏时诚实回退 JSON 且不隐藏记录。
 - **统一历史 KPI**：`epochs={configured,completed,best}`；审计与历史 KPI 必须一致。
 - **敏感字段递归脱敏**：api_key/apikey/authorization/token/secret/password 等不得进入审计/历史。
+- **文本模型默认名统一为 `deepseek-flash`**（`config.template.yaml`、`decision_agent.call_decision_llm`、`llm_analyzer` 的 payload 默认与 `model_used`、`ui/app.py` 的 `_default_model_for("text")`）；显式配置的 `llm.model` 始终优先，config.yaml 本地值可不同但不得回写死名。
+- **JSON 输出约束按路径区分**：`call_decision_llm(prompt, config, json_mode=False)` 只在**结构化 JSON 路径**传 `json_mode=True`（`generate_suggestion` 的首次与一次 JSON 纠错重试、TuningDecision v1 的首次与一次纠正重试），payload 才带 `response_format={"type":"json_object"}`；**终局摘要等纯文本调用必须保持默认 False**（该提示词明确要求"不要输出 JSON"）。两条 JSON 路径的提示词都必须含 `JSON` 字样（DeepSeek `json_object` 模式的前置要求）。新增 `call_decision_llm` 调用方时按其输出类型选择，不要无条件开启。
 
 ## P4/P5 展示层与只读视图契约
 
@@ -396,7 +399,7 @@ All reports stored in `log/`:
 - 上传/分析目录已接入 S1.4 `input_safety` 预检；ZIP 不作为主流程，安全提取未恢复
 - Tuning status uses a JSON status file (`tuning_running.json`) written/cleaned by the tuning endpoint（与 S1.5 run_state 统一运行状态并存）
 - S2 Core 只实现 SQLite 基础索引；数据集重命名、标签、批量操作、归档、高级搜索、统计图表、导入导出、复杂对比不开发，仅保留 Repository/Service/API 扩展边界
-- 当前路线（2026-09-16 修订，见 `docs/roadmap_20260814.md`/`docs/implementation_plan_20260814.md`）：**Q1 与 H1 已完成**；H1 分 **H1.1 搜索契约与持久化基础（已验收 2026-09-08）→ H1.2 训练执行与恢复（已验收 2026-09-09）→ H1.3 Studio 接入（已验收 2026-09-16）** 三批。下一步为 **F1.1 产品优化与稳定版本冻结**，随后进入 **F1.2 Windows、Docker 与 API 交付适配**；不设置 H1.4。**R1 轻量 Research** 与 **Cloud（CL1–CL6）** 暂不排期、不自动衔接启动。用户可在直接训练/HPO/LLM 三种独立策略中选择，**不串联决策**（不做"HPO 结果再交给 LLM 裁决"）；YOLOv5 Detect 不再开发，Segment/OBB/Pose/YOLO11/26 不在当前计划
+- 当前路线（2026-09-18 修订，见 `docs/roadmap_20260814.md`/`docs/implementation_plan_20260814.md`）：**Q1、H1 与 F1.1 均已完成验收**。F1.1-A 完成体验优化与受控权重库，F1.1-B 完成 LLM 效果专项，F1.1-C 完成稳定冻结审查与必要最小修复；最终完整自动化为 **2738 passed / 2 warnings**。F1.1 已关闭前端干运行入口、原参考总体最佳展示与目标绑定、动态运行名转义等 P1，未做结构重写，未改已验收协议。下一入口为 **F1.2 Windows、单 Docker 镜像与 API 交付适配**；不设置 H1.4。**R1 轻量 Research** 与 **Cloud（CL1–CL6）** 暂不排期、不自动启动。用户可在直接训练、HPO 和 LLM 三种独立策略中选择，不串联决策；YOLOv5 Detect、Segment、OBB、Pose、YOLO11/26 不在当前计划。
 - **H1.1（已通过 Codex 验收，2026-09-08；本批不含真实训练/UI/API/LLM/产品排名）**：`auto_tune/modules/hpo/` 严格契约（`extra='forbid'`、拒绝 bool/str/NumPy/NaN/Inf、JSON 唯一事实源、版本化 study/trial）、条件搜索空间（SGD momentum_sgd / AdamW beta1_adamw 独立采样键 → 统一 momentum；lrf 上限 0.1；epochs=1 时 warmup=0）、Optuna 4.5.0 TPE/RandomSampler（每次按历史重建内存 study，不落 RDB/pickle）、原子 JSON + 锁（同目录临时文件 flush/fsync/os.replace；进程内共享 Lock + msvcrt/fcntl 非阻塞 OS 锁，忙返回 `HPO_STUDY_BUSY`）、候选写盘成功才返回、同 request_id 幂等、失败 trial 消耗预算不补偿、历史损坏/版本不匹配/输入绑定改变拒绝继续。验收后加固：新增 `validation.py`（validate_trial/validate_history/validate_record：读/写/重建同一深度重校验，含候选↔sampled 映射、条件分布 JSON 字符串键序/有限性/属性集合、state↔result 不变量、history 预算/去重/连续性）与 `storage.reject_link_chain`（storage 根/study/锁/study.json/model 路径拒绝 symlink 与 reparse、`..`；写前不覆盖已损坏 study.json），新增 `test_hpo_recovery_validation.py`。H1.1 测试共 6 个 `test_hpo_*.py`（188 tests）；依赖新增 optuna 4.5.0、alembic 1.19.2、SQLAlchemy 2.0.52、colorlog 6.12.0、greenlet 3.5.5（`requirements.txt` 仅追加五行）。实现与验收规格见 `历史文档/已验收批次_截至20260916/superpowers/specs/2026-09-07-h1-1-hpo-foundation-design.md`、`历史文档/已验收批次_截至20260916/superpowers/plans/2026-09-07-h1-1-hpo-foundation.md`
 - **H1.2（已通过 Codex 验收，2026-09-09；全量本地 1837 passed / 2 PCA warnings / 0 skipped，97.89 秒）**：`modules/hpo/` 新增 execution_models/execution_storage/execution_adapter/execution/metrics/ranking；`HpoRunner.prepare/run/resume/status` + `rank_trials` + `extract_objective`；execution.json（hpo-execution-v1）原子审计 + `.hpo-runner.lock` 全局执行锁；executor.py 仅追加 task/amp 白名单；`ExecutionAttempt` 新增必填 `command_executable`（与 command 分离并等于 command[0]；历史命令重建以此为据、不解析当前 YOLO，新启动才解析当前环境比对；缺该字段的旧 execution-v1 记录拒读、不补齐/不迁移/不覆盖，属未发布格式收紧，后续发布版本不得以此先例静默破坏已发布格式）；新增 `auto_tune/scripts/verify_hpo_execution.py`（预算完整 + 真实验收 trial 全成功 + 有效排名才返回 0）。四轮返修（R1–R7、R2a-1/R2a-2/R2a-3、R2b/R2c）后独立反例累计 **21 passed**；**4 次真实短训练**（TPE/Random×budget=2、epochs=1、batch=1、imgsz=64、device=0、timeout_seconds=120）均 SUCCESS/FINALIZED、CLI 退出 0；**未提交、未推送**。验收不含 UI/API 接线、真实 SGD、长训练性能与真实训练中全部故障注入。规格/计划/验收见 `历史文档/已验收批次_截至20260916/superpowers/specs/2026-09-08-h1-2-hpo-execution-design.md`、`历史文档/已验收批次_截至20260916/superpowers/plans/2026-09-08-h1-2-hpo-execution.md`、`历史文档/已验收批次_截至20260916/reviews/h1_2_codex_review_20260908.md`
 - **H1.3 Studio 接入（已通过验收，2026-09-16）**：`ui/hpo_training.py`（严格 `FormalTrainingConfig`/`TrainBestRequest`、`resolve_hpo_formal_training` 只采纳 epochs 且 batch/imgsz/device 必须与权威 execution 逐项相等、候选在新 epochs 下重校验不裁剪、`submit_formal_training` 复用 `ManualRunController`/共享门禁/原子写盘且失败零进程零新目录、受控产物与关联结果投影）、`ui/hpo_api.py`（字段级安全错误投影 `INVALID_HPO_FIELD`、快照/本地模型投影）、`ui/app.py`（第二个 `/api/hpo` router，service/runner/manager 以 accessor 传参）、`ui/hpo_controller.py`、`ui/hpo_reuse.py`、`ui/static/hpo.js` + `single_page.html`（四模式统一布局、HPO 专属元素 `hpo-mode`/`non-hpo-only`、选择代号丢弃乱序响应、202 后经 `refreshRound` 自动轮询、公共监控所有权守卫、设备选择器）、`ui/static/monitor.js` 的 `epochsValue`（终态 epoch KPI 是 `{configured,completed,best}` 结构，不是标量）。返修节点：09-14 主体 → 09-15 结构化 epochs 投影 → 09-15 最终浏览器阻断项 → 09-15 第四轮（202 后自动轮询）→ 09-16 第五轮（正式训练恢复 YOLO 静态绘图：`FORMAL_TRAINING_OVERRIDES = {"plots": True}` 只作用于 `/train-best`，搜索阶段仍 `plots=False`；同条件验证路径 `ui/hpo_reuse.py` 未改）。验收前本地完整套件 **2426 passed / 2 PCA warnings / 0 skipped**；**遗留的浏览器体验问题转 F1 第一轮产品打磨统一处理**

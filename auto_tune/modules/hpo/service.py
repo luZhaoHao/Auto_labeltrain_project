@@ -88,7 +88,8 @@ class HpoService:
         reject_link_chain(self._root, code='HPO_INVALID_CONFIG')
 
         snapshot = self._validate_snapshot(snapshot_dir)
-        model_abs, model_bytes, model_sha = self._validate_model_file(model_path)
+        model_abs, model_bytes, model_sha, model_mtime_ns = self._validate_model_file(
+            model_path)
 
         snapshot_binding = SnapshotBinding(
             snapshot_id=snapshot.snapshot_id,
@@ -98,7 +99,8 @@ class HpoService:
         )
         model_binding = ModelBinding(model_path=model_abs,
                                      model_bytes=model_bytes,
-                                     model_sha256=model_sha)
+                                     model_sha256=model_sha,
+                                     model_mtime_ns=model_mtime_ns)
         environment = EnvironmentSnapshot(**_current_environment())
         now = utc_now_iso()
         study_id = "hpo_" + uuid.uuid4().hex
@@ -149,7 +151,9 @@ class HpoService:
             raise HpoError("HPO_INVALID_CONFIG",
                            "model_path must be a regular local file")
         model_abs = os.path.abspath(os.path.normpath(str(path)))
-        return model_abs, int(st.st_size), _sha256_file(path)
+        # 大小与 mtime 来自同一次 stat()；SHA-256 随后按内容计算
+        return (model_abs, int(st.st_size), _sha256_file(path),
+                int(st.st_mtime_ns))
 
     # ── 读取 ────────────────────────────────────────────────────────
 
@@ -279,13 +283,20 @@ class HpoService:
             raise HpoError("HPO_BINDING_MISMATCH",
                            "model binding no longer a regular local file")
         try:
-            size = mpath.stat().st_size
+            stat_result = mpath.stat()
         except OSError as exc:
             raise HpoError("HPO_BINDING_MISMATCH",
                            "model binding inaccessible") from exc
-        if size != model.model_bytes or _sha256_file(mpath) != model.model_sha256:
+        if (stat_result.st_size != model.model_bytes
+                or _sha256_file(mpath) != model.model_sha256):
             raise HpoError("HPO_BINDING_MISMATCH",
                            "model binding content changed")
+        # 新研究同时冻结 mtime；旧记录没有该事实（None），继续按路径/大小/
+        # SHA-256 复核，不因缺少 mtime 被判损坏
+        if (model.model_mtime_ns is not None
+                and int(stat_result.st_mtime_ns) != model.model_mtime_ns):
+            raise HpoError("HPO_BINDING_MISMATCH",
+                           "model binding modification time changed")
 
     def _same_terminal_result(self, trial: TrialRecord,
                               result: ResultInput) -> bool:

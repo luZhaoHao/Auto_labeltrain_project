@@ -1,8 +1,12 @@
-"""H1.3 Task 3: four training modes + HPO configuration UI.
+"""H1.3 Task 3: training-mode selection + HPO configuration UI.
 
 Structural assertions on the real templates + HTTP behaviour of /tuning/start.
 These are NOT a browser pass — Codex still performs the real browser walkthrough.
 No real training, no network LLM.
+
+F1.1-C Task 1: the page offers the four approved selectable modes
+(``dry_run``, ``keep_params``, ``hpo``, ``full``) in the frozen order, and the
+backend ``/tuning/start`` contract keeps accepting all of them.
 """
 
 import re
@@ -28,20 +32,22 @@ def _mode_options(html: str) -> list[str]:
     return re.findall(r'<option value="([^"]+)"', block)
 
 
-# ── four modes: values / names / order identical in both pages ─────
+# ── four selectable modes: values / names / order identical in both pages ──
 
 
 @pytest.mark.parametrize("template", ["single_page.html", "agent_suggestion.html"])
-def test_four_modes_order_and_values(template):
+def test_page_mode_options_order_and_values(template):
     assert _mode_options(_raw(template)) == _MODE_ORDER
 
 
 @pytest.mark.parametrize("template", ["single_page.html", "agent_suggestion.html"])
-def test_four_modes_share_translation_keys(template):
+def test_page_mode_options_share_translation_keys(template):
     html = _raw(template)
     for key in ("Dry-Run (generate plan only)", "Train with Original Parameters",
                 "HPO Algorithm Tuning", "LLM Parameter Tuning"):
         assert key in html
+    # 干运行是真实可选选项：在 DOM 里，不是靠 CSS/属性藏起来的
+    assert 'value="dry_run"' in html
 
 
 def test_mode_labels_localized():
@@ -188,6 +194,42 @@ def test_tuning_start_rejects_unknown_modes_before_llm(tmp_path, monkeypatch, mo
         assert resp.status_code == 422
         assert resp.json()["error_code"] == "INVALID_MODE"
         assert app_mod._RUN_MANAGER.active_tuning() is None
+    finally:
+        app_mod._running_training.clear()
+
+
+def test_tuning_start_accepts_dry_run(tmp_path, monkeypatch):
+    """页面恢复四模式后，后端 dry-run 语义仍原样保留。
+
+    页面渲染 ``dry_run`` 选项不等于后端可以省掉 dry-run 的业务分支：它必须只生成
+    计划、不执行训练，也不占训练槽位。
+    """
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    _redirect_log(monkeypatch, tmp_path)
+    monkeypatch.setattr(app_mod, "_read_latest_dataset", lambda: None)
+    captured = {}
+
+    def fake_run_tuning_loop(config, **kwargs):
+        captured.update(kwargs)
+        return {"error": None, "iterations": []}
+
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.loop.run_tuning_loop", fake_run_tuning_loop)
+    app_mod._running_training.clear()
+    try:
+        client = TestClient(app_mod.app)
+        resp = client.post("/tuning/start", json={
+            "reference_run": None, "max_retries": 1, "mode": "dry_run",
+            "auto_analyze": False, "auto_loop": False,
+        })
+        assert resp.status_code == 200, resp.text
+        assert "INVALID_MODE" not in resp.text
+        # 真正走到了原有 dry-run 分支：只生成计划，不执行训练，也不占训练槽位
+        assert captured, "dry_run must still reach the tuning loop"
+        assert captured["skip_execute"] is True
+        assert app_mod._RUN_MANAGER.reservation_owner() is None
     finally:
         app_mod._running_training.clear()
 

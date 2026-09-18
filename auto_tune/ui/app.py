@@ -123,9 +123,11 @@ from auto_tune.modules.run_state.manager import (
 from auto_tune.modules.run_state.manual_controller import ManualRunController
 from auto_tune.modules.run_state.tuning_controller import TuningRunController
 from auto_tune.modules.hpo import HpoError, HpoRunner, HpoService
+from auto_tune.modules.model_store import ModelStore, ModelStoreError
 from .hpo_api import create_hpo_router, safe_hpo_error_code
 from .hpo_reuse import resolve_hpo_verification
 from .hpo_training import TrainingSubmitDeps, create_hpo_training_router
+from .model_store_api import create_model_store_router
 
 
 def _finalize_and_build_event(
@@ -701,7 +703,7 @@ def _default_endpoint_for(purpose: str) -> str:
 
 
 def _default_model_for(purpose: str) -> str:
-    return "deepseek-chat" if purpose == "text" else "qwen-vl-plus"
+    return "deepseek-flash" if purpose == "text" else "qwen-vl-plus"
 
 
 def _read_config_file() -> dict:
@@ -996,58 +998,129 @@ def _load_data():
 
 
 # ── Helper: assemble suggestion from tuning history or LLM analysis ──
-def _get_latest_suggestion(tuning_history, training):
-    """Extract the latest structured suggestion for the intelligent-analysis page.
+def _project_decision(decision):
+    """Project a stored decision/suggestion object into the UI suggestion shape.
 
     Rationale is always sourced from ``action`` (never a non-existent
     ``llm_rationale``). Structured failures surface a stable error instead of a
-    fake "no suggestions". A plain LLM diagnosis without a structured decision
-    is never presented as an executable suggestion.
+    fake "no suggestions". Returns ``None`` when the object carries neither a
+    structured failure nor an actionable decision.
     """
-    if tuning_history:
-        latest = tuning_history[-1]
-        decision = latest.get("decision", {})
-        if decision.get("error"):
-            return {
-                "diagnosis": "",
-                "rationale": "",
-                "action": "",
-                "hyperparameter_changes": {},
-                "training_overrides": {},
-                "error": decision["error"],
-            }
-        changes = decision.get("hyperparameter_changes", {})
-        if changes or decision.get("action"):
-            return {
-                "diagnosis": decision.get("diagnosis", ""),
-                "rationale": decision.get("action", ""),
-                "action": decision.get("action", ""),
-                "hyperparameter_changes": changes,
-                "training_overrides": decision.get("training_overrides", {}),
-                "error": None,
-            }
-    # Check training report's own structured suggestion (analyze-folder / ZIP)
-    if training and training.get("suggestion"):
-        sug = training["suggestion"]
-        if sug.get("error"):
-            return {
-                "diagnosis": "",
-                "rationale": "",
-                "action": "",
-                "hyperparameter_changes": {},
-                "training_overrides": {},
-                "error": sug["error"],
-            }
-        if sug.get("hyperparameter_changes") or sug.get("action"):
-            return {
-                "diagnosis": sug.get("diagnosis", ""),
-                "rationale": sug.get("action", ""),
-                "action": sug.get("action", ""),
-                "hyperparameter_changes": sug.get("hyperparameter_changes", {}),
-                "training_overrides": sug.get("training_overrides", {}),
-                "error": None,
-            }
+    if not isinstance(decision, dict):
+        return None
+    if decision.get("error"):
+        return {
+            "diagnosis": "",
+            "rationale": "",
+            "action": "",
+            "hyperparameter_changes": {},
+            "training_overrides": {},
+            "error": decision["error"],
+        }
+    changes = decision.get("hyperparameter_changes", {})
+    if changes or decision.get("action"):
+        return {
+            "diagnosis": decision.get("diagnosis", ""),
+            "rationale": decision.get("action", ""),
+            "action": decision.get("action", ""),
+            "hyperparameter_changes": changes,
+            "training_overrides": decision.get("training_overrides", {}),
+            "error": None,
+        }
     return None
+
+
+def _get_latest_suggestion(tuning_history, training):
+    """Extract the structured suggestion that belongs to the analysed page.
+
+    Source priority (F1.1): the current training report's own ``suggestion``
+    always wins — success, ``keep_params`` and structured failure alike. Tuning
+    history is only a fallback, and only entries whose ``train_name`` matches a
+    run in the current report may be used; unrelated runs never leak into the
+    page. Without a training report the legacy "latest history entry" behaviour
+    is preserved. A plain LLM diagnosis without a structured decision is never
+    presented as an executable suggestion.
+    """
+    if training:
+        projected = _project_decision(training.get("suggestion"))
+        if projected is not None:
+            return projected
+        # No report-level suggestion: only a history entry bound to the same
+        # run may fill in. Never guess by timestamp or filename similarity.
+        runs = training.get("runs")
+        run_names = {name for name in runs if name} if isinstance(runs, dict) else set()
+        for entry in reversed(tuning_history or []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("train_name") not in run_names:
+                continue
+            projected = _project_decision(entry.get("decision"))
+            if projected is not None:
+                return projected
+        return None
+    if tuning_history and isinstance(tuning_history[-1], dict):
+        projected = _project_decision(tuning_history[-1].get("decision"))
+        if projected is not None:
+            return projected
+    return None
+
+
+def _llm_analysis_bound_run(training):
+    """Run that owns the current report's structured suggestion, or ``None``.
+
+    Single-run reports bind to that run; multi-run reports only bind when
+    ``summary.best_overall_run`` names a run that truly exists. Anything else is
+    ambiguous and must not be guessed.
+    """
+    runs = training.get("runs")
+    if not isinstance(runs, dict) or not runs:
+        return None
+    names = [name for name in runs if name]
+    if len(names) == 1:
+        return names[0]
+    best = (training.get("summary") or {}).get("best_overall_run")
+    if best and best in runs:
+        return best
+    return None
+
+
+def _get_llm_analysis_display(training):
+    """Read-only projection of the LLM analysis belonging to the current report.
+
+    Entries with nothing renderable are dropped so the template never shows a
+    title-only card. An empty plain diagnosis is filled from the same report's
+    structured ``suggestion.diagnosis`` only when the run identity is certain; a
+    stored error is kept and never masked by that fallback. The source report is
+    never mutated and no value is ever taken from another run's analysis.
+    """
+    if not training:
+        return None
+    analysis = training.get("llm_analysis")
+    if not isinstance(analysis, dict) or not analysis:
+        return None
+    suggestion = training.get("suggestion")
+    suggestion = suggestion if isinstance(suggestion, dict) else {}
+    fallback = suggestion.get("diagnosis")
+    fallback = fallback.strip() if isinstance(fallback, str) else ""
+    bound_run = _llm_analysis_bound_run(training) if fallback else None
+
+    display = {}
+    for run_name, diag in analysis.items():
+        if not isinstance(diag, dict):
+            continue
+        raw = diag.get("llm_diagnosis")
+        text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+        entry = {
+            "llm_diagnosis": text,
+            "model_used": diag.get("model_used"),
+            "error": diag.get("error"),
+        }
+        if not text.strip() and not entry["error"] and run_name == bound_run:
+            entry["llm_diagnosis"] = fallback
+        if not entry["llm_diagnosis"].strip() and not entry["error"]:
+            continue
+        display[run_name] = entry
+    return display or None
 
 
 def _monitor_latest_projection(training, experiment_history):
@@ -1143,7 +1216,7 @@ def _common_context():
         "current_args": _get_current_args(training),
         "dataset_analyzer_config": data["dataset_analyzer_config"],
         "training_config": APP_CONFIG.get("training", {}),
-        "llm_analysis": training.get("llm_analysis") if training else None,
+        "llm_analysis": _get_llm_analysis_display(training),
         "vision_analysis": training.get("vision_analysis") if training else None,
         "latest_dataset": latest_dataset,
         "csrf_token": _CSRF_TOKEN,
@@ -2156,6 +2229,16 @@ async def start_tuning(request: Request):
     if auto_analyze and max_retries > 1 and not auto_loop:
         auto_loop = True
     eval_mode = body.get("eval_mode", "comprehensive")
+
+    # 大模型调优必须继承参考运行 args.yaml 中已经使用的权重：不接受任何客户端
+    # 权重覆盖（哪怕会被静默忽略），也绝不因此用新权重训练却沿用旧基线。
+    # 该判断先于参考运行解析，避免把一个被拒绝的请求先暴露成参考运行错误。
+    if "model_id" in body or "model" in body:
+        return JSONResponse(
+            {"error_code": "LLM_MODEL_OVERRIDE_FORBIDDEN",
+             "error": "大模型调优必须继承参考运行的初始权重。"},
+            status_code=422,
+        )
 
     # Resolve the reference run's bound dataset snapshot BEFORE any controller
     # or YOLO subprocess is created. The global latest_dataset is never a
@@ -3503,7 +3586,10 @@ async def start_first_training(request: Request):
                 return _snapshot_error_response(exc)
         else:
             data_yaml = project_cfg.get("data_yaml") or training_cfg.get("data_yaml", "")
-    model = body.get("model") or project_cfg.get("model") or training_cfg.get("model", "yolov8n.pt")
+    model = _resolve_training_model(body)
+    if isinstance(model, JSONResponse):
+        # 解析失败不创建训练目录、不写运行状态、不启动任何进程
+        return model
     epochs = int(body.get("epochs", training_cfg.get("default_epochs", 100)))
     imgsz = int(body.get("imgsz", training_cfg.get("imgsz", 640)))
     batch = int(body.get("batch", training_cfg.get("batch", 16)))
@@ -3832,60 +3918,86 @@ def list_published_snapshots(root=None, include_source_root=False) -> list[dict]
     return readable + unreadable
 
 
-_HPO_MODEL_SCAN_LIMIT = 100
+def _model_store_root() -> str:
+    """Controlled weight root from config, relative to the working directory."""
+    cfg = (APP_CONFIG.get("model_store") or {}) if APP_CONFIG else {}
+    configured = cfg.get("root") or os.path.join("models", "weights")
+    return os.path.abspath(str(configured))
+
+
+def _build_model_store() -> "ModelStore":
+    cfg = (APP_CONFIG.get("model_store") or {}) if APP_CONFIG else {}
+    try:
+        max_upload = int(cfg.get("max_upload_bytes", 2_147_483_648))
+    except (TypeError, ValueError):
+        max_upload = 2_147_483_648
+    try:
+        max_models = int(cfg.get("max_models", 100))
+    except (TypeError, ValueError):
+        max_models = 100
+    return ModelStore(
+        Path(_model_store_root()),
+        # 项目根作为遗留兼容来源继续可读；绝不扫描 detect/trainN 训练产物
+        legacy_roots=[Path(os.getcwd())],
+        max_upload_bytes=max_upload,
+        max_models=max_models,
+    )
+
+
+_MODEL_STORE = _build_model_store()
 
 
 def list_local_models() -> list[dict]:
-    """Minimal local ``.pt`` listing for the HPO weight selector.
+    """Short-term compatibility wrapper over the one controlled weight store.
 
-    Scans only controlled roots: the project working directory (non-recursive)
-    and the Detect directory with its per-run ``weights`` folders. It never
-    walks the system, never follows links/reparse points, and is bounded in
-    both depth and entry count. The absolute path is returned because the user
-    must confirm which local file gets bound (the create API re-validates and
-    hashes it); selection alone never grants trust.
-
-    Each row carries ``kind`` (``initial`` vs ``training_artifact``) and a
-    human ``origin`` so a training product (``trainN/weights/best.pt``) is never
-    presented as if it were the same thing as an initial weight.
+    It no longer scans anything itself: the safe public projection (model id,
+    name, size, SHA-256, origin, availability) is the only listing, so no
+    client ever receives a server-side path and no training artifact is
+    presented as an initial weight.
     """
-    candidates: list[tuple[Path, str, str]] = []
-    try:
-        for path in sorted(Path(os.getcwd()).glob("*.pt")):
-            candidates.append((path, "initial", "项目根目录"))
-    except OSError:
-        pass
-    detect_dir = Path(_hpo_detect_dir())
-    try:
-        for path in sorted(detect_dir.glob("*.pt")):
-            candidates.append((path, "initial", "Detect 目录"))
-        for run_dir in sorted(detect_dir.iterdir(), key=lambda p: p.name)[:200]:
-            if not run_dir.is_dir():
-                continue
-            for path in sorted(run_dir.glob("weights/*.pt")):
-                candidates.append(
-                    (path, "training_artifact", f"训练产物 {run_dir.name}/weights"))
-    except OSError:
-        pass
+    return [row.public_dict() for row in _MODEL_STORE.list_models()]
 
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for path, kind, origin in candidates:
-        if len(rows) >= _HPO_MODEL_SCAN_LIMIT:
-            break
+
+def _resolve_training_model(body: dict):
+    """Resolve the initial weight of a direct training from the controlled library.
+
+    A client-supplied ``model`` (or any path) is rejected outright — it is never
+    used and never guessed — and the configured default is resolved **by
+    basename** inside the controlled library, so Ultralytics can never
+    implicitly download a checkpoint. The resolved value is an absolute path of
+    a file whose existence and SHA-256 are re-checked right here, before any run
+    directory, state file, reservation or controller exists.
+    """
+    model_id = body.get("model_id")
+    if model_id:
         try:
-            if _is_reparse_like(path) or not path.is_file():
-                continue
-            resolved = str(Path(os.path.abspath(str(path))))
-            if resolved.lower() in seen:
-                continue
-            size_mb = round(path.stat().st_size / (1024 * 1024), 1)
-        except OSError:
-            continue
-        seen.add(resolved.lower())
-        rows.append({"name": path.name, "path": resolved, "size_mb": size_mb,
-                     "kind": kind, "origin": origin})
-    return rows
+            return str(_MODEL_STORE.resolve(model_id))
+        except ModelStoreError as exc:
+            return JSONResponse({"error_code": exc.code, "error": exc.message},
+                                status_code=exc.status_code)
+    if "model" in body:
+        return JSONResponse(
+            {"error_code": "MODEL_PATH_FORBIDDEN",
+             "error": "请从受控权重库选择初始权重。"},
+            status_code=422,
+        )
+    project_cfg = APP_CONFIG.get("project", {}) if APP_CONFIG else {}
+    training_cfg = APP_CONFIG.get("training", {}) if APP_CONFIG else {}
+    configured = project_cfg.get("model") or training_cfg.get("model", "yolov8n.pt")
+    try:
+        return str(_MODEL_STORE.resolve_configured_name(configured))
+    except ModelStoreError as exc:
+        return JSONResponse({"error_code": exc.code, "error": exc.message},
+                            status_code=exc.status_code)
+
+
+def _require_security_verdict(request: Request):
+    """``require_security`` in the gate style used by the HPO routers."""
+    try:
+        _require_security(request)
+    except _SecurityRejected as exc:
+        return JSONResponse({"error": str(exc)}, status_code=403)
+    return None
 
 
 def _is_reparse_like(path: Path) -> bool:
@@ -3902,20 +4014,16 @@ def _is_reparse_like(path: Path) -> bool:
         return False
 
 
-def _validate_hpo_model(value):
-    """Map a local initial-weight file to a validated absolute path.
+def _resolve_hpo_model_id(model_id):
+    """Map a controlled model id to the frozen absolute initial-weight path.
 
-    Link/reparse and regular-file checks plus content hashing are enforced by
-    ``HpoService.create_study``; this resolver only requires an existing local
-    ``.pt`` file so input errors surface early and nothing is auto-downloaded.
+    The client never sends a path: a model id is re-resolved against the current
+    controlled-library facts here, and ``HpoService.create_study`` freezes the
+    normalized path, byte count, SHA-256 and nanosecond mtime (``model_mtime_ns``)
+    into the study binding. Legacy records without that field stay readable.
+    Existing studies keep their own frozen binding and are never rebound.
     """
-    if not isinstance(value, str) or not value:
-        raise HpoError("HPO_INVALID_CONFIG", "请选择本地初始权重文件")
-    norm = os.path.abspath(os.path.normpath(value))
-    path = Path(norm)
-    if path.suffix.lower() != ".pt" or not path.is_file():
-        raise HpoError("HPO_INVALID_CONFIG", "本地初始权重不存在或不是 .pt 文件")
-    return norm
+    return _MODEL_STORE.resolve(model_id)
 
 
 _hpo_service = HpoService(Path(_hpo_storage_root()))
@@ -4064,44 +4172,46 @@ def _default_snapshot_binding() -> tuple[dict | None, str, bool]:
     return None, ("NO_MATCHING_SNAPSHOT" if registered else "NO_REGISTERED_DATASET"), registered
 
 
-def _default_model_binding(project_cfg: dict, training_cfg: dict) -> dict:
-    """Default initial weight: configured legal local ``.pt``, else yolov8n.pt.
+def _model_row_by_name(name: str):
+    """Controlled-library record for one configured name, or ``None``.
 
-    A configured-but-illegal value is never silently swapped for a different
-    file (that would change the user's experiment); it is reported so the user
-    makes the one necessary selection. A search-stage ``best.pt`` is never
-    auto-selected and nothing is ever downloaded.
+    Delegates to the store's single configuration-name resolution so HPO
+    defaults and direct training can never diverge: a path form is rejected by
+    the shared rule instead of being truncated to its last segment. A missing
+    name is reported as such and never triggers a download.
     """
-    def resolve(value) -> str | None:
-        if not isinstance(value, str) or not value.strip():
-            return None
-        norm = os.path.abspath(os.path.normpath(value.strip()))
-        path = Path(norm)
-        try:
-            if path.suffix.lower() != ".pt" or not path.is_file() \
-                    or _is_reparse_like(path):
-                return None
-        except OSError:
-            return None
-        return norm
+    try:
+        return _MODEL_STORE.resolve_configured_record(name)
+    except ModelStoreError:
+        return None
 
+
+def _default_model_binding(project_cfg: dict, training_cfg: dict) -> dict:
+    """Default initial weight: configured basename resolved in the library.
+
+    The projection is client-safe: a ``model_id`` and a display name, never a
+    server path. A configured-but-illegal value is never silently swapped for a
+    different file (that would change the user's experiment); it is reported so
+    the user makes the one necessary selection. A search-stage ``best.pt`` is
+    never auto-selected and nothing is ever downloaded.
+    """
     for source_key, value in (("project.model", project_cfg.get("model")),
                               ("training.model", training_cfg.get("model"))):
         if isinstance(value, str) and value.strip():
-            resolved = resolve(value)
-            if resolved is None:
-                return {"path": None, "name": None, "source": None,
+            row = _model_row_by_name(value)
+            if row is None:
+                return {"model_id": None, "name": None, "source": None,
                         "available": False, "reason_code": "MODEL_CONFIG_INVALID"}
-            return {"path": resolved, "name": os.path.basename(resolved),
+            return {"model_id": row.model_id, "name": row.name,
                     "source": source_key, "available": True,
                     "reason_code": "MODEL_BOUND"}
 
-    fallback = resolve("yolov8n.pt")
+    fallback = _model_row_by_name("yolov8n.pt")
     if fallback is not None:
-        return {"path": fallback, "name": os.path.basename(fallback),
+        return {"model_id": fallback.model_id, "name": fallback.name,
                 "source": "fallback:yolov8n.pt", "available": True,
                 "reason_code": "MODEL_BOUND"}
-    return {"path": None, "name": None, "source": None, "available": False,
+    return {"model_id": None, "name": None, "source": None, "available": False,
             "reason_code": "MODEL_MISSING"}
 
 
@@ -4181,12 +4291,19 @@ app.include_router(
         runner=_hpo_runner,
         manager=_RUN_MANAGER,
         resolve_snapshot=_resolve_hpo_snapshot,
-        validate_model=_validate_hpo_model,
+        resolve_model=_resolve_hpo_model_id,
         assert_training_slot_free=_assert_training_slot_free,
         list_snapshots=list_published_snapshots,
         list_models=list_local_models,
     ),
     prefix="/api/hpo",
+)
+app.include_router(
+    create_model_store_router(
+        # accessor, not a captured instance: the module global is the truth
+        store=lambda: _MODEL_STORE,
+        require_security=_require_security_verdict,
+    ),
 )
 app.include_router(
     create_hpo_training_router(

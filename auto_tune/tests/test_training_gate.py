@@ -204,13 +204,19 @@ def test_running_match_blocks():
             pass
 
 
-def test_running_missing_allows_and_reconciles():
+def test_running_missing_allows_and_reconciles(monkeypatch):
+    # The identity read must be stubbed, not simulated with a real short-lived
+    # child PID: on Windows the OS may reuse a freed PID before the gate reads
+    # it, and the gate then correctly reports MISMATCH → pid_reused. That made
+    # this test depend on PID-allocator timing instead of the MISSING contract.
+    calls = _counting_identity(monkeypatch, "MISSING")
     state = new_run_state("manual", run_name="train1")
     state = with_status_phase(
         state, status="running", phase="training",
-        pid=_pid_gone(), process_create_token="token")
+        pid=12345, process_create_token="token")
     decision = evaluate_persisted_run_state(state)
-    # The child is already gone → MISSING → not blocked, terminal reconciled.
+    assert len(calls) == 1
+    # MISSING → not blocked, terminal reconciled.
     assert decision.blocked is False
     assert decision.persist is not None
     assert decision.persist.status == "interrupted"
@@ -441,7 +447,7 @@ def test_manual_start_releases_slot_on_persist_failure(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt",
+            "data_yaml": str(tmp_path / "data.yaml"),
             "epochs": 1,
         })
         assert resp.status_code == 500
@@ -514,7 +520,7 @@ def _patch_training_runtime(monkeypatch, detect_dir, launched, release=None):
 
 
 def _training_payload(tmp_path):
-    return {"data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt",
+    return {"data_yaml": str(tmp_path / "data.yaml"),
             "epochs": 1}
 
 

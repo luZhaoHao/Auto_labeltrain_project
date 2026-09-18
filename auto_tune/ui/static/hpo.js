@@ -49,6 +49,7 @@
     INTERRUPTED: '已中断',
     COMPLETED: '已完成',
     BLOCKED: '需处理',
+    FAILED: '失败',
     starting: '启动中',
     running: '运行中',
     stopping: '正在停止',
@@ -77,6 +78,7 @@
     stopPending: false,
     stopPendingAt: 0,
     resumePending: false,     // 恢复请求已提交、等待执行器收敛（页面禁止重复提交）
+    uploadPending: false,     // 权重上传进行中：按钮禁用且重复点击只发一次
     watchFormal: false,
     formalRunName: null,
     formalInitialized: false,
@@ -143,6 +145,13 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {})
     });
+  }
+
+  // multipart 上传：只设置 CSRF 头，content-type 交给浏览器带 boundary
+  function jsonPostMultipart(path, formData) {
+    var headers = {};
+    if (window._CSRF_TOKEN) headers['X-CSRF-Token'] = window._CSRF_TOKEN;
+    return api(path, { method: 'POST', headers: headers, body: formData });
   }
 
   // ── selection identity ───────────────────────────────────────────
@@ -286,11 +295,15 @@
       llmOnly[j].style.display = isHpo ? 'none' : '';
     }
     // 主操作只有一个：HPO 用 hpoCreateAndStartBtn，其他三模式用公共提交按钮，
-    // 两者占据共同控制区的同一位置，切换时选项栏与按钮都不会跳动。
+    // 各自位于可见配置区末尾（#llmPrimaryActionHost / #hpoPrimaryActionHost）。
     var nonHpo = document.querySelectorAll('.non-hpo-only');
     for (var n = 0; n < nonHpo.length; n++) {
       nonHpo[n].style.display = isHpo ? 'none' : '';
     }
+    // 按钮本身也随模式显隐：宿主只负责布局分居，可见性必须由按钮自己决定，
+    // 否则隐藏宿主里的按钮仍会被当成“可见的主操作”。
+    setHidden($('startTuningBtn'), isHpo);
+    setHidden($('hpoCreateAndStartBtn'), !isHpo);
     // .hpo-mode = 该区域在 HPO 模式下始终显示；数据驱动的区域由渲染函数自行
     // 增删 hidden，模式切换只负责隐藏它们，绝不在无数据时凭空显示空卡片。
     var modeEls = document.querySelectorAll('.hpo-mode');
@@ -371,6 +384,8 @@
     }
     var sel = $('tuningModeSelect');
     if (sel) window.onTuningModeChange(sel.value);
+    // 受控权重库列表在首屏取一次：直接训练与 HPO 共用同一份选项来源
+    window.refreshModelLibrary();
   });
 
   // ── polling (single timer, bound to one id, cleared on unload) ────
@@ -548,67 +563,180 @@
     return (value == null) ? '—' : String(value);
   }
 
-  window.hpoLoadLocalModels = function () {
-    var select = $('hpoModelSelect');
-    if (!select) return Promise.resolve();
-    var previous = select.value;
-    return api('/api/hpo/local-models', {}).then(function (res) {
-      // 权威默认绑定可能比本请求先完成：以“当前值”为准，否则回退到发起时值，
-      // 绝不把已经绑定的权重退回到“未选择”。
-      var wanted = select.value || previous;
-      clearChildren(select);
-      select.appendChild(option('', '请选择本地 .pt 权重'));
+  // ── 受控权重库：列表 / 刷新 / 上传（HPO 与直接训练共用同一份客户端）──
+  //
+  // 客户端只认识安全 model_id（sha256:<64 hex>）：选项 value 只能是 model_id，
+  // 页面上不出现任何服务器路径，也不允许手工输入路径。
+
+  function formatWeightBytes(size) {
+    var value = Number(size);
+    if (!isFinite(value) || value < 0) return '';
+    if (value < 1024) return value + ' B';
+    if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+    if (value < 1024 * 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + ' MB';
+    return (value / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
+
+  function weightOriginLabel(origin) {
+    return origin === 'legacy' ? '兼容来源' : '权重库';
+  }
+
+  function weightOptionText(row) {
+    var size = formatWeightBytes(row.size_bytes);
+    return String(row.name) + (size ? ' · ' + size : '') +
+      ' · ' + weightOriginLabel(row.origin);
+  }
+
+  function fillWeightSelect(select, rows, placeholder) {
+    if (!select) return;
+    var wanted = select.value;
+    clearChildren(select);
+    select.appendChild(option('', placeholder));
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || !row.model_id) continue;
+      var opt = option(row.model_id, weightOptionText(row));
+      opt.setAttribute('data-name', String(row.name));
+      opt.setAttribute('data-available', row.available === false ? '0' : '1');
+      select.appendChild(opt);
+    }
+    // 已选中的绑定优先保留；它不在新列表里时绝不退回“未选择”，而是保留原值
+    // （服务器仍会在提交边界按当前事实重新解析）。
+    if (wanted) select.value = wanted;
+  }
+
+  // 列表读取失败绝不清空既有合法选项：失败只提示，不改变当前选择。
+  function loadModelLibrary() {
+    var hpoSelect = $('hpoModelSelect');
+    var trainSelect = $('trainModelSelect');
+    var previousHpo = hpoSelect ? hpoSelect.value : '';
+    var previousTrain = trainSelect ? trainSelect.value : '';
+    return api('/api/models', {}).then(function (res) {
       if (!res.ok) {
-        // 列表读取失败也不能丢掉当前绑定：选择器仍要回显已绑定的权重名称
-        syncModelSelectToPath(wanted);
-        updateDraftReadouts();
-        return;
+        setModelUploadStatus('权重列表暂不可用，已保留当前选择。', true);
+        return null;
       }
-      var rows = res.body.models || [];
-      for (var i = 0; i < rows.length; i++) {
-        var row = rows[i];
-        // 区分“模型初始权重”与“训练产物”，不能全部显示同一个 best.pt 标签
-        var kind = row.kind === 'training_artifact' ? '训练产物' : '初始权重';
-        select.appendChild(option(row.path, row.name +
-          (row.size_mb == null ? '' : ' · ' + row.size_mb + ' MB') +
-          ' · ' + kind + '（' + (row.origin || '未知来源') + '）'));
+      var rows = (res.body && res.body.models) || [];
+      if (hpoSelect) {
+        fillWeightSelect(hpoSelect, rows, '请从受控权重库选择权重');
+        if (previousHpo) hpoSelect.value = previousHpo;
       }
-      // 绑定的权重必须在选择器里可见，绝不能显示成“未选择”
-      syncModelSelectToPath(wanted);
-      updateDraftReadouts();
-    }).catch(function () { /* the already-bound value stays selected */ });
+      if (trainSelect) {
+        fillWeightSelect(trainSelect, rows, '请从受控权重库选择权重');
+        if (previousTrain) trainSelect.value = previousTrain;
+      }
+      setModelUploadStatus('');
+      renderModelSummary();
+      return rows;
+    }).catch(function () {
+      setModelUploadStatus('权重列表暂不可用，已保留当前选择。', true);
+      return null;
+    });
+  }
+
+  window.refreshModelLibrary = function () {
+    return loadModelLibrary().then(function (rows) {
+      if (rows !== null) updateDraftReadouts();
+      return rows;
+    });
   };
 
-  // 选择器是**唯一**的权重入口：绑定的路径不在受控列表里时补一条“当前绑定”项
-  // （只显示名称，不显示物理路径），绝不留下可编辑的路径输入。
-  function syncModelSelectToPath(path) {
+  window.hpoLoadLocalModels = function () {
+    return window.refreshModelLibrary();
+  };
+
+  function setModelUploadStatus(text, isError) {
+    var el = $('modelUploadStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = isError ? 'var(--destructive)' : 'var(--text-secondary)';
+  }
+
+  // 上传只做一件事：把操作人员给的单个 .pt 安全保存进受控目录。
+  // pending 期间按钮禁用且重复点击只发一次；失败绝不清空既有合法选项。
+  window.uploadModelFile = function () {
+    if (state.uploadPending) return;
+    var input = $('modelUploadInput');
+    var file = input && input.files && input.files[0];
+    if (!file) {
+      setModelUploadStatus('请先选择要上传的 .pt 权重文件。', true);
+      return;
+    }
+    state.uploadPending = true;
+    var btn = $('modelUploadBtn');
+    disable(btn, true, '上传中…');
+    setModelUploadStatus('正在上传…', false);
+    var body = new FormData();
+    body.append('file', file, file.name);
+    jsonPostMultipart('/api/models/upload', body).then(function (res) {
+      if (res.status !== 201 && res.status !== 200) {
+        setModelUploadStatus(errText(res.body) || '上传失败，未保存任何文件。', true);
+        return null;
+      }
+      var model = (res.body && res.body.model) || {};
+      return loadModelLibrary().then(function () {
+        // 上传成功即选中新权重（两个选择器保持一致）
+        var hpoSelect = $('hpoModelSelect');
+        if (hpoSelect && model.model_id) selectOptionByValue(hpoSelect, model.model_id);
+        var trainSelect = $('trainModelSelect');
+        if (trainSelect && model.model_id) selectOptionByValue(trainSelect, model.model_id);
+        renderModelSummary();
+        updateDraftReadouts();
+        setModelUploadStatus(
+          (res.status === 200 ? '权重已存在：' : '已上传：') + (model.name || ''), false);
+        if (input) input.value = '';
+        return model;
+      });
+    }).catch(function () {
+      setModelUploadStatus('上传结果未知，请刷新列表确认后再重试。', true);
+      return null;
+    }).then(function (model) {
+      state.uploadPending = false;
+      disable(btn, false, '上传权重');
+      return model;
+    });
+  };
+
+  // 选择器是**唯一**的权重入口：只接受受控列表里的 model_id。
+  // 已绑定的 model_id 不在当前列表里时保留原值并如实提示，绝不伪造可用性。
+  function syncModelSelectToId(modelId, displayName) {
     var select = $('hpoModelSelect');
     if (!select) return;
-    var value = String(path == null ? '' : path).trim();
+    var value = String(modelId == null ? '' : modelId).trim();
     if (!value) {
       selectOptionByValue(select, '');
       renderModelSummary();
       return;
     }
     if (!selectOptionByValue(select, value)) {
-      select.appendChild(option(value, '当前绑定：' + modelBasename(value) +
-        '（由当前项目/训练配置指定）'));
+      // 列表暂不可用时服务器仍给了安全显示名：如实回显名称，不退回“未选择”
+      var label = displayName
+        ? '当前绑定：' + displayName : '当前绑定（不在当前列表中）';
+      var opt = option(value, label);
+      opt.setAttribute('data-name', displayName || '当前绑定');
+      select.appendChild(opt);
       select.value = value;
     }
     renderModelSummary();
   }
 
-  function modelBasename(path) {
-    var text = String(path || '');
-    var parts = text.split(/[\\/]/);
-    return parts[parts.length - 1] || text;
+  function selectedOptionText(select) {
+    if (!select || !select.options) return '';
+    for (var i = 0; i < select.options.length; i++) {
+      if (select.options[i].value === select.value) {
+        return String(select.options[i].getAttribute('data-name')
+          || select.options[i].textContent || '');
+      }
+    }
+    return '';
   }
 
   // 主界面只显示模型名称；物理路径既不显示也不接受手工输入
   function renderModelSummary() {
     var select = $('hpoModelSelect');
     var value = String((select && select.value) || '').trim();
-    setText('hpoModelSummary', '模型名称：' + (value ? modelBasename(value) : '未选择'));
+    setText('hpoModelSummary',
+      '模型名称：' + (value ? (selectedOptionText(select) || '已选择') : '未选择'));
   }
 
   function onModelSelectChanged() {
@@ -682,11 +810,11 @@
     if (dataset.snapshot && dataset.snapshot.snapshot_id) {
       setValue('hpoSnapshotSelect', dataset.snapshot.snapshot_id, true);
     }
-    // 默认初始权重只作为受控列表里的一个选项出现：不从 .pt 列表里自动挑选
-    // 搜索产物（避免误选 best.pt），也不自动下载或换模型。
+    // 默认初始权重只作为受控列表里的一个选项出现：服务器给的是安全 model_id
+    // （不含路径），不从 .pt 列表里自动挑选搜索产物，也不自动下载或换模型。
     var model = payload.model || {};
-    if (model.available && model.path) {
-      syncModelSelectToPath(model.path);
+    if (model.available && model.model_id) {
+      syncModelSelectToId(model.model_id, model.name);
     } else {
       renderModelSummary();
     }
@@ -711,13 +839,14 @@
   }
 
   // 绑定只来自受控选择器：没有可编辑路径输入，也没有任意路径文本。
+  // 权重绑定是安全 model_id（不是路径）；文件事实由服务端在创建边界重新校验。
   function draftInputs() {
     var select = $('hpoSnapshotSelect');
     var modelSelect = $('hpoModelSelect');
     var deviceSelect = $('hpoDevice');
     return {
       snapshot_id: String((select && select.value) || '').trim(),
-      model_path: String((modelSelect && modelSelect.value) || '').trim(),
+      model_id: String((modelSelect && modelSelect.value) || '').trim(),
       device: String((deviceSelect && deviceSelect.value) || '').trim()
     };
   }
@@ -755,7 +884,8 @@
         fmtCount(row && row.image_count) + '）'
       : '未绑定快照，请确认当前数据集快照'));
     // 主摘要只给模型名称；完整内部身份与固定条件在“高级技术选项”里核对
-    short.push('初始权重：' + (inputs.model_path ? modelBasename(inputs.model_path) : '未选择'));
+    short.push('初始权重：' + (inputs.model_id
+      ? (selectedOptionText($('hpoModelSelect')) || '已选择') : '未选择'));
     if (cfg) {
       // 编辑控件收进折叠区后，主摘要必须继续如实反映即将提交的条件
       short.push('算法 ' + samplerLabel(cfg.sampler));
@@ -775,7 +905,10 @@
       detail.push('train ' + fmtCount(row.train_count) + ' / val ' + fmtCount(row.val_count) +
         ' / 背景 ' + fmtCount(row.background_count) + '（背景是 train/val 的子集，不重复相加）');
     }
-    detail.push('初始权重名称：' + (inputs.model_path ? modelBasename(inputs.model_path) : '未选择'));
+    detail.push('初始权重：' + (inputs.model_id
+      ? (selectedOptionText($('hpoModelSelect')) || '已选择') +
+        '（模型标识 ' + inputs.model_id.slice(0, 15) + '…）'
+      : '未选择'));
     if (cfg) {
       detail.push('种子 ' + cfg.seed + '，Batch ' + cfg.batch +
         '，图像尺寸 ' + cfg.imgsz + '，单试验超时 ' + cfg.timeout_seconds + ' 秒');
@@ -832,12 +965,10 @@
         ? '当前数据集尚未登记：请先到数据集页确认数据集并创建快照（系统不会自动替代数据）。'
         : '未找到当前数据集的可靠快照绑定：请在上方“已发布数据快照”中选择要使用的快照。');
     }
-    if (!inputs.model_path) {
+    if (!inputs.model_id) {
       reasons.push(model.reason_code === 'MODEL_CONFIG_INVALID'
-        ? '当前配置里的初始权重不合法：请在上方“本地初始权重”中选择一次合法的本地 .pt 权重。'
-        : '未找到合法的本地初始权重：请在上方“本地初始权重”中选择一次本地 .pt 权重。');
-    } else if (model.reason_code === 'MODEL_CONFIG_INVALID') {
-      reasons.push('当前配置里的初始权重不合法（已按原值显示）：请确认后再开始。');
+        ? '当前配置里的初始权重不在受控权重库中：请在上方“本地初始权重”中选择或上传一次 .pt 权重。'
+        : '未找到可用的受控初始权重：请在上方“本地初始权重”中选择或上传一次 .pt 权重。');
     }
     return reasons;
   }
@@ -948,8 +1079,9 @@
       showFieldError({ field: '数据快照', message: '请选择已发布的快照。' });
       return Promise.resolve(false);
     }
-    if (!inputs.model_path) {
-      showFieldError({ field: '本地初始权重', message: '请选择或填写本地 .pt 权重路径。' });
+    if (!inputs.model_id) {
+      showFieldError({ field: '本地初始权重',
+                       message: '请从受控权重库选择或上传一个 .pt 权重。' });
       return Promise.resolve(false);
     }
     var fieldError = validateDraft();
@@ -962,7 +1094,7 @@
     var cfg = readDraftConfig();
     var body = {
       snapshot_id: inputs.snapshot_id,
-      model_path: inputs.model_path,
+      model_id: inputs.model_id,
       study_config: {
         sampler: cfg.sampler, evaluation_mode: cfg.evaluation_mode,
         budget: cfg.budget, epochs: cfg.epochs, seed: cfg.seed
@@ -1009,6 +1141,11 @@
     return jsonPost(path, {}).then(function (res) {
       if (res.status === 202 || res.status === 200) {
         setStatus(resume ? '已提交恢复请求，等待执行器收敛…' : '已提交启动请求，等待执行器收敛…');
+        // 服务端已接受：必须再读一次本研究的权威状态。创建流程里的首读可能早于本
+        // 响应返回（那时还是 READY），若不再刷新，页面会停在“准备就绪”并且永远
+        // 不建立轮询，只能靠用户手动刷新整页。这里复用唯一的刷新回合：首读仍在途
+        // 时由 pendingRefresh 合并，绝不并发发出第二轮详情读取，也不伪造状态。
+        if (id === state.studyId) refreshRound(id, true);
         return true;
       }
       setOperationError((resume ? '恢复失败 ' : '启动失败 ') + errText(res.body));
@@ -1269,8 +1406,60 @@
       setText('hpoProgressMessage', '已中断，可恢复');
     } else if (status === 'BLOCKED') {
       setText('hpoProgressMessage', '需先处理才能继续');
+    } else if (status === 'FAILED') {
+      // 持久事实里没有 FAILED 终态（失败以 error_code/BLOCKED 表达）；
+      // 这是防御性文案：绝不把原始英文状态码当成说明展示给用户。
+      setText('hpoProgressMessage', '执行失败，请查看错误原因后重试或恢复');
     } else {
       setText('hpoProgressMessage', '');
+    }
+
+    // 试验状态轨道与最近事件都从**本次响应**整体重建：重复响应幂等，
+    // 乱序/旧研究响应由既有的 selection generation 守卫丢弃。
+    renderTrialRail(body.trial_states || []);
+    renderRecentEvents(body.recent_events || []);
+  }
+
+  // class 集合固定：waiting/running/success/failed/cancelled/interrupted
+  var TRIAL_STATE_CLASS = {
+    SUCCESS: 'success', FAILED: 'failed', CANCELLED: 'cancelled',
+    INTERRUPTED: 'interrupted', PENDING: 'waiting', WAITING: 'waiting',
+    RUNNING: 'running'
+  };
+  var TRIAL_STATE_TEXT = {
+    SUCCESS: '成功', FAILED: '失败', CANCELLED: '已取消',
+    INTERRUPTED: '已中断', PENDING: '等待', WAITING: '等待', RUNNING: '运行中'
+  };
+
+  function renderTrialRail(rows) {
+    var host = $('hpoTrialRail');
+    if (!host) return;
+    clearChildren(host);
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i] || {};
+      var state = String(row.state || 'WAITING');
+      var cell = document.createElement('div');
+      cell.className = 'hpo-trial-cell ' +
+        (TRIAL_STATE_CLASS[state] || 'waiting');
+      cell.setAttribute('data-state', state);
+      cell.textContent = String(row.trial_number) + ' ' +
+        (TRIAL_STATE_TEXT[state] || state);
+      host.appendChild(cell);
+    }
+  }
+
+  function renderRecentEvents(rows) {
+    var host = $('hpoRecentEvents');
+    if (!host) return;
+    clearChildren(host);
+    var items = rows.slice(-3);      // 服务端已限三条，这里再兜一层
+    for (var i = 0; i < items.length; i++) {
+      var row = items[i] || {};
+      var line = document.createElement('div');
+      line.className = 'hpo-recent-event';
+      line.setAttribute('data-kind', String(row.kind || ''));
+      line.textContent = row.message == null ? '—' : String(row.message);
+      host.appendChild(line);
     }
   }
 

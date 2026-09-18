@@ -208,6 +208,9 @@ class ModelBinding(StrictModel):
     model_path: str = Field(min_length=1, max_length=2048)
     model_bytes: StrictInt = Field(ge=0)
     model_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # 新建研究冻结的纳秒级修改时间。旧 hpo-study-v1 记录没有该字段（None），
+    # 仍按路径/大小/SHA-256 复核，不因缺少 mtime 被判损坏。
+    model_mtime_ns: StrictInt | None = Field(default=None, ge=0)
 
 
 class EnvironmentSnapshot(StrictModel):

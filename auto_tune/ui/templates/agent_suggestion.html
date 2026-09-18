@@ -141,6 +141,7 @@
                 </div>
                 <div style="margin-bottom:12px;">
                     <label style="font-size:13px; font-weight:500; display:block; margin-bottom:4px;">{{ _("Mode") }}</label>
+                    {# 与 single_page.html 一致：四种已批准模式，顺序 dry_run / keep_params / hpo / full #}
                     <select name="mode" id="tuningModeSelect" onchange="window.onTuningModeChange && window.onTuningModeChange(this.value)" style="width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
                         <option value="dry_run">{{ _("Dry-Run (generate plan only)") }}</option>
                         <option value="keep_params">{{ _("Train with Original Parameters") }}</option>

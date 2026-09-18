@@ -33,6 +33,12 @@ from .executor import (
     build_yolo_command, validate_training_preflight, write_training_config,
 )
 from .probe_monitor import monitor_training, ProbeDecision
+from .round_policy import (
+    STOP_BUDGET_EXHAUSTED,
+    RoundState,
+    evaluate_decision_before_training,
+    evaluate_round,
+)
 from .audit import TuningAuditSession, atomic_write_json
 from auto_tune.modules.train_analyzer.results_parser import parse_results_csv
 from auto_tune.modules.train_analyzer.training_finalizer import finalize_training_run
@@ -361,6 +367,45 @@ class TuningHistory:
         return cls()
 
 
+def composite_score_from_metrics(
+    mAP50, mAP50_95, precision, recall, mode: str = "comprehensive",
+) -> float:
+    """冻结的调优综合评分口径（唯一实现，轮次与参考基线共用）。
+
+    - quick（双指标）: mAP50×0.6 + mAP50-95×0.4
+    - comprehensive（四维）: mAP50×0.35 + mAP50-95×0.25 + precision×0.20 + recall×0.20
+
+    缺项时沿用既有降级口径（comprehensive 缺项降为 quick，quick 只有 mAP50 时
+    只用 mAP50）。
+    """
+    if mode == "quick":
+        if mAP50 is not None and mAP50_95 is not None:
+            return mAP50 * 0.6 + mAP50_95 * 0.4
+        if mAP50 is not None:
+            return mAP50
+        return 0.0
+    scores = [mAP50, mAP50_95, precision, recall]
+    if all(score is not None for score in scores):
+        weights = [0.35, 0.25, 0.20, 0.20]
+        return sum(score * weight for score, weight in zip(scores, weights))  # type: ignore
+    return composite_score_from_metrics(mAP50, mAP50_95, None, None, "quick")
+
+
+def _reference_baseline_score(metrics: dict, eval_mode: str) -> float | None:
+    """进入调优前的原参考运行综合分，口径与调优轮次完全一致。
+
+    没有任何可用指标时返回 ``None``（未知）：未知基线绝不补造成 0，否则一个
+    读不到指标的参考运行会以 0 分参与比较。与轮次评分一致，mAP50 缺失即视为
+    无法评分。
+    """
+    if metrics.get("mAP50") is None:
+        return None
+    return composite_score_from_metrics(
+        metrics.get("mAP50"), metrics.get("mAP50_95"),
+        metrics.get("precision"), metrics.get("recall"), eval_mode,
+    )
+
+
 class TuningResult:
     """Result of a single tuning loop iteration."""
 
@@ -383,25 +428,11 @@ class TuningResult:
         self.result_analysis_status: str | None = None
 
     def get_composite_score(self, mode: str = "comprehensive") -> float:
-        """Compute composite score based on evaluation mode.
-
-        - quick (双指标): mAP50×0.6 + mAP50-95×0.4
-        - comprehensive (四维): mAP50×0.35 + mAP50-95×0.25 + precision×0.20 + recall×0.20
-        """
-        if mode == "quick":
-            if self.result_mAP50 is not None and self.result_mAP50_95 is not None:
-                return self.result_mAP50 * 0.6 + self.result_mAP50_95 * 0.4
-            if self.result_mAP50 is not None:
-                return self.result_mAP50
-            return 0.0
-        # comprehensive (default)
-        scores = [self.result_mAP50, self.result_mAP50_95, self.result_precision, self.result_recall]
-        weights = [0.35, 0.25, 0.20, 0.20]
-        has_all = all(s is not None for s in scores)
-        if has_all:
-            return sum(s * w for s, w in zip(scores, weights))  # type: ignore
-        # Fallback to quick
-        return self.get_composite_score(mode="quick")
+        """Compute composite score based on evaluation mode."""
+        return composite_score_from_metrics(
+            self.result_mAP50, self.result_mAP50_95,
+            self.result_precision, self.result_recall, mode,
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -464,6 +495,92 @@ def _compute_best(tuning_result: dict, eval_mode: str = "comprehensive"):
             "decision": (best_it.get("decision") or {}).get("diagnosis"),
             "changes": (best_it.get("decision") or {}).get("hyperparameter_changes", {}),
         }
+
+
+def _record_baseline_outcome(
+    tuning_result: dict, best_run: str | None, best_score: float | None,
+    original_reference_run: str | None,
+) -> None:
+    """Record which run the deterministic policy ended up keeping as baseline.
+
+    ``kept_reference_baseline`` means no tuning round ever strictly beat the run
+    the session started from, so the overall best is still that reference run —
+    consumers must not present the best tuning round as the overall best.
+    """
+    tuning_result["baseline_run"] = best_run
+    tuning_result["baseline_score"] = best_score
+    tuning_result["kept_reference_baseline"] = (
+        best_run is not None and best_run == original_reference_run)
+
+
+def _audit_round_verdict(
+    tuning_result: dict,
+    iter_result: TuningResult,
+    audit: TuningAuditSession,
+    verdict: dict,
+    iteration: int,
+    history: TuningHistory,
+    log_dir: str,
+    on_progress: callable = None,
+) -> dict | None:
+    """Record one round verdict and close the iteration.
+
+    Returns ``None`` on success, or the finalized tuning result when the audit
+    write failed — audit persistence failure is fatal and must stop the round
+    before any further LLM call, guardrail or training launch.
+    """
+    try:
+        audit.record_round_verdict(iteration, verdict)
+    except Exception as exc:
+        failure = _persist_iteration_failure(
+            audit, iteration, "audit", "audit_persistence_error",
+            f"审计写入失败: {exc}",
+        )
+        _abort_tuning(tuning_result, iter_result, audit, iteration, failure,
+                      history, log_dir, on_progress)
+        return tuning_result
+    audit.complete_iteration(iteration)
+    return None
+
+
+def _finish_stopped_tuning(
+    tuning_result: dict,
+    audit: TuningAuditSession,
+    verdict: dict,
+    iteration: int,
+    config: dict,
+    detect_dir: str,
+    eval_mode: str,
+    tuning_session_id: str,
+    history: TuningHistory,
+    log_dir: str,
+    original_reference_run: str | None,
+    on_progress: callable = None,
+    on_state: callable = None,
+    message: str | None = None,
+) -> dict:
+    """Finish the session after a stopping verdict was already audited.
+
+    Shared by the pre-training judgment (keep_params / repeated / oscillation) and
+    the post-training one (no improvement) so the two can never diverge in how a
+    stop is reported. Returns the tuning result.
+    """
+    tuning_result["stop_reason"] = verdict["stop_reason"]
+    _record_baseline_outcome(
+        tuning_result, verdict.get("best_run"), verdict.get("best_score"),
+        original_reference_run,
+    )
+    _emit_state(on_state, "finalizing", "finalizing", "调优收尾")
+    _compute_best(tuning_result, eval_mode)
+    _finalize_final_summary(
+        tuning_result, audit, config, detect_dir, eval_mode,
+        tuning_session_id, tuning_result.get("reference_run"),
+    )
+    audit.finalize("completed")
+    history.to_json(os.path.join(log_dir, "tuning_history.json"))
+    if on_progress and message:
+        on_progress(iteration, message)
+    return tuning_result
 
 
 def _session_short_id(tuning_session_id: str) -> str:
@@ -706,6 +823,9 @@ def run_tuning_loop(
         "final_summary_path": None,
         "llm_summary_status": "skipped",
         "summary_persistence_status": "skipped",
+        # 多轮调优的确定性终态原因（keep_params / repeated_change / oscillation /
+        # no_improvement / budget_exhausted）；单轮模式保持 None。
+        "stop_reason": None,
         # Public-safe projection of the frozen reference dataset resolution.
         # Absolute data_yaml_path is never included here.
         "reference_dataset": _reference_dataset_public(reference_dataset),
@@ -715,6 +835,23 @@ def run_tuning_loop(
     }
 
     _emit_state(on_state, "preparing", "tuning_start", "调优会话开始")
+
+    # 多轮策略状态：基线只在**严格优于原参考运行**后才接替，停止条件全部由
+    # 代码判定。初始基线必须是进入调优前的原参考运行本身——否则一个比原参考更
+    # 差的首轮运行也会被当成「改善后的最佳」。单轮/非 auto_loop 流程不涉及。
+    original_reference_run = reference_run
+    round_state = RoundState()
+    if auto_loop:
+        reference_baseline_metrics, _baseline_source = _read_reference_before_metrics(
+            reference_run, detect_dir)
+        tuning_result["reference_baseline"] = {
+            "run_name": reference_run,
+            "score": _reference_baseline_score(reference_baseline_metrics, eval_mode),
+        }
+        round_state = RoundState(
+            best_run=reference_run,
+            best_score=tuning_result["reference_baseline"]["score"],
+        )
 
     for iteration in range(1, max_retries + 1):
         # Check cancellation before each iteration
@@ -970,6 +1107,37 @@ def run_tuning_loop(
                 history.to_json(os.path.join(log_dir, "tuning_history.json"))
                 return tuning_result
 
+            session_short_id = _session_short_id(tuning_session_id)
+            train_name = _make_train_name(session_short_id, iteration)
+
+            # ── Auto-loop: 训练前判定（不建目录、不构造命令、不启动训练） ──
+            # keep_params 与「重复同一组参数」「参数来回摆动」都不需要训练结果
+            # 就能判定；拖到训练之后判定等于每发现一次就白跑一轮训练。判定使用
+            # 护栏处理后的实际执行值，且只看 LLM 在本会话里给出的决策——用户显式
+            # 选择的「按原参数训练」模式（外部 keep_params=True）契约不变。
+            if auto_loop and not keep_params:
+                pretrain_verdict = evaluate_decision_before_training(
+                    round_state,
+                    train_name=train_name,
+                    decision=decision,
+                    previous_params=base_args,
+                    applied_params=merged,
+                )
+                if pretrain_verdict["stop_reason"]:
+                    aborted = _audit_round_verdict(
+                        tuning_result, iter_result, audit, pretrain_verdict,
+                        iteration, history, log_dir, on_progress)
+                    if aborted is not None:
+                        return aborted
+                    return _finish_stopped_tuning(
+                        tuning_result, audit, pretrain_verdict, iteration, config,
+                        detect_dir, eval_mode, tuning_session_id, history, log_dir,
+                        original_reference_run,
+                        on_progress=on_progress, on_state=on_state,
+                        message=(f"调优结束（{pretrain_verdict['stop_reason']}），"
+                                 f"未启动训练；保留基线 {pretrain_verdict['best_run']}"),
+                    )
+
             # ── Step 4: Execute ──
             # Bind the frozen reference dataset identity (when resolved) so
             # auto-tuning always trains against the reference run's own verified
@@ -980,8 +1148,6 @@ def run_tuning_loop(
                 merged["data"] = str(reference_dataset.data_yaml_path)
             if on_progress:
                 on_progress(iteration, f"执行层：启动训练 {merged.get('model', 'yolov8')}", step="execute")
-            session_short_id = _session_short_id(tuning_session_id)
-            train_name = _make_train_name(session_short_id, iteration)
             output_dir = os.path.join(detect_dir, train_name)
 
             # ── Preflight before creating the output directory ──
@@ -1244,14 +1410,42 @@ def run_tuning_loop(
                     "analysis": analysis_record,
                 })
 
-                # ── Auto-loop: continue to next iteration ──
+                # ── Auto-loop: deterministic baseline + stop policy ──
+                # 基线只在**严格优于当前基线**后接替；连续无改善（依赖本轮真实
+                # 训练指标）在这里判定。keep_params / 重复变更 / 参数摆动已在训练
+                # 前判掉。指标缺失按「无法判定」处理，绝不假定改善。
                 if auto_loop:
-                    audit.complete_iteration(iteration)
+                    score = (iter_result.get_composite_score(eval_mode)
+                             if iter_result.result_mAP50 is not None else None)
+                    round_state, verdict = evaluate_round(
+                        round_state,
+                        train_name=train_name,
+                        score=score,
+                        decision=decision,
+                        previous_params=base_args,
+                        applied_params=merged,
+                    )
+                    aborted = _audit_round_verdict(
+                        tuning_result, iter_result, audit, verdict, iteration,
+                        history, log_dir, on_progress)
+                    if aborted is not None:
+                        return aborted
                     history.add_attempt(iter_result.to_dict())
                     tuning_result["iterations"].append(iter_result.to_dict())
-                    reference_run = train_name
+
+                    if verdict["stop_reason"]:
+                        return _finish_stopped_tuning(
+                            tuning_result, audit, verdict, iteration, config,
+                            detect_dir, eval_mode, tuning_session_id, history,
+                            log_dir, original_reference_run,
+                            on_progress=on_progress, on_state=on_state,
+                            message=(f"调优结束（{verdict['stop_reason']}），保留基线 "
+                                     f"{verdict['best_run']}"),
+                        )
+
+                    reference_run = verdict["next_reference_run"]
                     if on_progress:
-                        on_progress(iteration, f"自动循环 → 下一轮 (新参考: {train_name})")
+                        on_progress(iteration, f"自动循环 → 下一轮 (基线: {reference_run})")
                     continue
 
                 # ── auto_analyze only: return success ──
@@ -1332,12 +1526,22 @@ def run_tuning_loop(
             return tuning_result
 
     # All retries exhausted — check if we have any successful iterations
+    if auto_loop:
+        # 预算用尽时同样要记录终局基线，且必须早于收尾报告，否则报告里读不到
+        # 「整体最佳是不是原参考运行」。
+        _record_baseline_outcome(
+            tuning_result, round_state.best_run, round_state.best_score,
+            original_reference_run)
     _compute_best(tuning_result, eval_mode)
     _finalize_final_summary(
         tuning_result, audit, config, detect_dir, eval_mode,
         tuning_session_id, tuning_result.get("reference_run"),
     )
     if tuning_result.get("best_iteration") is not None:
+        if auto_loop and tuning_result.get("stop_reason") is None:
+            # 预算用尽但已有最佳运行：正常终态，不是失败。
+            tuning_result["stop_reason"] = STOP_BUDGET_EXHAUSTED
+            audit.set_stop_reason(STOP_BUDGET_EXHAUSTED)
         audit.finalize("completed")
         if on_progress:
             best_m = tuning_result.get("best_metrics", {})

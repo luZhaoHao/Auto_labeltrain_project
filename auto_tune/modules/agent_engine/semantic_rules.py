@@ -121,15 +121,11 @@ DETECT_SEMANTIC_RULES: tuple[SemanticRule, ...] = (
           "training.issue.plateau", "cos_lr", DIRECTION_ENABLE,
           ChangeLimit(LIMIT_BOOL, description="只允许 false→true"),
           "mAP 停滞时可开启 cos_lr"),
-    _rule("detect.map_saturated.lr0.decrease.v1",
-          "training.curve.mAP50", "lr0", DIRECTION_DECREASE,
-          ChangeLimit(LIMIT_RATIO_RANGE, min_ratio=0.25, max_ratio=0.80,
-                      description="新值为当前值的 25%–80%"),
-          "mAP50 饱和时应降低 lr0", fact_value="saturated"),
-    _rule("detect.map_saturated.cos_lr.enable.v1",
-          "training.curve.mAP50", "cos_lr", DIRECTION_ENABLE,
-          ChangeLimit(LIMIT_BOOL, description="只允许 false→true"),
-          "mAP50 饱和时可开启 cos_lr", fact_value="saturated"),
+    # 注意：不存在以 training.curve.mAP50 为事实的规则。TrainAnalyzer 只把
+    # analyze_loss_curves 的结果并入报告 curve_analysis，mAP50 趋势从未进入
+    # 报告，因此该事实永不进入事实包；挂在它上面的规则无法触发，却会被
+    # build_semantic_rule_summary 当作可用关系写进提示词，诱导模型引用不存在
+    # 的事实（DECISION_EVIDENCE_UNKNOWN）。mAP50 饱和场景已由 plateau 覆盖。
     # ── 训练不稳定 / NaN：降低 lr0 / 增大 warmup_epochs ──
     _rule("detect.unstable_training.lr0.decrease.v1",
           "training.issue.unstable_training", "lr0", DIRECTION_DECREASE,
@@ -190,6 +186,16 @@ def get_semantic_parameter_set() -> frozenset[str]:
     return frozenset(rule.parameter for rule in DETECT_SEMANTIC_RULES)
 
 
+def get_semantic_evidence_fact_ids() -> frozenset[str]:
+    """返回可以被引用为证据的 fact_id 集合（规则注册表里出现过的那些）。
+
+    事实包里还有大量真实但**不可作证据**的事实：参考指标、bbox/图像比例、
+    计数、参数当前值。它们只作只读背景——没有任何规则以它们为前提，拿它们
+    支持参数修改会被语义校验以 NO_SUPPORTING_RULE 拒绝。
+    """
+    return frozenset(rule.fact_id for rule in DETECT_SEMANTIC_RULES)
+
+
 _DIRECTION_TEXT = {
     DIRECTION_INCREASE: "增加",
     DIRECTION_DECREASE: "减少",
@@ -210,8 +216,15 @@ def build_semantic_rule_summary() -> str:
             f"- {rule.fact_id}{value_cond} → 允许 {rule.parameter} {direction_text}"
             f"（幅度：{rule.change_limit.description}）"
         )
+    supported = sorted(get_semantic_parameter_set())
     unsupported = sorted(get_tunable_parameter_names() - get_semantic_parameter_set())
-    lines.append(f"- 未开放自动修改的参数：{', '.join(unsupported)}")
+    lines.append(f"- 可修改参数：{', '.join(supported)}")
+    lines.append(f"- 禁止修改参数：{', '.join(unsupported)}")
+    lines.append(
+        "  「禁止修改参数」在本批没有任何受支持的语义关系：把它们写进"
+        " hyperparameter_changes 或 training_overrides 都会以"
+        " DECISION_SEMANTIC_UNSUPPORTED 失败，本轮随即终止且不会启动任何训练。"
+    )
     return "\n".join(lines)
 
 

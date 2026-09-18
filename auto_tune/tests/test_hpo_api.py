@@ -30,6 +30,7 @@ from auto_tune.modules.hpo import (
     ResultInput,
     StudyConfig,
 )
+from auto_tune.modules.model_store import ModelStore, ModelStoreError
 from auto_tune.modules.run_state.manager import RunManager
 from auto_tune.modules.run_state.process_identity import capture_process_identity
 from auto_tune.modules.run_state.service import (
@@ -149,6 +150,12 @@ class Stack:
         if snapshot is None or model is None:
             snapshot, model = _make_inputs(tmp_path)
         self.snapshot, self.model = snapshot, model
+        # 新建研究只接受受控模型标识：fixture 权重就是受控库里的一个普通文件
+        self.store = ModelStore(tmp_path / "models" / "weights",
+                                legacy_roots=[tmp_path],
+                                max_upload_bytes=1024, max_models=50)
+        self.model_id = {row.name: row.model_id
+                         for row in self.store.list_models()}["fixture.pt"]
         self.root = tmp_path / "storage"
         self.service = HpoService(self.root)
         self.runner = FakeRunner()
@@ -169,11 +176,9 @@ class Stack:
                 return Path(snapshot.snapshot_path)
             raise HpoError("HPO_INVALID_CONFIG", "快照不存在或已失效")
 
-        def validate_model(value):
-            path = Path(value)
-            if path.is_file() and path.suffix == ".pt":
-                return str(path.resolve())
-            raise HpoError("HPO_INVALID_CONFIG", "模型文件不存在或不受支持")
+        def resolve_model(model_id):
+            """受控模型标识 -> 冻结路径；测试里就是受控库中的 fixture 权重。"""
+            return stack.store.resolve(model_id)
 
         def published_snapshots():
             from auto_tune.ui.app import list_published_snapshots
@@ -186,7 +191,7 @@ class Stack:
 
         router = create_hpo_router(
             service=self.service, runner=self.runner, manager=self.manager,
-            resolve_snapshot=resolve_snapshot, validate_model=validate_model,
+            resolve_snapshot=resolve_snapshot, resolve_model=resolve_model,
             assert_training_slot_free=gate or (lambda: None),
             list_snapshots=published_snapshots)
         app = FastAPI()
@@ -196,7 +201,7 @@ class Stack:
     def create(self, **overrides):
         payload = {
             "snapshot_id": self.snapshot.snapshot_id,
-            "model_path": str(self.model),
+            "model_id": self.model_id,
             "study_config": {},
             "execution_config": {},
         }
@@ -282,9 +287,47 @@ def test_create_unknown_snapshot_rejected_no_latest_fallback(stack):
 
 
 def test_create_missing_model_rejected(stack):
-    resp = stack.create(model_path=str(stack.root / "nope.pt"))
-    assert resp.status_code == 422
+    resp = stack.create(model_id="sha256:" + "0" * 64)
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "MODEL_NOT_FOUND"
+    assert resp.json()["field"] == "model_id"
+    assert str(stack.root) not in resp.text
     assert list(stack.root.glob("hpo_*")) == []
+
+
+def test_create_rejects_a_client_supplied_model_path(stack):
+    """客户端路径字段在严格契约下直接拒绝，绝不作为权重来源。"""
+    resp = stack.create(model_path=str(stack.model))
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "INVALID_HPO_FIELD"
+    assert resp.json()["field"] == "model_path"
+    assert list(stack.root.glob("hpo_*")) == []
+
+
+def test_create_freezes_the_controlled_weight_identity(stack):
+    """新研究冻结的是受控文件的规范化路径、字节数与 SHA-256（既有绑定契约）。"""
+    import hashlib
+
+    body = stack.create().json()
+    study = stack.service.load_study(body["study_id"])
+    binding = study.model_binding
+    assert Path(binding.model_path) == Path(stack.model).resolve()
+    assert binding.model_bytes == Path(stack.model).stat().st_size
+    assert binding.model_sha256 == hashlib.sha256(
+        Path(stack.model).read_bytes()).hexdigest()
+
+
+def test_old_studies_keep_their_frozen_binding(stack):
+    """旧研究继续按既有冻结值校验，不按当前模型库重新绑定。"""
+    study_id = stack.create().json()["study_id"]
+    study = stack.service.load_study(study_id)
+    frozen_path = Path(study.model_binding.model_path)
+
+    # 当前模型库里不再有这个名字，旧研究仍按冻结路径与哈希读取
+    frozen_path.unlink()
+    reopened = stack.service.load_study(study_id)
+    assert Path(reopened.model_binding.model_path) == frozen_path
+    assert reopened.model_binding.model_sha256 == study.model_binding.model_sha256
 
 
 def test_llm_credentials_never_resolved(stack, monkeypatch):
@@ -1179,3 +1222,114 @@ def test_missing_or_unlistable_snapshots_are_honestly_missing(tmp_path):
     assert row["readable"] is True
     assert row["dataset_name"] is None
     assert "secret" not in resp.text
+
+
+# ── F1.1-A Task 5：试验状态轨道与最近关键事件（纯只读投影）──────────
+
+
+class _Attempt:
+    """状态投影只读 attempt 的 phase/trial_number；不需要完整审计记录。"""
+
+    def __init__(self, phase, trial_number):
+        self.phase = phase
+        self.trial_number = trial_number
+
+
+_REASON_CODE = {
+    "FAILED": "training_failed",
+    "CANCELLED": "user_stopped",
+    "INTERRUPTED": "process_interrupted",
+}
+
+
+def _run_trials(stack, study_id, states):
+    """按给定终态创建试验：state 为 None 时只 ask（保持 PENDING）。"""
+    numbers = []
+    for state in states:
+        trial = stack.service.ask(study_id, request_id=uuid.uuid4().hex)
+        numbers.append(trial.number)
+        if state == "SUCCESS":
+            stack.service.tell(study_id, trial.number,
+                               ResultInput(state="SUCCESS", value=0.5,
+                                           evidence=_evidence(1)))
+        elif state is not None:
+            stack.service.tell(study_id, trial.number,
+                               ResultInput(state=state,
+                                           reason_code=_REASON_CODE[state]))
+    return numbers
+
+
+def _status(stack, study_id):
+    resp = stack.client.get(f"/api/hpo/studies/{study_id}")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_status_payload_exposes_the_trial_state_rail(stack):
+    study_id = stack.create(study_config={"budget": 3}).json()["study_id"]
+    _run_trials(stack, study_id, ["SUCCESS", None])
+    stack.runner._get(study_id).attempts = [_Attempt("RUNNING", 1)]
+
+    body = _status(stack, study_id)
+    assert body["trial_states"] == [
+        {"trial_number": 1, "state": "SUCCESS"},
+        {"trial_number": 2, "state": "RUNNING"},
+        {"trial_number": 3, "state": "WAITING"},
+    ]
+
+
+def test_trial_state_rail_covers_every_budget_slot_and_keeps_real_states(stack):
+    study_id = stack.create(study_config={"budget": 5}).json()["study_id"]
+    _run_trials(stack, study_id, ["SUCCESS", "FAILED", "CANCELLED", "INTERRUPTED"])
+
+    body = _status(stack, study_id)
+    assert [row["trial_number"] for row in body["trial_states"]] == [1, 2, 3, 4, 5]
+    assert [row["state"] for row in body["trial_states"]] == [
+        "SUCCESS", "FAILED", "CANCELLED", "INTERRUPTED", "WAITING"]
+
+
+def test_trial_state_rail_does_not_fabricate_a_started_trial(stack):
+    study_id = stack.create(study_config={"budget": 2}).json()["study_id"]
+    body = _status(stack, study_id)
+    assert body["trial_states"] == [
+        {"trial_number": 1, "state": "WAITING"},
+        {"trial_number": 2, "state": "WAITING"},
+    ]
+    # 没有任何试验事实时绝不伪造“已开始”的试验事件
+    assert all(row["kind"] != "trial_finished" for row in body["recent_events"])
+    assert all(row["kind"] != "trial_running" for row in body["recent_events"])
+
+
+def test_recent_events_are_bounded_deterministic_and_path_free(stack):
+    study_id = stack.create(study_config={"budget": 4}).json()["study_id"]
+    _run_trials(stack, study_id, ["SUCCESS", "SUCCESS", "FAILED"])
+    stack.runner._get(study_id).set("PAUSED", "user_stopped")
+
+    first = _status(stack, study_id)
+    events = first["recent_events"]
+    assert len(events) == 3
+    for event in events:
+        assert set(event) == {"event_id", "kind", "trial_number", "state",
+                              "message"}
+        assert isinstance(event["message"], str) and event["message"]
+        assert not any(token in event["message"]
+                       for token in ("C:\\", "E:/", "/", "Traceback"))
+        assert event["event_id"] == event["event_id"].strip()
+    # 事件 ID 不含时间：同一持久事实必须得到完全相同的投影
+    assert first == _status(stack, study_id)
+    # 研究终态事件排在最后（最近事件）
+    assert events[-1]["kind"] == "study_status"
+    assert events[-1]["state"] == "PAUSED"
+    assert "暂停" in events[-1]["message"]
+
+
+def test_progress_projection_is_read_only(stack):
+    study_id = stack.create(study_config={"budget": 2}).json()["study_id"]
+    _run_trials(stack, study_id, ["SUCCESS"])
+    before = sorted((p.name, p.stat().st_size)
+                    for p in (stack.root / study_id).rglob("*") if p.is_file())
+    for _ in range(3):
+        _status(stack, study_id)
+    after = sorted((p.name, p.stat().st_size)
+                   for p in (stack.root / study_id).rglob("*") if p.is_file())
+    assert before == after

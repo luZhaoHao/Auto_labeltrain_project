@@ -25,6 +25,7 @@ from auto_tune.modules.hpo import (
     ResultInput,
     StudyConfig,
 )
+from auto_tune.modules.model_store import ModelStoreError
 from auto_tune.modules.run_state.manager import RunManager
 from auto_tune.ui.hpo_api import create_hpo_router
 from auto_tune.ui.hpo_training import create_hpo_training_router
@@ -177,16 +178,14 @@ class Stack:
                 return Path(snapshot.snapshot_path)
             raise HpoError("HPO_INVALID_CONFIG", "bad snapshot")
 
-        def validate_model(value):
-            path = Path(value)
-            if path.is_file() and path.suffix == ".pt":
-                return str(path.resolve())
-            raise HpoError("HPO_INVALID_CONFIG", "bad model")
+        def resolve_model(model_id):
+            """受控模型标识 -> 冻结路径；这些用例只读产物，不做权重解析。"""
+            raise ModelStoreError("MODEL_NOT_FOUND", "未找到该受控权重，请重新选择。")
 
         app = FastAPI()
         app.include_router(create_hpo_router(
             service=service, runner=runner, manager=manager,
-            resolve_snapshot=resolve_snapshot, validate_model=validate_model,
+            resolve_snapshot=resolve_snapshot, resolve_model=resolve_model,
             assert_training_slot_free=lambda: None), prefix="/api/hpo")
         app.include_router(create_hpo_training_router(
             service=lambda: service, runner=lambda: runner, manager=lambda: manager,

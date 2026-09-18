@@ -418,6 +418,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "Comprehensive (+Precision+Recall)": "全面模式（含 Precision+Recall）",
         "Quick (mAP50+mAP50-95)": "快速模式（仅 mAP50+mAP50-95）",
         "Best Iteration": "最佳迭代",
+        "Overall best: original reference run": "总体最佳：原参考训练",
+        "Best tuning round": "本次调优轮次中最佳",
         "Best Iteration Full Analysis": "最佳迭代完整分析",
         "Iteration": "迭代",
         "Training directory": "训练目录",
@@ -697,6 +699,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "Select a published snapshot": "请选择已发布快照",
         "Reload": "刷新",
         "Select a local .pt file": "请选择本地 .pt 权重",
+        # F1.1-A 受控权重库：上传入口、权重占位与缺省提示统一中文
+        "Upload Weight File": "上传权重文件",
+        "Upload Weight": "上传权重",
+        "Select a weight from the controlled library": "请从受控权重库选择权重",
+        "Please select an initial weight from the controlled library.":
+            "请先从受控权重库选择初始权重。",
         "Trial Count (includes failed/cancelled slots)":
             "试验次数（包含失败/取消槽）",
         "Epochs per Trial": "每次训练轮数",

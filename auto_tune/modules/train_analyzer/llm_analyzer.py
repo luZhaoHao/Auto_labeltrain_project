@@ -136,7 +136,7 @@ def call_deepseek(prompt: str, config: dict) -> str:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": llm_cfg.get("model", "deepseek-v4-flash"),
+        "model": llm_cfg.get("model", "deepseek-flash"),
         "messages": [
             {"role": "system", "content": "你是YOLO训练分析专家。请直接输出分析结果，不使用任何标记符号（#、-、*等），不要用'好的'、'根据分析'等套话开头，保持专业简洁。"},
             {"role": "user", "content": prompt},
@@ -173,7 +173,7 @@ def analyze_with_llm(stage1_report: dict, config: dict) -> dict:
     runs = stage1_report.get("runs", {})
     summary = stage1_report.get("summary", {})
     project_info = stage1_report.get("project", {})
-    model_used = config.get("llm", {}).get("model", "deepseek-v4-flash")
+    model_used = config.get("llm", {}).get("model", "deepseek-flash")
     results = {}
 
     for run_name, run_data in runs.items():

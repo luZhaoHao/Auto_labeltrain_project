@@ -22,6 +22,49 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
+// Character references are handled like a real HTML parser does: the page
+// escapes a value with ``_escapeHtml()``, the escaped string is parsed back to
+// DOM, and reading the text must show the original characters again. Without
+// the decoding half, a behavioural test could not tell "the untrusted name is
+// displayed as plain text" from "the untrusted name was swallowed".
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+function decodeEntities(text) {
+  return text.replace(/&(#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, body) => {
+    if (body.charAt(0) === '#') {
+      const hex = body.charAt(1) === 'x' || body.charAt(1) === 'X';
+      const code = parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code) : match;
+    }
+    const named = NAMED_ENTITIES[body.toLowerCase()];
+    return named === undefined ? match : named;
+  });
+}
+
+function escapeHtmlText(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+  'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+/** Serialise one element the way ``innerHTML`` would report it. */
+function serializeElement(el) {
+  const tag = String(el.tagName).toLowerCase();
+  const attrs = [];
+  if (el.className) attrs.push('class="' + escapeHtmlText(el.className) + '"');
+  for (const key of Object.keys(el.attributes)) {
+    if (key !== 'class') attrs.push(key + '="' + escapeHtmlText(el.attributes[key]) + '"');
+  }
+  const open = '<' + tag + (attrs.length ? ' ' + attrs.join(' ') : '') + '>';
+  if (VOID_TAGS.has(tag)) return open;
+  return open + el.children.map(serializeElement).join('') + escapeHtmlText(el._text) +
+    '</' + tag + '>';
+}
+
 class Element {
   constructor(tag) {
     this.tagName = String(tag).toUpperCase();
@@ -86,6 +129,26 @@ class Element {
     this._text = value == null ? '' : String(value);
   }
 
+  // Parts of the tuning result card are rendered by assigning an HTML string.
+  // Parse that string into real child elements (same parser as the template) so
+  // behavioural tests can read the text and the attributes the renderer really
+  // produced, instead of searching the source template for those strings.
+  set innerHTML(html) {
+    const parsed = buildDom(String(html == null ? '' : html));
+    this.children = [];
+    this._text = '';
+    for (const el of parsed.all) {
+      if (!el.parentNode) this.appendChild(el);
+    }
+  }
+
+  // The page's ``_escapeHtml()`` assigns ``textContent`` and reads the escaped
+  // result back through ``innerHTML``. Without a getter it would silently be
+  // ``undefined``, so a renderer that forgot to escape could never be caught.
+  get innerHTML() {
+    return this.children.map(serializeElement).join('') + escapeHtmlText(this._text);
+  }
+
   get firstChild() { return this.children[0] || null; }
   get childNodes() { return this.children; }
   get firstElementChild() { return this.children[0] || null; }
@@ -125,12 +188,29 @@ class Element {
 
   setAttribute(key, value) { this.attributes[key] = String(value); }
   getAttribute(key) { return this.attributes[key] === undefined ? null : this.attributes[key]; }
+
+  // ``dataset`` and ``getAttribute('data-*')`` must be one store: the renderers
+  // set one and the click handlers read the other (``this.dataset.trainName``),
+  // so a value written through either accessor has to be visible in both.
+  get dataset() {
+    const el = this;
+    const keyFor = (prop) => 'data-' + String(prop).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+    return new Proxy({}, {
+      get(target, prop) {
+        if (typeof prop !== 'string') return undefined;
+        const value = el.attributes[keyFor(prop)];
+        return value === undefined ? undefined : value;
+      },
+      set(target, prop, value) {
+        el.setAttribute(keyFor(String(prop)), value == null ? '' : value);
+        return true;
+      },
+    });
+  }
+
   querySelectorAll() { return []; }
   querySelector() { return null; }
 }
-
-const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img',
-  'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 
 function buildDom(html) {
   const registry = {};
@@ -147,7 +227,8 @@ function buildDom(html) {
     const raw = html.slice(cursor, end);
     const el = stack[stack.length - 1];
     if (!raw || !el || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return;
-    const text = raw.replace(/\s+/g, ' ').trim();
+    // Parsed text is decoded, exactly like a parser feeding ``textContent``.
+    const text = decodeEntities(raw).replace(/\s+/g, ' ').trim();
     // Append to the element's own text instead of replacing it: setting
     // ``textContent`` would drop the element children parsed so far.
     if (text) el._text = el._text ? el._text + ' ' + text : text;
@@ -169,6 +250,7 @@ function buildDom(html) {
       const opt = new Element('option');
       const om = /value="([^"]*)"/.exec(attrs);
       opt.value = om ? om[1] : '';
+      if (/(?:^|\s)selected(?:\s|=|$)/.test(attrs)) opt.selected = true;
       const tm = /<option[^>]*>([^<]*)/.exec(html.slice(match.index, match.index + 400));
       opt.textContent = tm ? tm[1] : '';
       lastSelect.appendChild(opt);
@@ -196,9 +278,14 @@ function buildDom(html) {
     if (/(?:^|\s)disabled(?:\s|=|$)/.test(attrs)) el.disabled = true;
     const valMatch = /value="([^"]*)"/.exec(attrs);
     if (valMatch) { el.value = valMatch[1]; el.defaultValue = valMatch[1]; }
-    for (const key of ['name', 'placeholder', 'min', 'max', 'step']) {
+    for (const key of ['name', 'placeholder', 'min', 'max', 'step', 'form', 'onclick']) {
       const m = new RegExp(key + '="([^"]*)"').exec(attrs);
       if (m) el.setAttribute(key, m[1]);
+    }
+    // ``data-*`` carries behaviour-relevant state (e.g. which run a button is
+    // bound to), so it must be readable exactly like in a browser.
+    for (const dm of attrs.matchAll(/\s(data-[a-z0-9-]+)="([^"]*)"/g)) {
+      el.setAttribute(dm[1], dm[2]);
     }
     if (tagLower === 'select') lastSelect = el;
     // Build a real tree: the parent is the innermost open element. Static
@@ -209,6 +296,17 @@ function buildDom(html) {
     if (!VOID_TAGS.has(tagLower) && !attrs.endsWith('/')) stack.push(el);
   }
   flushText(html.length);
+
+  // A <select> whose options carry no ``selected`` reports its first option in a
+  // browser. The template relies on that for the frozen default mode: dry_run is
+  // the first option and no option is marked selected. (Only static markup is
+  // defaulted — a select whose options are appended by script keeps the explicit
+  // value the script assigns.)
+  for (const el of all) {
+    if (el.tagName !== 'SELECT' || !el.options.length || el.value) continue;
+    const chosen = el.options.find((opt) => opt.selected) || el.options[0];
+    el.value = chosen.value;
+  }
 
   const document = {
     _registry: registry,
@@ -340,6 +438,56 @@ function createHarness(options) {
   // bare `hpoX()` call resolve. Mirror that faithfully.
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
+
+  // ── FormData ────────────────────────────────────────────────────────
+  // A form-associated control is either inside the form's subtree or points at
+  // it with `form="<id>"` while being rendered elsewhere — exactly the case
+  // that made the mode select invisible to `new FormData(tuningForm)`.
+  const formOwns = (el, form) => {
+    const owner = el.getAttribute('form');
+    if (owner) return owner === form.id;
+    for (let node = el.parentNode; node; node = node.parentNode) {
+      if (node === form) return true;
+    }
+    return false;
+  };
+  const collectEntries = (form) => {
+    const rows = [];
+    for (const el of all) {
+      const name = el.getAttribute && el.getAttribute('name');
+      if (!name || el.disabled) continue;
+      if (!formOwns(el, form)) continue;
+      if (el.tagName === 'SELECT') {
+        rows.push([name, el.value == null ? '' : String(el.value)]);
+      } else if (el.tagName === 'TEXTAREA') {
+        rows.push([name, String(el.value == null ? '' : el.value)]);
+      } else if (el.tagName === 'INPUT') {
+        const type = String(el.type || 'text').toLowerCase();
+        if (type === 'checkbox' || type === 'radio') {
+          if (el.checked) rows.push([name, el.value || 'on']);
+        } else if (type === 'file') {
+          if (el.files && el.files.length) rows.push([name, el.files[0]]);
+        } else {
+          rows.push([name, String(el.value == null ? '' : el.value)]);
+        }
+      }
+    }
+    return rows;
+  };
+  sandbox.FormData = class FormData {
+    constructor(form) { this._entries = form ? collectEntries(form) : []; }
+    append(name, value) { this._entries.push([String(name), value]); }
+    set(name, value) { this.delete(name); this.append(name, value); }
+    delete(name) { this._entries = this._entries.filter(([k]) => k !== String(name)); }
+    has(name) { return this._entries.some(([k]) => k === String(name)); }
+    get(name) {
+      const hit = this._entries.find(([k]) => k === String(name));
+      return hit ? hit[1] : null;
+    }
+    getAll(name) { return this._entries.filter(([k]) => k === String(name)).map(([, v]) => v); }
+    entries() { return this._entries.slice(); }
+  };
+
   vm.createContext(sandbox);
   if (pageHtml) {
     for (const block of extractScripts(html)) {
@@ -353,9 +501,38 @@ function createHarness(options) {
       sandbox, { filename: 'hpo.js' });
   }
 
+  // Inline `onclick="..."` is real markup, so activate it like the browser does
+  // (evaluated at click time, never at parse time). A submit button activates
+  // its form, which is what makes the shared primary action testable.
+  for (const el of all) {
+    const code = el.getAttribute && el.getAttribute('onclick');
+    if (code) {
+      el.addEventListener('click', () => {
+        vm.runInContext(code, sandbox, { filename: 'onclick' });
+      });
+    }
+    if (el.tagName === 'BUTTON' && el.type === 'submit') {
+      el.addEventListener('click', () => {
+        let form = null;
+        const owner = el.getAttribute('form');
+        if (owner) {
+          form = document.getElementById(owner);
+        } else {
+          for (let node = el.parentNode; node && !form; node = node.parentNode) {
+            if (node.tagName === 'FORM') form = node;
+          }
+        }
+        if (form) form.dispatch('submit', { preventDefault() {} });
+      });
+    }
+  }
+
   const api = {
     document,
     window: sandbox,
+    // The same constructor the page itself calls (scenario bodies run in Node
+    // scope, so they must reach it through the api).
+    FormData: sandbox.FormData,
     registry,
     all,
     order: inOrder,
@@ -373,9 +550,14 @@ function createHarness(options) {
       const matcher = typeof pattern === 'function' ? pattern : (url) => url.indexOf(pattern) >= 0;
       const entry = fetchQueue.find((e) => matcher(e.url));
       if (!entry) return null;
+      const raw = entry.opts && entry.opts.body;
       let body = null;
-      try { body = JSON.parse((entry.opts && entry.opts.body) || 'null'); } catch (err) { body = null; }
-      return { url: entry.url, method: (entry.opts && entry.opts.method) || 'GET', body: body };
+      try { body = JSON.parse(raw || 'null'); } catch (err) { body = null; }
+      // A multipart upload sends the sandbox FormData itself: expose its entries
+      // so a test can assert which file/fields were actually appended.
+      const form = raw instanceof sandbox.FormData ? raw.entries() : null;
+      return { url: entry.url, method: (entry.opts && entry.opts.method) || 'GET',
+               body: body, form: form, headers: (entry.opts && entry.opts.headers) || {} };
     },
 
     /** Resolve the first queued request whose url matches `pattern`. */
@@ -607,6 +789,21 @@ const ID_A = 'hpo_' + 'a'.repeat(32);
 const ID_B = 'hpo_' + 'b'.repeat(32);
 const ID_C = 'hpo_' + 'c'.repeat(32);
 
+// 受控权重库 fixture：客户端只看到 model_id，服务器路径永远不出现
+const MODEL_ID_MANAGED = 'sha256:' + '1'.repeat(64);
+const MODEL_ID_LEGACY = 'sha256:' + '2'.repeat(64);
+
+function modelLibraryPayload() {
+  return {
+    models: [
+      { model_id: MODEL_ID_MANAGED, name: 'yolov8n.pt', size_bytes: 6549796,
+        sha256: '1'.repeat(64), origin: 'managed', available: true },
+      { model_id: MODEL_ID_LEGACY, name: 'yolov8s.pt', size_bytes: 22588772,
+        sha256: '2'.repeat(64), origin: 'legacy', available: true },
+    ],
+  };
+}
+
 function defaultsPayload() {
   return {
     dataset: { registered: true, display_name: 'demo', reason_code: 'REGISTERED_SNAPSHOT',
@@ -614,7 +811,8 @@ function defaultsPayload() {
       snapshot: { snapshot_id: 'd'.repeat(64), short_id: 'dddddddd', dataset_name: 'demo',
         source_root: 'E:/data/demo', created_at: '2026-09-14T00:00:00Z',
         train_count: 184, val_count: 46, background_count: 99, image_count: 230 } },
-    model: { path: 'E:/project/yolov8n.pt', name: 'yolov8n.pt', source: 'project.model',
+    // 安全投影：只给 model_id 与显示名，绝不给服务器路径
+    model: { model_id: MODEL_ID_MANAGED, name: 'yolov8n.pt', source: 'project.model',
       available: true, reason_code: 'MODEL_BOUND' },
     search: { sampler: 'tpe', budget: 10, epochs: 30, seed: 42, timeout_seconds: 3600,
       evaluation_mode: 'comprehensive', batch: 16, imgsz: 640, device: '0' },
@@ -676,8 +874,48 @@ function statusPayload(studyId, overrides) {
         imgsz: 640, device: 'cpu', seed: 42, snapshot: 'dddddddd', model: 'yolov8n.pt' } },
     approved_for_formal_training: false,
     best: null,
+    // 服务端投影的试验状态轨道与最近事件（默认：预算内全部等待）
+    trial_states: trialRail(10, ['WAITING'], {}),
+    recent_events: recentEvents([{ kind: 'study_status', trial_number: null,
+      state: 'READY', message: '研究已就绪，等待启动。' }]),
   };
   return Object.assign(base, overrides || {});
+}
+
+/** 按预算顺序构造轨道：stateFor(n) 为状态名，或按 index 循环取值。 */
+function trialRail(budget, cycle, statesByNumber) {
+  const rows = [];
+  for (let n = 1; n <= budget; n++) {
+    const state = (statesByNumber && statesByNumber[n])
+      || cycle[(n - 1) % cycle.length];
+    rows.push({ trial_number: n, state: state });
+  }
+  return rows;
+}
+
+function recentEvents(rows) {
+  return rows.slice(-3).map((row, i) => ({
+    event_id: 'ev:' + i, kind: row.kind, trial_number: row.trial_number,
+    state: row.state, message: row.message,
+  }));
+}
+
+/** 读取渲染后的轨道（格内文案 + 状态 class）与最近事件。 */
+function readRail(api) {
+  const rail = api.$('hpoTrialRail');
+  const events = api.$('hpoRecentEvents');
+  return {
+    rail: rail ? rail.children.map((c) => String(c.textContent).trim()) : null,
+    classes: rail ? rail.children.map((c) => String(c.className)) : null,
+    states: rail ? rail.children.map((c) => c.getAttribute('data-state')) : null,
+    events: events ? events.children.map((c) => String(c.textContent)) : null,
+    eventKinds: events ? events.children.map((c) => c.getAttribute('data-kind')) : null,
+  };
+}
+
+function railClasses(api) {
+  const rail = api.$('hpoTrialRail');
+  return rail ? rail.children.map((c) => String(c.className)) : null;
 }
 
 function bestPayload(studyId) {
@@ -790,7 +1028,13 @@ function defaultHandler(url) {
     return { status: 200, body: { snapshots: [Object.assign({ readable: true,
       selectable: true, reason_code: null }, snap)], count: 1 } };
   }
-  if (url.indexOf('/api/hpo/local-models') >= 0) return { status: 200, body: { models: [], count: 0 } };
+  if (url.indexOf('/api/hpo/local-models') >= 0) {
+    return { status: 200, body: modelLibraryPayload() };
+  }
+  if (url.indexOf('/api/models/upload') >= 0) {
+    return { status: 200, body: { status: 'exists', model: modelLibraryPayload().models[0] } };
+  }
+  if (url.indexOf('/api/models') >= 0) return { status: 200, body: modelLibraryPayload() };
   if (url.indexOf('/formal-runs') >= 0) {
     return { status: 200, body: { runs: [], count: 0, warnings: [], truncated: false } };
   }
@@ -1610,7 +1854,7 @@ const SCENARIOS = {
 
     // B. 普通训练原始响应流（同一份 result）
     api.setInput('trainDataYaml', 'E:/data/data.yaml');
-    api.setInput('trainModel', 'yolov8n.pt');
+    api.setInput('trainModelSelect', MODEL_ID_MANAGED);   // 受控权重标识，不是路径
     api.setInput('trainEpochs', '2');
     api.setInput('trainImgsz', '96');
     api.setInput('trainBatch', '1');
@@ -1746,8 +1990,9 @@ const SCENARIOS = {
       datasetSummary: api.text('hpoDatasetSummary'),
       modelSummary: api.text('hpoModelSummary'),
     };
-    // 绑定只能来自受控列表：选择即成为提交值，主摘要只显示模型名称
-    api.setInput('hpoModelSelect', 'E:/models/other.pt');
+    // 绑定只能来自受控列表：选择即成为提交值（安全 model_id，不是路径），
+    // 主摘要只显示模型名称
+    api.setInput('hpoModelSelect', MODEL_ID_LEGACY);
     api.$('hpoModelSelect').dispatch('change');
     await api.drain();
     const afterSelect = {
@@ -1768,7 +2013,7 @@ const SCENARIOS = {
     const missing = defaultsPayload();
     missing.dataset = { registered: true, display_name: null, snapshot: null,
       reason_code: 'NO_MATCHING_SNAPSHOT', needs_user_confirmation: true };
-    missing.model = { path: null, name: null, source: null, available: false,
+    missing.model = { model_id: null, name: null, source: null, available: false,
       reason_code: 'MODEL_CONFIG_INVALID' };
     api.setInput('tuningModeSelect', 'hpo');
     api.fireDomReady();
@@ -1837,7 +2082,7 @@ const SCENARIOS = {
     await api.settle((url) => {
       if (url.indexOf('/api/hpo/defaults') >= 0) return { status: 200, body: defaultsPayload() };
       if (url.indexOf('/api/hpo/snapshots') >= 0) return { status: 500, body: { error: 'x' } };
-      if (url.indexOf('/api/hpo/local-models') >= 0) return { status: 500, body: {} };
+      if (url.indexOf('/api/models') >= 0) return { status: 500, body: { error: 'x' } };
       return defaultHandler(url);
     });
     return {
@@ -2179,6 +2424,88 @@ const SCENARIOS = {
     await api.settle(defaultHandler);
     const backToHpo = read();
     return { hpo: hpo, historyOpen: historyOpen, full: full, backToHpo: backToHpo };
+  },
+
+  /* F1.1-A 最终返修 Task 2：HPO 模式必须整体隐藏 LLM 调优区域。
+     调优进度卡（五阶段 / LLM 日志 / 最佳迭代）此前只由 hidden 类控制：LLM 调优跑过
+     一次之后切到 HPO，它整块仍留在页面上。这里断言它在 HPO 模式下整体不可见、
+     切回其它模式能恢复，且公共正式训练监控没有被误伤（同一组唯一 ID、仍归 HPO 宿主）。 */
+  async llm_regions_hidden_in_hpo_mode(api) {
+    // 可见性按真实祖先链判断：任一父级的 class/style 都会隐藏子元素
+    function visible(elId) {
+      let node = api.$(elId);
+      if (!node) return false;
+      while (node) {
+        if (node.classList && node.classList.contains('hidden')) return false;
+        if (node.style && node.style.display === 'none') return false;
+        node = node.parentNode;
+      }
+      return true;
+    }
+    const read = () => ({
+      tuningProgress: visible('tuningProgress'),
+      pipeline: visible('pipelineIndicator'),
+      tuningLog: visible('tuningLog'),
+      tuningFullLog: visible('tuningFullLog'),
+      bestResult: visible('bestResult'),
+      hpoCreateDraft: visible('hpoCreateDraft'),
+      hpoProgressCard: visible('hpoProgressCard'),
+      hpoSearchConfig: visible('hpoSearchConfig'),
+      hpoBestArea: visible('hpoBestArea'),
+      monitorVisible: visible('sharedMonitorBlock') && visible('monitorEpochs'),
+      monitorHost: api.$('sharedMonitorBlock')
+        ? api.$('sharedMonitorBlock').parentNode.id : null,
+    });
+    const leaveLlmTrace = () => {
+      const progress = api.$('tuningProgress');
+      progress.classList.remove('hidden');
+      progress.style.display = '';
+      api.$('bestResult').classList.remove('hidden');
+      api.$('tuningLog').textContent = '大模型调优日志：epoch 1/1';
+      api.$('tuningFullLog').textContent = '大模型调优完整日志';
+      api.$('bestResultContent').textContent = '最佳迭代 #1（mAP50 0.9000）';
+    };
+
+    // (1) 刷新后直接以 HPO 初始化：DOM 里带着上一次 LLM 调优留下的可见残留
+    leaveLlmTrace();
+    api.setInput('tuningModeSelect', 'hpo');
+    api.fireDomReady();
+    await api.settle(pageHandler);
+    const afterRefresh = read();
+
+    // (2) 选中一个研究：HPO 进度卡按权威事实出现（不是“无任务”空态）
+    await selectStudyWithRuns(api, {
+      execution_status: 'RUNNING', control_active: true, can_stop: true }, []);
+    const hpoWithStudy = read();
+
+    // (3) 切到 full：LLM 区域恢复显示（上一次 LLM 运行的进度/日志/最佳迭代仍在）
+    api.window.onTuningModeChange('full');
+    leaveLlmTrace();
+    const inFullMode = read();
+
+    // (4) 切回 HPO：LLM 区域必须立即整体隐藏，HPO 创建/进度/搜索/最佳区域可见
+    api.window.onTuningModeChange('hpo');
+    await api.settle(defaultHandler);
+    const inHpoMode = read();
+
+    // (5) 再切回 full：原有 LLM 状态恢复显示，HPO 专属区域隐藏
+    api.window.onTuningModeChange('full');
+    const backToFull = read();
+
+    return {
+      afterRefresh: afterRefresh,
+      hpoWithStudy: hpoWithStudy,
+      inFullMode: inFullMode,
+      inHpoMode: inHpoMode,
+      backToFull: backToFull,
+      // 公共监控与 LLM 调优区域各自唯一，移动绝不复制节点
+      monitorIdCounts: ['sharedMonitorBlock', 'monitorEpochs', 'monitorMap50',
+                        'monitorMap5095', 'monitorPR', 'monitorLog']
+        .map((id) => api.all.filter((e) => e.id === id).length),
+      llmIdCounts: ['tuningProgress', 'bestResult', 'tuningLog']
+        .map((id) => api.all.filter((e) => e.id === id).length),
+      monitorHostAfterHpo: inHpoMode.monitorHost,
+    };
   },
 
   /* 第四轮 Task 5：HPO 正式训练的 202 自动选中同一 runtime run 并订阅监控。 */
@@ -3113,6 +3440,503 @@ const SCENARIOS = {
   },
 
   /* A2/A3/B1/B2: layout order, single primary action, collapse defaults. */
+  /* F1.1-A Task 1: the mode select is rendered outside #tuningForm, so only an
+     explicit form association reaches ``new FormData(tuningForm)``.
+     F1.1-C Task 1: the page offers the four approved modes again (dry_run,
+     keep_params, hpo, full). The expectation is read from the real select
+     rather than hard-coded, so an option that disappears from the DOM can never
+     be submitted again. */
+  async mode_submission(api) {
+    api.fireDomReady();
+    await api.settle(pageHandler);
+
+    const form = api.$('tuningForm');
+    const select = api.$('tuningModeSelect');
+    const createBtn = api.$('hpoCreateAndStartBtn');
+    // Read the untouched default before anything changes it: no option carries
+    // ``selected``, so the browser picks the first one (dry_run). F1.1-C freezes
+    // that decision instead of leaving it implicit.
+    const initialMode = select.value;
+    const visibleModes = select.options.map(function (o) { return o.value; });
+
+    const modeValues = visibleModes.map(function (mode) {
+      select.value = mode;
+      return new api.FormData(form).get('mode');
+    });
+
+    const llmRequests = [];
+    const llmBodies = [];
+    let llmNullModes = 0;
+    let hpoCreateCount = 0;
+
+    // Answer everything the page asks for until it is quiescent again. Creates
+    // are counted (never auto-retried); the LLM branch answers the same 422 the
+    // reported INVALID_MODE bug produced, so the handler stays bounded.
+    async function settleRound() {
+      for (let guard = 0; guard < 60; guard++) {
+        await api.drain();
+        const urls = api.pending();
+        if (!urls.length) return;
+        for (const url of urls) {
+          if (url.indexOf('/tuning/start') >= 0) {
+            const entry = api.queued(url);
+            const mode = entry && entry.body ? entry.body.mode : null;
+            llmRequests.push(mode);
+            llmBodies.push(entry && entry.body ? entry.body : null);
+            if (mode == null) llmNullModes += 1;
+            await api.respond(url, 422, { error_code: 'INVALID_MODE',
+                                          error: '未知训练模式: ' + mode });
+          } else if (/\/api\/hpo\/studies$/.test(url)) {
+            hpoCreateCount += 1;
+            await api.respond(url, 201, { study_id: ID_A,
+                                          execution_status: 'READY' });
+          } else {
+            const res = defaultHandler(url);
+            await api.respond(url, res.status, res.body);
+          }
+        }
+      }
+      throw new Error('mode_submission did not quiesce; pending=' +
+        JSON.stringify(api.pending()));
+    }
+
+    // Every non-HPO page mode goes through the shared submit button and must
+    // submit its complete value through the shared form association.
+    const llmModes = visibleModes.filter(function (m) { return m !== 'hpo'; });
+    for (const mode of llmModes) {
+      select.value = mode;
+      api.window.onTuningModeChange(mode);
+      await api.drain();
+      api.$('startTuningBtn').dispatch('click');
+      await settleRound();
+    }
+
+    // HPO has its own entry point and must never reach /tuning/start.
+    select.value = 'hpo';
+    api.window.onTuningModeChange('hpo');
+    await settleRound();
+    const llmStartVisible = api.visible('startTuningBtn');
+    const hpoStartVisible = api.visible('hpoCreateAndStartBtn');
+
+    createBtn.dispatch('click');
+    await api.drain();
+    const afterFirst = api.pending().filter((u) => /\/api\/hpo\/studies$/.test(u)).length;
+    createBtn.dispatch('click');     // repeat click while the create is pending
+    await api.drain();
+    const afterSecond = api.pending().filter((u) => /\/api\/hpo\/studies$/.test(u)).length;
+    const duplicateClicksWhilePending = afterSecond - afterFirst;
+    await settleRound();
+
+    return {
+      visibleModes: visibleModes,
+      initialMode: initialMode,
+      dryRunOptionPresent: visibleModes.indexOf('dry_run') >= 0,
+      modeValues: modeValues,
+      llmRequests: llmRequests,
+      llmBodies: llmBodies,
+      llmNullModes: llmNullModes,
+      hpoCreateCount: hpoCreateCount,
+      duplicateClicksWhilePending: duplicateClicksWhilePending,
+      llmStartVisible: llmStartVisible,
+      hpoStartVisible: hpoStartVisible,
+    };
+  },
+
+  /* F1.1-C Task 2: ``kept_reference_baseline === true`` 表示没有任何调优轮次严格超过
+     会话开始时的原参考训练，后端此时仍把原参考运行作为总体最佳。页面必须跟着走：
+     主卡写明总体最佳是原参考训练、评分取原参考分数（缺失显示 '-'，不伪造 0）、
+     查看与保存都绑定到原参考运行；调优轮次的最佳只能作为次级信息。
+     ``kept_reference_baseline !== true`` 时保持原有调优最佳行为。
+
+     完成态的结果卡是 innerHTML 字符串拼装，运行名是后端给的动态文本：后端只拒绝
+     路径分隔符/冒号/方括号/空字符，`<`、`>`、引号都能通过校验，所以显示文本必须转义。
+     卡片结构（后代标签序列）与干净用例逐项相同即证明没有节点被注入。 */
+  async reference_baseline_best(api) {
+    api.fireDomReady();
+    await api.settle(pageHandler);
+
+    function findButton(node) {
+      for (const child of node.children) {
+        if (child.tagName === 'BUTTON') return child;
+        const nested = findButton(child);
+        if (nested) return nested;
+      }
+      return null;
+    }
+
+    function descendants(node, out) {
+      for (const child of node.children) {
+        out.push(child);
+        descendants(child, out);
+      }
+      return out;
+    }
+
+    // 按钮的 data-train-name 对查看入口是 encodeURIComponent 后的值；语义必须仍是
+    // 原始运行名（保存入口保存原值）。
+    function decodeTarget(value) {
+      if (value == null) return null;
+      try { return decodeURIComponent(value); } catch (err) { return value; }
+    }
+
+    function datasetValue(el) {
+      return el && el.dataset ? el.dataset.trainName : null;
+    }
+
+    async function render(result) {
+      const select = api.$('tuningModeSelect');
+      select.value = 'keep_params';
+      api.window.onTuningModeChange('keep_params');
+      await api.drain();
+      api.$('startTuningBtn').dispatch('click');
+      await api.drain();
+      await api.respondStream('/tuning/start', [
+        sse({ status: 'completed', run_id: RUN_A, event_seq: 1, result: result }),
+      ]);
+      await api.settle(pageHandler);
+      const content = api.$('bestResultContent');
+      const viewBtn = findButton(content);
+      const saveBtn = api.$('saveReportBtn');
+      const titleEl = api.$('bestResultTitle');
+      const nodes = descendants(content, []);
+      const onAttrs = [];
+      for (const node of nodes) {
+        for (const key of Object.keys(node.attributes)) {
+          if (/^on/.test(key) && onAttrs.indexOf(key) < 0) onAttrs.push(key);
+        }
+      }
+      return {
+        visible: api.visible('bestResult'),
+        title: titleEl ? titleEl.textContent : null,
+        text: content.textContent,
+        viewTarget: viewBtn ? viewBtn.getAttribute('data-train-name') : null,
+        viewTargetDecoded: viewBtn ? decodeTarget(viewBtn.getAttribute('data-train-name')) : null,
+        viewTargetDataset: datasetValue(viewBtn),
+        saveTarget: saveBtn.getAttribute('data-train-name'),
+        saveTargetDataset: datasetValue(saveBtn),
+        tags: nodes.map((node) => node.tagName),
+        onAttrs: onAttrs,
+      };
+    }
+
+    const roundMetrics = { mAP50: 0.5, mAP50_95: 0.2, precision: 0.6, recall: 0.4 };
+    // 原参考训练仍然是总体最佳，且能拿到真实分数
+    const keptWithScore = await render({
+      best_iteration: 2, best_train_name: 'train60', best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: true,
+      baseline_run: 'train54', baseline_score: 0.9,
+      reference_baseline: { run_name: 'train54', score: 0.9 },
+    });
+    // 同一状态但原参考分数缺失：只能显示 '-'，不得伪造 0
+    const keptNoScore = await render({
+      best_iteration: 2, best_train_name: 'train60', best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: true,
+      baseline_run: 'train54', baseline_score: null,
+      reference_baseline: { run_name: 'train54', score: null },
+    });
+    // 调优轮次确实超过原参考：保持原有调优最佳展示与绑定
+    const improved = await render({
+      best_iteration: 2, best_train_name: 'train60', best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: false,
+      baseline_run: 'train60', baseline_score: 0.7,
+      reference_baseline: { run_name: 'train54', score: 0.9 },
+    });
+
+    // 恶意/被篡改的运行名：闭合 span 后自带事件属性，任何未转义的插值都会把它
+    // 变成真实节点。三个位置各自覆盖一次。
+    const MALICIOUS = 'train54</span><img data-xss="1" src="x" onerror="alert(1)">';
+    // 1. 总体最佳的原参考运行名本身是恶意的
+    const maliciousOverall = await render({
+      best_iteration: 2, best_train_name: 'train60', best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: true,
+      baseline_run: MALICIOUS, baseline_score: 0.9,
+      reference_baseline: { run_name: MALICIOUS, score: 0.9 },
+    });
+    // 2. 参考运行正常，但次级“本次调优轮次中最佳”的运行名是恶意的
+    const maliciousRound = await render({
+      best_iteration: 2, best_train_name: MALICIOUS, best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: true,
+      baseline_run: 'train54', baseline_score: 0.9,
+      reference_baseline: { run_name: 'train54', score: 0.9 },
+    });
+    // 3. 没有保留原参考（kept=false）时主分支显示的是 best_train_name
+    const maliciousBest = await render({
+      best_iteration: 2, best_train_name: MALICIOUS, best_metrics: roundMetrics,
+      eval_mode: 'comprehensive', kept_reference_baseline: false,
+      baseline_run: MALICIOUS, baseline_score: 0.7,
+      reference_baseline: { run_name: 'train54', score: 0.9 },
+    });
+
+    return {
+      keptWithScore: keptWithScore, keptNoScore: keptNoScore, improved: improved,
+      malicious: {
+        name: MALICIOUS,
+        overall: maliciousOverall,
+        round: maliciousRound,
+        best: maliciousBest,
+      },
+    };
+  },
+
+  /* F1.1-A Task 5: 试验状态轨道与最近事件只由响应整体重建。
+     重复响应幂等、乱序/旧研究响应不得污染当前研究、不新增第二个轮询器。 */
+  async progress_rail(api) {
+    const completedRail = trialRail(4, ['SUCCESS', 'FAILED', 'SUCCESS', 'SUCCESS']);
+    const completedEvents = recentEvents([
+      { kind: 'trial_finished', trial_number: 2, state: 'FAILED',
+        message: '试验 2 失败。' },
+      { kind: 'trial_finished', trial_number: 4, state: 'SUCCESS',
+        message: '试验 4 成功。' },
+      { kind: 'study_status', trial_number: null, state: 'COMPLETED',
+        message: '研究已完成。' },
+    ]);
+
+    const runningPayload = statusPayload(ID_A, {
+      execution_status: 'RUNNING', budget: 4, terminal_count: 1,
+      success_count: 1, running_count: 1, remaining_count: 2,
+      current_trial_number: 2, control_active: true, can_stop: true,
+      trial_states: trialRail(4, ['SUCCESS', 'RUNNING', 'WAITING', 'WAITING']),
+      recent_events: recentEvents([
+        { kind: 'trial_finished', trial_number: 1, state: 'SUCCESS',
+          message: '试验 1 成功。' },
+        { kind: 'trial_running', trial_number: 2, state: 'RUNNING',
+          message: '试验 2 正在运行。' },
+        { kind: 'study_status', trial_number: null, state: 'RUNNING',
+          message: '研究正在运行。' },
+      ]),
+    });
+    const completedPayload = statusPayload(ID_A, {
+      execution_status: 'COMPLETED', budget: 4, terminal_count: 4,
+      success_count: 3, failed_count: 1, remaining_count: 0,
+      control_active: false, can_stop: false,
+      trial_states: completedRail, recent_events: completedEvents,
+    });
+
+    await bootstrap(api);
+    api.window.hpoSelectStudy(ID_A);
+    await api.drain();
+    // 运行中：4 个槽位 = 成功 / 运行中 / 等待 / 等待
+    await api.respond('/studies/' + ID_A, 200, runningPayload);
+    await api.settle(pageHandler);
+    const running = readRail(api);
+    // 单一轮询器：不新增第二个 setInterval
+    const intervalCount = api.intervalCount();
+
+    // 一次轮询周期后收敛到终态
+    await api.tickIntervals();
+    await api.respond('/studies/' + ID_A, 200, completedPayload);
+    await api.settle(pageHandler);
+    const completed = readRail(api);
+
+    // 重复同一响应：整体重建，不追加、不重复
+    api.window.hpoRefreshRound(ID_A, true);
+    await api.drain();
+    await api.respond('/studies/' + ID_A, 200, completedPayload);
+    await api.settle(pageHandler);
+    const repeated = readRail(api);
+
+    // 切换研究：旧研究已在途的响应迟到返回时，绝不能污染当前研究
+    api.window.hpoRefreshRound(ID_A, true);
+    await api.drain();
+    api.window.hpoSelectStudy(ID_B);
+    await api.drain();
+    await api.respond('/studies/' + ID_A, 200, runningPayload);
+    await api.drain();
+    const staleReply = readRail(api);
+
+    await api.settle(defaultHandler);
+    return {
+      running: running,
+      completed: completed,
+      repeated: repeated,
+      stale_reply: staleReply,
+      intervalCount: intervalCount,
+    };
+  },
+
+  /* F1.1-A Task 5: 七种研究状态的中文文案与轨道终态。 */
+  async study_status_rail(api) {
+    const cases = {
+      READY: { message: '' },
+      RUNNING: { message: '' },
+      PAUSED: { message: '已暂停，可恢复' },
+      INTERRUPTED: { message: '已中断，可恢复' },
+      BLOCKED: { message: '需先处理才能继续' },
+      COMPLETED: { message: '调优已完成' },
+      FAILED: { message: '执行失败，请查看错误原因后重试或恢复' },
+    };
+    await bootstrap(api);
+    api.window.hpoSelectStudy(ID_A);
+    await api.drain();
+    const facts = {};
+    let first = true;
+    for (const status of Object.keys(cases)) {
+      const rail = status === 'COMPLETED'
+        ? trialRail(2, ['SUCCESS'])
+        : status === 'FAILED' ? trialRail(2, ['FAILED'])
+        : status === 'BLOCKED' ? trialRail(2, ['INTERRUPTED'])
+        : status === 'RUNNING' ? trialRail(2, ['RUNNING'])
+        : trialRail(2, ['WAITING']);
+      // 第一次的请求已经由 hpoSelectStudy 排队；其后每次显式起一轮
+      if (!first) {
+        api.window.hpoRefreshRound(ID_A, true);
+        await api.drain();
+      }
+      first = false;
+      await api.respond('/studies/' + ID_A, 200, statusPayload(ID_A, {
+        execution_status: status, budget: 2, trial_states: rail,
+        recent_events: recentEvents([{ kind: 'study_status', trial_number: null,
+          state: status, message: '状态：' + status }]),
+      }));
+      await api.settle(pageHandler);
+      facts[status] = {
+        statusText: api.text('hpoProgressStatus'),
+        messageText: api.text('hpoProgressMessage'),
+        expectMessage: cases[status].message,
+        classes: railClasses(api),
+      };
+    }
+    return facts;
+  },
+
+  /* F1.1-A Task 5: 页面刷新后第一次权威响应即可完整重建轨道与事件。 */
+  async progress_rail_after_refresh(api) {
+    const rail = trialRail(3, ['SUCCESS', 'RUNNING', 'WAITING']);
+    const events = recentEvents([
+      { kind: 'trial_finished', trial_number: 1, state: 'SUCCESS',
+        message: '试验 1 成功。' },
+      { kind: 'trial_running', trial_number: 2, state: 'RUNNING',
+        message: '试验 2 正在运行。' },
+      { kind: 'best_updated', trial_number: 1, state: 'SUCCESS',
+        message: '当前最佳来自试验 1（综合分数 0.9）。' },
+    ]);
+    // 冷启动：没有任何先前内存状态，只有一次权威响应
+    api.setInput('tuningModeSelect', 'hpo');
+    api.fireDomReady();
+    await api.settle(defaultHandler);
+    api.window.hpoSelectStudy(ID_A);
+    await api.drain();
+    await api.respond('/studies/' + ID_A, 200, statusPayload(ID_A, {
+      execution_status: 'RUNNING', budget: 3, terminal_count: 1,
+      success_count: 1, running_count: 1, remaining_count: 1,
+      trial_states: rail, recent_events: events,
+    }));
+    await api.drain();
+    const rebuilt = readRail(api);
+    await api.settle(defaultHandler);
+    return { rebuilt: rebuilt, intervalCount: api.intervalCount() };
+  },
+
+  /* F1.1-A Task 4: 受控权重库在真实页面上的可见性与提交值。
+     选择器 value 只能是 model_id；LLM 配置区不得出现任何权重入口。 */
+  async weight_library_ui(api) {
+
+    api.fireDomReady();
+    await api.settle(pageHandler);
+    // HPO 模式才会应用服务端权威默认绑定（直接训练则在打开弹窗时刷新）
+    api.window.onTuningModeChange('hpo');
+    await api.settle(pageHandler);
+
+    const ids = ['modelUploadInput', 'modelUploadBtn', 'hpoModelSelect',
+                 'trainModelSelect', 'hpoPrimaryActionHost',
+                 'llmPrimaryActionHost', 'hpoModelSelectBtn'];
+    const counts = {};
+    for (const id of ids) counts[id] = api.all.filter((e) => e.id === id).length;
+    // 自由文本权重输入已不存在；整页只有一个文件控件
+    counts.staleFreeTextInput = api.all.filter((e) => e.id === 'trainModel').length;
+    counts.fileInputs = api.all.filter(
+      (e) => e.tagName === 'INPUT' && String(e.type).toLowerCase() === 'file').length;
+
+    // LLM 配置区里不得出现权重选择器或上传控件
+    const llmWeightControls = [];
+    const walk = (el) => {
+      for (const child of el.children) {
+        const childId = child.id || '';
+        if (/Model/i.test(childId)
+            || (child.tagName === 'INPUT' && String(child.type).toLowerCase() === 'file')) {
+          llmWeightControls.push(childId || child.tagName);
+        }
+        walk(child);
+      }
+    };
+    for (const region of api.all.filter((e) => e.classList.contains('llm-only'))) {
+      walk(region);
+    }
+
+    const valuesOf = (id) => {
+      const el = api.$(id);
+      return el ? Array.prototype.map.call(el.options, (o) => o.value) : null;
+    };
+    const textsOf = (id) => {
+      const el = api.$(id);
+      return el ? Array.prototype.map.call(el.options, (o) => String(o.textContent)) : null;
+    };
+    const initialTrainValue = api.$('trainModelSelect').value;
+
+    // 直接训练：选择受控权重后，提交体只带 model_id（绝不带 model/路径）
+    api.setInput('trainDataYaml', 'E:/data/demo/data.yaml');
+    api.setInput('trainModelSelect', MODEL_ID_LEGACY);
+    api.window.startTraining();
+    await api.drain();
+    const trainRequest = api.queued('/api/training/start');
+    const trainBody = trainRequest ? trainRequest.body : null;
+    if (trainRequest) await api.reject('/api/training/start');
+    await api.settle(pageHandler);
+
+    return {
+      counts: counts,
+      llmWeightControls: llmWeightControls,
+      hpoValues: valuesOf('hpoModelSelect'),
+      trainValues: valuesOf('trainModelSelect'),
+      trainTexts: textsOf('trainModelSelect'),
+      hpoValue: api.$('hpoModelSelect').value,
+      initialTrainValue: initialTrainValue,
+      trainBody: trainBody,
+    };
+  },
+
+  /* F1.1-A Task 4: 上传只安全保存文件，成功后刷新两个选择器并选中新权重；
+     pending 期间重复点击只产生一次请求，失败不清空既有合法选项。 */
+  async weight_upload(api) {
+    api.fireDomReady();
+    await api.settle(pageHandler);
+
+    api.$('modelUploadInput').files = [{ name: 'custom.pt' }];
+    api.window.uploadModelFile();
+    await api.drain();
+    const afterFirst = api.pending().filter((u) => u.indexOf('/api/models/upload') >= 0).length;
+    api.window.uploadModelFile();          // pending 期间重复点击
+    await api.drain();
+    const afterSecond = api.pending().filter((u) => u.indexOf('/api/models/upload') >= 0).length;
+
+    const queued = api.queued('/api/models/upload');
+    const facts = {
+      uploadQueued: queued !== null,
+      formEntries: queued && queued.form
+        ? queued.form.map(([k, v]) => [k, (v && v.name) || v]) : null,
+      headers: queued ? Object.keys(queued.headers) : [],
+      duplicateUploads: afterSecond - afterFirst,
+    };
+    await api.settle(pageHandler);
+    facts.hpoValue = api.$('hpoModelSelect').value;
+    facts.trainValue = api.$('trainModelSelect').value;
+    facts.status = api.text('modelUploadStatus');
+    facts.btnDisabled = api.$('modelUploadBtn').disabled;
+    facts.btnLabel = api.$('modelUploadBtn').textContent;
+
+    // 列表失败时必须保留既有合法选项
+    const kept = api.$('trainModelSelect').value;
+    api.window.refreshModelLibrary();
+    await api.drain();
+    await api.respond('/api/models', 503, { error_code: 'MODEL_STORE_UNAVAILABLE',
+                                            models: [] });
+    await api.drain();
+    facts.afterFailureValue = api.$('trainModelSelect').value;
+    facts.keptValue = kept;
+    facts.afterFailureStatus = api.text('modelUploadStatus');
+    return facts;
+  },
+
   async layout_and_defaults(api) {
     await bootstrap(api);
     const draftEl = api.$('hpoCreateDraft');
@@ -3122,6 +3946,28 @@ const SCENARIOS = {
         api.all.indexOf(commonEl),
       hpoDraftAfterCommon: api.all.indexOf(draftEl) > api.all.indexOf(commonEl),
       formalRunsListCount: api.all.filter((e) => e.id === 'hpoFormalRunsList').length,
+    };
+    // F1.1-A 最终返修 Task 3：HPO 区域在**真实 DOM 顺序**上是 1→2→3→4
+    const at = (id) => {
+      const el = api.$(id);
+      return el ? api.order.indexOf(el) : -1;
+    };
+    const hpoOrder = {
+      commonBeforeArea: at('tuningCommonControlsCard') < at('hpoWorkArea'),
+      draftBeforeProgress: at('hpoCreateDraft') < at('hpoProgressCard'),
+      areaBeforeSearch: at('hpoWorkArea') < at('hpoSearchConfig'),
+      searchBeforeBest: at('hpoSearchConfig') < at('hpoBestArea'),
+      createBtnBeforeProgress: at('hpoCreateAndStartBtn') < at('hpoProgressCard'),
+      formalMonitorInsideBest: (function () {
+        let node = api.$('hpoFormalMonitorHost');
+        while (node) {
+          if (node.id === 'hpoBestArea') return true;
+          node = node.parentNode;
+        }
+        return false;
+      })(),
+      everySectionPresent: ['tuningCommonControlsCard', 'hpoWorkArea',
+        'hpoSearchConfig', 'hpoBestArea'].every((id) => at(id) >= 0),
     };
     api.window.onTuningModeChange('hpo');
     await api.settle(defaultHandler);
@@ -3155,6 +4001,7 @@ const SCENARIOS = {
     };
     return {
       order: order,
+      hpoOrder: hpoOrder,
       hpoMode: hpoMode,
       dryMode: dryMode,
       fullMode: fullMode,
@@ -3175,11 +4022,185 @@ const SCENARIOS = {
       mainSummary: api.$('hpoMainSummary').textContent,
     };
   },
+
+  /* F1.1 收尾：真实点击“创建并开始调优”后，页面必须自动从 READY 收敛到 RUNNING，
+     不得依赖用户手动刷新整页。测试只应答实现自己发出的请求（绝不调用
+     hpoRefreshRound/hpoFetchStatus 等人工刷新入口）：READY 首读必须先完整结束
+     （此刻轮询器为 0），随后 /start 的 202 必须触发该研究的权威刷新并建立唯一轮询器。 */
+  async create_start_converges_to_running(api) {
+    const createUrl = '/api/hpo/studies';
+    const detailUrl = '/api/hpo/studies/' + ID_A;
+    const formalUrl = detailUrl + '/formal-runs';
+    const historyUrl = (u) => u.indexOf('/api/hpo/studies?') === 0;
+    const runsBody = (runs) => ({ study_id: ID_A, count: runs.length, truncated: false,
+                                  warnings: [], runs: runs });
+    const counts = () => ({
+      detail: api.requestLog.filter((u) => u === detailUrl).length,
+      create: api.requestLog.filter((u) => u === createUrl).length,
+      start: api.requestLog.filter((u) => u.endsWith('/start')).length,
+    });
+
+    const runningPayload = statusPayload(ID_A, {
+      execution_status: 'RUNNING', budget: 3, claimed_count: 1, terminal_count: 0,
+      success_count: 0, running_count: 1, remaining_count: 2,
+      current_trial_number: 1, control_active: true, can_stop: true,
+      trial_states: trialRail(3, ['RUNNING', 'WAITING', 'WAITING']),
+      recent_events: recentEvents([
+        { kind: 'trial_running', trial_number: 1, state: 'RUNNING',
+          message: '试验 1 开始运行。' },
+      ]),
+    });
+
+    await bootstrap(api);
+    const createDisabled = api.$('hpoCreateAndStartBtn').disabled;
+    api.$('hpoCreateAndStartBtn').dispatch('click');   // 真实按钮（onclick 入口）
+    await api.drain();
+    const createBody = (api.queued((u) => u === createUrl) || {}).body;
+
+    // 创建 201：返回完整 study_id；随后实现自己发出详情首读与启动请求
+    await api.respond((u) => u === createUrl, 201,
+                      { study_id: ID_A, execution_status: 'READY' });
+    const afterCreate = {
+      detailQueued: api.pending().some((u) => u === detailUrl),
+      startQueued: api.pending().some((u) => u.endsWith('/start')),
+      studyId: api.state.studyId,
+    };
+
+    // 首读先回来且是 READY：该刷新回合必须完整结束（关联记录 + 历史），此时没有轮询器
+    await api.respond((u) => u === detailUrl, 200, statusPayload(ID_A));
+    await api.respond((u) => u === formalUrl, 200, runsBody([]));
+    await api.respond(historyUrl, 200, { studies: [], count: 0 });
+    const afterReadyRound = {
+      detailReads: counts().detail,
+      timers: api.intervalCount(),
+      startPending: api.pending().some((u) => u.endsWith('/start')),
+      progressStatus: api.text('hpoProgressStatus'),
+      statusText: api.text('hpoStatusText'),
+    };
+
+    // 服务端接受启动（202）：这是本场景里唯一允许触发后续刷新的来源
+    await api.respond((u) => u.endsWith('/start'), 202,
+                      { study_id: ID_A, started: true });
+    const afterStartAccepted = {
+      detailReads: counts().detail,
+      create: counts().create,
+      start: counts().start,
+      detailQueued: api.pending().some((u) => u === detailUrl),
+      timers: api.intervalCount(),
+    };
+
+    let converged = null;
+    if (afterStartAccepted.detailQueued) {
+      await api.respond((u) => u === detailUrl, 200, runningPayload);
+      await api.respond((u) => u === formalUrl, 200, runsBody([]));
+      await api.respond(historyUrl, 200, { studies: [], count: 0 });
+      converged = {
+        studyId: api.state.studyId,
+        progressVisible: api.visible('hpoProgress'),
+        progressCardVisible: api.visible('hpoProgressCard'),
+        progressStatus: api.text('hpoProgressStatus'),
+        progressCurrent: api.text('hpoProgressCurrent'),
+        progressCounts: api.text('hpoProgressCounts'),
+        statusText: api.text('hpoStatusText'),
+        rail: readRail(api).rail,
+        timers: api.intervalCount(),
+        detailReads: counts().detail,
+        create: counts().create,
+        start: counts().start,
+      };
+      // 只推进 fake clock：唯一的轮询器必须真的指向当前研究
+      await api.tickIntervals();
+      await api.respond((u) => u === detailUrl, 200, runningPayload);
+      await api.respond((u) => u === formalUrl, 200, runsBody([]));
+      await api.respond(historyUrl, 200, { studies: [], count: 0 });
+      converged.afterTick = { detailReads: counts().detail,
+                              timers: api.intervalCount() };
+    }
+
+    return {
+      createDisabled: createDisabled,
+      createBody: createBody,
+      afterCreate: afterCreate,
+      afterReadyRound: afterReadyRound,
+      afterStartAccepted: afterStartAccepted,
+      converged: converged,
+    };
+  },
+
+  /* F1.1 收尾：/start 的 202 落在 READY 首读仍在途时，必须走既有 refreshing/
+     pendingRefresh 合并——绝不并发发出第二轮详情读取，也绝不丢掉启动后的那次权威
+     刷新（合并后的回合随后补跑）。 */
+  async create_start_coalesces_inflight_refresh(api) {
+    const createUrl = '/api/hpo/studies';
+    const detailUrl = '/api/hpo/studies/' + ID_A;
+    const formalUrl = detailUrl + '/formal-runs';
+    const historyUrl = (u) => u.indexOf('/api/hpo/studies?') === 0;
+    const runsBody = (runs) => ({ study_id: ID_A, count: runs.length, truncated: false,
+                                  warnings: [], runs: runs });
+    const detailReads = () => api.requestLog.filter((u) => u === detailUrl).length;
+    const pendingDetail = () => api.pending().filter((u) => u === detailUrl).length;
+
+    const runningPayload = statusPayload(ID_A, {
+      execution_status: 'RUNNING', budget: 3, claimed_count: 1, terminal_count: 0,
+      running_count: 1, remaining_count: 2, current_trial_number: 1,
+      control_active: true, can_stop: true,
+      trial_states: trialRail(3, ['RUNNING', 'WAITING', 'WAITING']),
+    });
+
+    await bootstrap(api);
+    api.$('hpoCreateAndStartBtn').dispatch('click');
+    await api.drain();
+    await api.respond((u) => u === createUrl, 201,
+                      { study_id: ID_A, execution_status: 'READY' });
+
+    // 启动响应先到，首读仍在途
+    await api.respond((u) => u.endsWith('/start'), 202,
+                      { study_id: ID_A, started: true });
+    const inflight = {
+      detailReads: detailReads(),
+      pendingDetail: pendingDetail(),
+      timers: api.intervalCount(),
+    };
+
+    // 应答在途的首读：回合结束后被合并的那一次随即补跑
+    await api.respond((u) => u === detailUrl, 200, statusPayload(ID_A));
+    await api.respond((u) => u === formalUrl, 200, runsBody([]));
+    await api.respond(historyUrl, 200, { studies: [], count: 0 });
+    const afterCoalescedRound = {
+      detailReads: detailReads(),
+      pendingDetail: pendingDetail(),
+      timers: api.intervalCount(),
+      progressStatus: api.text('hpoProgressStatus'),
+    };
+
+    let converged = null;
+    if (afterCoalescedRound.pendingDetail > 0) {
+      await api.respond((u) => u === detailUrl, 200, runningPayload);
+      await api.respond((u) => u === formalUrl, 200, runsBody([]));
+      await api.respond(historyUrl, 200, { studies: [], count: 0 });
+      converged = {
+        detailReads: detailReads(),
+        progressStatus: api.text('hpoProgressStatus'),
+        progressCurrent: api.text('hpoProgressCurrent'),
+        timers: api.intervalCount(),
+        create: api.requestLog.filter((u) => u === createUrl).length,
+        start: api.requestLog.filter((u) => u.endsWith('/start')).length,
+      };
+    }
+
+    return {
+      inflight: inflight,
+      afterCoalescedRound: afterCoalescedRound,
+      converged: converged,
+    };
+  },
 };
 
 // Scenarios that drive the whole page must be given a *rendered* single_page.html
 // (the training-monitor projections depend on the Jinja context).
-for (const name of ['monitor_first_paint', 'monitor_terminal_metrics',
+for (const name of ['mode_submission', 'weight_library_ui', 'weight_upload',
+                    'llm_regions_hidden_in_hpo_mode',
+                    'monitor_first_paint', 'monitor_terminal_metrics',
                     'monitor_result_projection', 'monitor_stream_parity',
                     'monitor_epochs_contract', 'formal_monitor_reuse',
                     'hpo_monitor_ownership', 'hpo_monitor_full_state',

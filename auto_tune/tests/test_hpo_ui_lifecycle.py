@@ -27,6 +27,7 @@ from auto_tune.modules.hpo import (
     ResultInput,
     StudyConfig,
 )
+from auto_tune.modules.model_store import ModelStore
 from auto_tune.modules.run_state.manager import RunManager
 from auto_tune.ui.hpo_api import create_hpo_router
 
@@ -119,22 +120,25 @@ class Stack:
         self.runner = FakeRunner()
         self.manager = RunManager()
         snapshot, model = self.snapshot, self.model
+        # 新建研究只接受受控模型标识（客户端不再提交任何路径）
+        self.store = ModelStore(tmp_path / "models" / "weights",
+                                legacy_roots=[tmp_path],
+                                max_upload_bytes=1024, max_models=50)
+        self.model_id = {row.name: row.model_id
+                         for row in self.store.list_models()}["fixture.pt"]
 
         def resolve_snapshot(sid):
             if sid == snapshot.snapshot_id:
                 return Path(snapshot.snapshot_path)
             raise HpoError("HPO_INVALID_CONFIG", "bad snapshot")
 
-        def validate_model(value):
-            path = Path(value)
-            if path.is_file() and path.suffix == ".pt":
-                return str(path.resolve())
-            raise HpoError("HPO_INVALID_CONFIG", "bad model")
+        def resolve_model(model_id):
+            return self.store.resolve(model_id)
 
         router = create_hpo_router(service=self.service, runner=self.runner,
                                    manager=self.manager,
                                    resolve_snapshot=resolve_snapshot,
-                                   validate_model=validate_model,
+                                   resolve_model=resolve_model,
                                    assert_training_slot_free=lambda: None)
         app = FastAPI()
         app.include_router(router, prefix="/api/hpo")
@@ -143,7 +147,7 @@ class Stack:
     def create(self):
         return self.client.post("/api/hpo/studies", json={
             "snapshot_id": self.snapshot.snapshot_id,
-            "model_path": str(self.model),
+            "model_id": self.model_id,
             "study_config": {}, "execution_config": {},
         }).json()["study_id"]
 

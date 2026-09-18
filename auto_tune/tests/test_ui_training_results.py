@@ -754,7 +754,7 @@ def test_training_start_failed_writes_failed_terminal(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 200
         # The terminal state is persisted as failed/terminal (never deleted).
@@ -1608,3 +1608,233 @@ def test_switching_studies_stops_the_old_timer_and_drops_its_response(tmp_path):
     # 再推进时钟：不复活旧轮询，也不产生任何新请求
     assert facts["afterFinalTick"]["timers"] == 0
     assert facts["afterFinalTick"]["total"] == facts["beforeFinalTick"]
+
+
+# ── F1.1-A Task 4：受控权重进入直接训练，LLM 只继承参考运行权重 ──────
+#
+# 直接训练只能提交受控模型标识；服务端在创建运行目录、状态文件和控制器
+# **之前**重新解析并复核文件事实。大模型调优不提供权重覆盖入口。
+
+def _controlled_store(tmp_path, monkeypatch, files=("yolov8n.pt",), legacy=()):
+    import io as _io
+
+    from auto_tune.modules.model_store import ModelStore
+    from auto_tune.ui import app as app_mod
+
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir(exist_ok=True)
+    for name in legacy:
+        (legacy_root / name).write_bytes(b"legacy-" + name.encode())
+    store = ModelStore(tmp_path / "models" / "weights",
+                       legacy_roots=[legacy_root],
+                       max_upload_bytes=1024, max_models=50)
+    records = {name: store.import_stream(name, _io.BytesIO(b"managed-" + name.encode()))
+               for name in files}
+    monkeypatch.setattr(app_mod, "_MODEL_STORE", store)
+    return store, records
+
+
+def _start_training_stack(tmp_path, monkeypatch):
+    """Temp log + temp detect + a YOLO subprocess that exits immediately."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    log_dir = _training_running_log_dir(monkeypatch, tmp_path)
+    detect_dir = tmp_path / "detect"
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.executor.find_detect_dir",
+        lambda: str(detect_dir))
+    monkeypatch.setattr(
+        "auto_tune.modules.agent_engine.executor.resolve_yolo_executable",
+        lambda: "yolo")
+
+    class FakeStdout:
+        async def readline(self):
+            return b""
+
+    class FakeProc:
+        returncode = 0
+        pid = 4242
+        stdout = FakeStdout()
+
+        async def wait(self):
+            return 0
+
+    started = []
+
+    async def fake_subprocess_exec(*args, **kwargs):
+        started.append(list(args))
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+
+    def fake_finalize(run_dir, run_name, source, config, log_dir, training_status,
+                      started_at=None, finished_at=None, training_error=None, **kw):
+        return {"run_id": f"manual:{run_name}", "run_name": run_name,
+                "source": "manual", "status": "completed",
+                "analysis_status": "skipped", "metrics": {},
+                "artifacts": {"report_path": None}, "error": None,
+                "analysis_error": None, "history_error": None}
+
+    monkeypatch.setattr("auto_tune.ui.app.finalize_training_run", fake_finalize)
+    app_mod._running_training.clear()
+    return {"log_dir": log_dir, "detect_dir": detect_dir, "started": started,
+            "client": TestClient(app_mod.app), "app": app_mod}
+
+
+def _written_args(detect_dir):
+    import yaml
+
+    runs = sorted(p for p in detect_dir.iterdir() if p.is_dir())
+    assert len(runs) == 1, runs
+    return yaml.safe_load((runs[0] / "args.yaml").read_text(encoding="utf-8"))
+
+
+def test_direct_training_resolves_a_controlled_model_id(tmp_path, monkeypatch):
+    _store, records = _controlled_store(tmp_path, monkeypatch)
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    try:
+        resp = stack["client"].post("/api/training/start", json={
+            "model_id": records["yolov8n.pt"].model_id,
+            "data_yaml": str(tmp_path / "data.yaml"),
+            "epochs": 1, "imgsz": 96, "batch": 1,
+        })
+        assert resp.status_code == 200, resp.text
+        args = _written_args(stack["detect_dir"])
+        # 实际训练用的是服务端解析出的受控绝对路径，不是客户端给的名字
+        assert Path(args["model"]) == records["yolov8n.pt"].path
+        assert args["model"] != "yolov8n.pt"
+        assert stack["started"], "training subprocess must have been launched"
+        assert str(records["yolov8n.pt"].path) in " ".join(stack["started"][0])
+        # 响应不回显任何服务器路径
+        assert str(tmp_path) not in resp.text
+    finally:
+        stack["app"]._running_training.clear()
+
+
+def test_direct_training_uses_the_configured_weight_from_the_controlled_library(
+        tmp_path, monkeypatch):
+    store, _ = _controlled_store(tmp_path, monkeypatch, files=("yolov8n.pt",),
+                                 legacy=("yolov8s.pt",))
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    try:
+        resp = stack["client"].post("/api/training/start", json={
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
+        })
+        assert resp.status_code == 200, resp.text
+        args = _written_args(stack["detect_dir"])
+        # 配置里的 yolov8n.pt 按 basename 在受控库中唯一解析
+        assert Path(args["model"]) == store.resolve_configured_name("yolov8n.pt")
+    finally:
+        stack["app"]._running_training.clear()
+
+
+@pytest.mark.parametrize("model_field", [
+    {"model": "yolov8n.pt"},
+    {"model": "C:\\models\\evil.pt"},
+    {"model": "models/weights/evil.pt"},
+    {"model": ""},
+])
+def test_direct_training_rejects_a_client_supplied_model(tmp_path, monkeypatch,
+                                                         model_field):
+    _controlled_store(tmp_path, monkeypatch)
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    try:
+        payload = {"data_yaml": str(tmp_path / "data.yaml"), "epochs": 1}
+        payload.update(model_field)
+        resp = stack["client"].post("/api/training/start", json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["error_code"] == "MODEL_PATH_FORBIDDEN"
+        # 零副作用：没有训练目录、没有状态文件、没有子进程
+        assert not stack["detect_dir"].exists()
+        assert not (stack["log_dir"] / "training_running.json").exists()
+        assert stack["started"] == []
+        assert str(tmp_path) not in resp.text
+    finally:
+        stack["app"]._running_training.clear()
+
+
+def test_direct_training_refuses_a_weight_replaced_after_upload(tmp_path, monkeypatch):
+    _store, records = _controlled_store(tmp_path, monkeypatch)
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    records["yolov8n.pt"].path.write_bytes(b"tampered")
+    try:
+        resp = stack["client"].post("/api/training/start", json={
+            "model_id": records["yolov8n.pt"].model_id,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
+        })
+        assert resp.status_code == 409
+        assert resp.json()["error_code"] == "MODEL_CHANGED"
+        assert not stack["detect_dir"].exists()
+        assert not (stack["log_dir"] / "training_running.json").exists()
+        assert stack["started"] == []
+    finally:
+        stack["app"]._running_training.clear()
+
+
+def test_direct_training_reports_an_unknown_model_id(tmp_path, monkeypatch):
+    _controlled_store(tmp_path, monkeypatch)
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    try:
+        resp = stack["client"].post("/api/training/start", json={
+            "model_id": "sha256:" + "a" * 64,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
+        })
+        assert resp.status_code == 404
+        assert resp.json()["error_code"] == "MODEL_NOT_FOUND"
+        assert not stack["detect_dir"].exists()
+        assert stack["started"] == []
+    finally:
+        stack["app"]._running_training.clear()
+
+
+def test_direct_training_never_downloads_an_absent_default_weight(tmp_path, monkeypatch):
+    """默认配置的权重不在受控库里时必须稳定报错，绝不触发隐式下载。"""
+    _controlled_store(tmp_path, monkeypatch, files=())
+    stack = _start_training_stack(tmp_path, monkeypatch)
+    try:
+        resp = stack["client"].post("/api/training/start", json={
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
+        })
+        assert resp.status_code == 404
+        assert resp.json()["error_code"] == "MODEL_NOT_FOUND"
+        assert not stack["detect_dir"].exists()
+        assert stack["started"] == []
+    finally:
+        stack["app"]._running_training.clear()
+
+
+# ── 大模型调优：绝不接受权重覆盖，且先于参考运行解析 ─────────────────
+
+
+@pytest.mark.parametrize("override", [
+    {"model_id": "sha256:" + "a" * 64},
+    {"model": "yolov8n.pt"},
+    {"model": "C:\\models\\evil.pt"},
+    {"model": ""},
+])
+def test_llm_tuning_rejects_any_model_override(tmp_path, monkeypatch, override):
+    from fastapi.testclient import TestClient
+    from auto_tune.ui import app as app_mod
+
+    _training_running_log_dir(monkeypatch, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("a model override must never reach the tuning loop")
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.run_tuning_loop", boom)
+    # 参考运行故意不可解析：覆盖必须在任何参考解析之前就被拒绝
+    monkeypatch.setattr(app_mod, "find_module_b_report", lambda **k: None)
+    app_mod._running_training.clear()
+    try:
+        payload = {"mode": "full", "max_retries": 1, "reference_run": "train-does-not-exist"}
+        payload.update(override)
+        resp = TestClient(app_mod.app).post("/tuning/start", json=payload)
+        assert resp.status_code == 422
+        assert resp.json()["error_code"] == "LLM_MODEL_OVERRIDE_FORBIDDEN"
+        assert app_mod._RUN_MANAGER.active_tuning() is None
+        assert not (tmp_path / "log" / "tuning_running.json").exists()
+    finally:
+        app_mod._running_training.clear()

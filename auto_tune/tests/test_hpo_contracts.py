@@ -340,3 +340,23 @@ def test_evidence_rejects_illegal_metric_payloads(metrics):
 def test_evidence_rejects_a_mode_objective_mismatch():
     with pytest.raises(ValidationError):
         _quick_evidence(objective="val_map50_95_best_epoch_v1")
+
+
+# ── F1.1-A 复审 Task 3：ModelBinding 的 mtime 冻结字段 ──────────────────────
+
+def test_model_binding_accepts_an_optional_mtime_and_keeps_old_records_readable():
+    legacy = ModelBinding(model_path=r"C:\models\y.pt", model_bytes=123,
+                          model_sha256="c" * 64)
+    assert legacy.model_mtime_ns is None
+
+    frozen = ModelBinding(model_path=r"C:\models\y.pt", model_bytes=123,
+                          model_sha256="c" * 64, model_mtime_ns=1_700_000_000_000_000_000)
+    assert frozen.model_mtime_ns == 1_700_000_000_000_000_000
+    assert frozen.model_dump(mode="json")["model_mtime_ns"] == 1_700_000_000_000_000_000
+
+
+@pytest.mark.parametrize("bad", [-1, -1_000, True, False, "1", 1.5, float("inf")])
+def test_model_binding_mtime_rejects_non_int_and_negative(bad):
+    with pytest.raises(ValidationError):
+        ModelBinding(model_path=r"C:\models\y.pt", model_bytes=123,
+                     model_sha256="c" * 64, model_mtime_ns=bad)

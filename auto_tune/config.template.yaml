@@ -1,8 +1,10 @@
 project:
-  name: 口服液瓶盖瑕疵检测
-  description: 瓶盖侧边的
-  detection_target: 口服液瓶盖侧边铝盖上缺陷，划痕、破损、翘边、锁边没锁好和连接处断裂
-  data_type: 缺陷
+  # 公开模板只含通用占位示例：本文件会随仓库发布，切勿填入客户、产线、
+  # 数据集或项目专用信息；真实项目信息请填本地 config.yaml（不入库）。
+  name: 示例项目名称
+  description: 示例项目描述
+  detection_target: 示例检测目标，如"表面缺陷（划痕、破损、脏污）"
+  data_type: 示例数据类型，如"工业相机拍摄的 RGB 图像"
   extra: {}
   data_yaml: ''
   model: yolov8n.pt
@@ -12,7 +14,7 @@ project:
 llm:
   provider: deepseek
   credential_ref: AutoTuneStudio/text/deepseek
-  model: deepseek-chat
+  model: deepseek-flash
   endpoint: https://api.deepseek.com/v1/chat/completions
   temperature: 0.3
   max_tokens: 2000
@@ -53,6 +55,13 @@ local_index:
   backup_dir: log/db_backups
   backup_max_files: 3
   busy_timeout_ms: 5000
+# 受控权重库（F1.1-A）：直接训练与 HPO 的初始权重只能从这里选择。
+# root 是项目根下的受控目录（不入库）；max_upload_bytes 是单文件上传上限。
+# 本批不访问网络、不自动下载 Ultralytics 权重，也不扫描 detect/trainN 训练产物。
+model_store:
+  root: models/weights
+  max_upload_bytes: 2147483648
+  max_models: 100
 dataset_analyzer:
   blur_threshold: 30
   under_exposure_pixel_threshold: 30

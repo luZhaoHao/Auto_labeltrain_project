@@ -1,5 +1,7 @@
 # F1.1-A Experience Optimization and Controlled Model Store Implementation Plan
 
+**当前版本状态：本子批次结果保留在本地，不单独提交或推送；待 F1.1 整体验收后统一处理 GitHub 上传。**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 修复大模型调优模式提交阻断，建立安全的受控权重库，让直接训练和 HPO 可选择初始权重，并用持久事实丰富 HPO 动态进度。

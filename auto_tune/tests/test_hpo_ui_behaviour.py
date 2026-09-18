@@ -11,6 +11,7 @@ These tests need ``node`` on PATH; the whole module is skipped otherwise.
 """
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,6 +26,10 @@ _NODE = shutil.which("node")
 pytestmark = pytest.mark.skipif(_NODE is None, reason="node is not available")
 
 _CACHE: dict[str, dict] = {}
+
+# 受控权重库 fixture 的 model_id（与 tests/js/minidom.js 的 modelLibraryPayload 一致）
+MODEL_ID_MANAGED = "sha256:" + "1" * 64
+MODEL_ID_LEGACY = "sha256:" + "2" * 64
 
 
 def _run(scenario: str) -> dict:
@@ -41,6 +46,308 @@ def _run(scenario: str) -> dict:
     return payload
 
 
+def _render_page(tmp_path) -> Path:
+    """The *real* Intelligent-Analysis page, rendered by the shipped app.
+
+    The tuning form only exists when the page has a training context, so the
+    page is taken from the actual route rather than hand-fed Jinja variables —
+    the harness then executes the shipping inline scripts and ``hpo.js``."""
+    from fastapi.testclient import TestClient
+
+    from auto_tune.ui.app import app
+
+    page = tmp_path / "rendered_page.html"
+    page.write_text(TestClient(app).get("/agent_suggestion").text,
+                    encoding="utf-8")
+    return page
+
+
+def _run_page(scenario: str, tmp_path) -> dict:
+    result = subprocess.run(
+        [_NODE, str(_HARNESS), scenario, str(_UI_DIR), str(_render_page(tmp_path))],
+        capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload.get("error")
+    return payload
+
+
+# ── F1.1-A Task 1：模式必须进入表单，页面模式各自走自己的入口 ────────
+
+
+def test_mode_submission_sends_the_complete_mode_for_every_route(tmp_path):
+    """模式选择器渲染在 #tuningForm 之外：只有显式表单关联才能被 FormData 收集。
+    修复前 ``mode=null`` 会让 /tuning/start 只能按严格白名单返回 INVALID_MODE。
+
+    F1.1-C Task 1：页面恢复已批准的四模式（dry_run / keep_params / hpo / full），
+    四个完整值都必须能被 FormData 收集到，且只有 hpo 走独立创建流程。"""
+    result = _run_page("mode_submission", tmp_path)
+    # 页面真实提供的选项，不是测试写死的清单
+    assert result["visibleModes"] == ["dry_run", "keep_params", "hpo", "full"]
+    # F1.1-C Task 3：默认模式冻结为 dry_run（第一个选项，且没有任何选项带
+    # selected）。这是浏览器按 markup 做出的默认选择，页面不得改成 keep_params。
+    assert result["initialMode"] == "dry_run"
+    assert result["dryRunOptionPresent"] is True
+    assert result["modeValues"] == ["dry_run", "keep_params", "hpo", "full"]
+    # 三个非 HPO 模式走共用提交按钮；HPO 绝不落到 /tuning/start
+    assert result["llmRequests"] == ["dry_run", "keep_params", "full"]
+    assert result["hpoCreateCount"] == 1
+    assert result["llmNullModes"] == 0
+    # 提交期间重复点击不得产生第二次创建
+    assert result["duplicateClicksWhilePending"] == 0
+    # 同一模式只有一个可见主操作
+    assert result["hpoStartVisible"] is True
+    assert result["llmStartVisible"] is False
+    # LLM 提交体里绝不出现任何权重要求：模型权重只能继承参考运行的 args.yaml
+    for body in result["llmBodies"]:
+        assert "model_id" not in body, body
+        assert "model" not in body, body
+        assert body["mode"] in ("dry_run", "keep_params", "full")
+
+
+# ── F1.1-C Task 2：原参考基线仍为总体最佳时的完成态展示 ──────────────
+#
+# 后端契约（loop.py 的 kept_reference_baseline / baseline_run / reference_baseline）
+# 已经确定：没有调优轮次严格超过会话开始时的原参考训练时，总体最佳仍是原参考运行。
+# 这里真实执行完成态渲染逻辑，读回它写进 DOM 的文本与按钮绑定目标。
+
+def test_kept_reference_baseline_is_presented_as_the_overall_best(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    kept = facts["keptWithScore"]
+
+    assert kept["visible"] is True
+    # 主卡文案指向原参考训练，而不是较差的调优轮次
+    assert "总体最佳" in kept["text"]
+    assert "原参考训练" in kept["text"]
+    assert "train54" in kept["text"]
+    # 原参考分数按真实值显示
+    assert "0.9000" in kept["text"]
+    # 查看与保存都绑定原参考运行
+    assert kept["viewTarget"] == "train54"
+    assert kept["saveTarget"] == "train54"
+    # 卡片标题本身也点明总体最佳是原参考训练
+    assert "总体最佳" in kept["title"]
+    assert "原参考训练" in kept["title"]
+    # 调优轮次最佳只作为次级信息出现（带次级标签，不占用总体最佳标题）
+    assert "train60" in kept["text"]
+    assert "本次调优轮次中最佳" in kept["text"]
+
+
+def test_kept_reference_baseline_without_a_score_shows_a_dash(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    kept = facts["keptNoScore"]
+
+    assert kept["visible"] is True
+    assert "train54" in kept["text"]
+    # 缺失分数显示 '-'，绝不伪造 0
+    assert "0.0000" not in kept["text"]
+    assert "-" in kept["text"]
+
+
+def test_improved_tuning_round_keeps_binding_to_the_best_iteration(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    improved = facts["improved"]
+
+    assert improved["visible"] is True
+    assert improved["viewTarget"] == "train60"
+    assert improved["saveTarget"] == "train60"
+    assert "train60" in improved["text"]
+
+
+# 后端只拒绝路径分隔符/冒号/方括号/空字符：运行名里的 `<>` 与引号能通过校验，
+# 因此它们进入结果卡正文前必须转义。卡片结构（后代标签序列）与干净用例完全一致
+# 就证明没有节点被注入；事件属性只能挂在被注入的节点上，不存在的节点不可能带
+# onerror。按钮的 data-train-name 语义必须仍是原始运行名（查看入口 encode 后
+# decode 还原，保存入口保存原值）。
+
+_MALICIOUS_RUN_NAME = 'train54</span><img data-xss="1" src="x" onerror="alert(1)">'
+
+
+def _assert_card_is_plain_text(case: dict, clean: dict, run_name: str) -> None:
+    assert case["visible"] is True
+    # 结果卡没有多出任何节点（干净用例的标签序列就是同一个卡片结构）：
+    # 未转义时这里会看到运行名闭合 span 后注入的 IMG
+    assert "IMG" not in case["tags"]
+    assert case["tags"] == clean["tags"]
+    assert "onerror" not in case["onAttrs"]
+    # 完整恶意名称作为普通文本显示，而不是被拆成标签
+    assert run_name in case["text"]
+
+
+def test_malicious_overall_run_name_is_escaped_in_the_card(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    malicious = facts["malicious"]
+
+    _assert_card_is_plain_text(malicious["overall"], facts["keptWithScore"], malicious["name"])
+    # 总体最佳仍是原参考训练，标题与文案都不变
+    assert "总体最佳" in malicious["overall"]["title"]
+    assert "原参考训练" in malicious["overall"]["text"]
+    # 查看目标仍是原始运行名（encode 后由按钮自己 decode 还原）
+    assert malicious["overall"]["viewTargetDecoded"] == malicious["name"]
+    assert malicious["overall"]["viewTargetDataset"] == malicious["overall"]["viewTarget"]
+    # 保存目标保存原值，且没有被转义实体污染
+    assert malicious["overall"]["saveTarget"] == malicious["name"]
+    assert malicious["overall"]["saveTargetDataset"] == malicious["name"]
+
+
+def test_malicious_tuning_round_name_is_escaped_in_the_card(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    malicious = facts["malicious"]
+
+    # 次级“本次调优轮次中最佳”同样不得注入
+    _assert_card_is_plain_text(malicious["round"], facts["keptWithScore"], malicious["name"])
+    assert "本次调优轮次中最佳" in malicious["round"]["text"]
+    assert malicious["round"]["viewTargetDecoded"] == "train54"
+    assert malicious["round"]["saveTarget"] == "train54"
+
+
+def test_malicious_best_train_name_is_escaped_when_the_round_wins(tmp_path):
+    facts = _run_page("reference_baseline_best", tmp_path)
+    malicious = facts["malicious"]
+
+    # kept_reference_baseline=false 的主分支显示 best_train_name：同样必须转义
+    _assert_card_is_plain_text(malicious["best"], facts["improved"], malicious["name"])
+    assert malicious["best"]["viewTargetDecoded"] == malicious["name"]
+    assert malicious["best"]["saveTarget"] == malicious["name"]
+
+
+# ── F1.1-A Task 5：HPO 动态进度（试验轨道 + 最近事件）─────────────
+
+def test_progress_rail_and_recent_events_follow_the_persisted_facts():
+    facts = _run("progress_rail")
+    assert facts["running"]["rail"] == ["1 成功", "2 运行中", "3 等待", "4 等待"]
+    assert facts["running"]["classes"] == [
+        "hpo-trial-cell success", "hpo-trial-cell running",
+        "hpo-trial-cell waiting", "hpo-trial-cell waiting"]
+    assert facts["completed"]["rail"] == ["1 成功", "2 失败", "3 成功", "4 成功"]
+    assert facts["completed"]["classes"] == [
+        "hpo-trial-cell success", "hpo-trial-cell failed",
+        "hpo-trial-cell success", "hpo-trial-cell success"]
+    assert len(facts["completed"]["events"]) == 3
+    assert facts["completed"]["eventKinds"] == [
+        "trial_finished", "trial_finished", "study_status"]
+
+
+def test_repeated_and_stale_progress_responses_are_idempotent():
+    facts = _run("progress_rail")
+    # 重复响应整体重建，不追加、不重复
+    assert facts["repeated"]["events"] == facts["completed"]["events"]
+    assert facts["repeated"]["rail"] == facts["completed"]["rail"]
+    # 旧研究的迟到响应无权改写当前轨道
+    assert facts["stale_reply"]["rail"] == facts["completed"]["rail"]
+    assert facts["stale_reply"]["events"] == facts["completed"]["events"]
+    # 只有一个轮询器
+    assert facts["intervalCount"] == 1
+
+
+def test_every_study_status_has_a_chinese_label_and_rail_state():
+    facts = _run("study_status_rail")
+    expected = {
+        "READY": ("准备就绪", ""),
+        "RUNNING": ("运行中", ""),
+        "PAUSED": ("已暂停", "已暂停，可恢复"),
+        "INTERRUPTED": ("已中断", "已中断，可恢复"),
+        "BLOCKED": ("需处理", "需先处理才能继续"),
+        "COMPLETED": ("已完成", "调优已完成"),
+        "FAILED": ("失败", "执行失败，请查看错误原因后重试或恢复"),
+    }
+    for status, (label, message) in expected.items():
+        entry = facts[status]
+        assert entry["statusText"] == label, status
+        assert entry["messageText"] == message, status
+        # 状态码绝不作为说明文案直接展示
+        assert entry["messageText"] != status
+
+
+def test_study_statuses_map_to_the_documented_rail_classes():
+    facts = _run("study_status_rail")
+    for status in ("READY", "RUNNING", "PAUSED", "INTERRUPTED", "BLOCKED",
+                   "COMPLETED", "FAILED"):
+        allowed = {"waiting", "running", "success", "failed", "cancelled",
+                   "interrupted"}
+        for class_name in facts[status]["classes"]:
+            tokens = class_name.split()
+            assert tokens[0] == "hpo-trial-cell", status
+            assert tokens[-1] in allowed, (status, class_name)
+    assert facts["COMPLETED"]["classes"] == ["hpo-trial-cell success"] * 2
+    assert facts["FAILED"]["classes"] == ["hpo-trial-cell failed"] * 2
+    assert facts["RUNNING"]["classes"] == ["hpo-trial-cell running"] * 2
+    assert facts["READY"]["classes"] == ["hpo-trial-cell waiting"] * 2
+
+
+def test_progress_rebuilds_from_persisted_facts_after_a_refresh():
+    facts = _run("progress_rail_after_refresh")["rebuilt"]
+    # 冷启动只有一次权威响应即可完整重建，不依赖任何先前的内存状态
+    assert facts["rail"] == ["1 成功", "2 运行中", "3 等待"]
+    assert facts["states"] == ["SUCCESS", "RUNNING", "WAITING"]
+    assert len(facts["events"]) == 3
+    assert facts["eventKinds"] == ["trial_finished", "trial_running",
+                                   "best_updated"]
+
+
+def test_progress_never_introduces_a_second_poller_or_a_chart():
+    script = (_UI_DIR / "static" / "hpo.js").read_text(encoding="utf-8")
+    # 事件与轨道只由轮询响应重建，绝不新建计时器或第二套轮询
+    for forbidden in ("setTimeout(", "new EventSource", "WebSocket"):
+        assert forbidden not in script, forbidden
+    assert script.count("setInterval(") == 1
+    # 没有实时曲线或资源图表
+    for forbidden in ("<canvas", "chart", "gpu_util", "memory_used"):
+        assert forbidden not in script, forbidden
+
+
+# ── F1.1-A Task 4：受控权重库的可见性、上传与提交值 ─────────────────
+
+
+def test_only_the_controlled_library_supplies_weights_on_the_page(tmp_path):
+    facts = _run_page("weight_library_ui", tmp_path)
+    # 每个受控元素在整页中唯一：不复制 DOM ID
+    for element_id in ("modelUploadInput", "modelUploadBtn", "hpoModelSelect",
+                       "trainModelSelect", "hpoPrimaryActionHost",
+                       "llmPrimaryActionHost"):
+        assert facts["counts"][element_id] == 1, element_id
+    # 自由文本权重输入已被移除；整页只有一个文件控件（不复制上传入口）
+    assert facts["counts"]["staleFreeTextInput"] == 0
+    assert facts["counts"]["fileInputs"] == 1
+    # LLM 配置区没有任何权重选择器 / 上传控件
+    assert facts["llmWeightControls"] == []
+    # 两个选择器的 value 只能是安全 model_id，绝不出现服务器路径
+    for values in (facts["hpoValues"], facts["trainValues"]):
+        assert values, values
+        for value in values:
+            assert value == "" or re.fullmatch(r"sha256:[0-9a-f]{64}", value), value
+    # HPO 用服务端权威默认绑定；直接训练要求用户显式选择（不替用户换权重）
+    assert facts["hpoValue"] == MODEL_ID_MANAGED
+    assert facts["initialTrainValue"] == ""
+    # 选项文案只给文件名与来源，不给路径
+    assert any("yolov8n.pt" in text for text in facts["trainTexts"])
+    assert not any("E:/" in text or "\\\\" in text for text in facts["trainTexts"])
+    # 直接训练提交体：只带受控 model_id，绝不带 model/路径
+    assert facts["trainBody"]["model_id"] == MODEL_ID_LEGACY
+    assert "model" not in facts["trainBody"]
+    assert facts["trainBody"]["data_yaml"] == "E:/data/demo/data.yaml"
+
+
+def test_upload_saves_once_refreshes_both_selectors_and_keeps_options(
+        tmp_path):
+    facts = _run_page("weight_upload", tmp_path)
+    assert facts["uploadQueued"] is True
+    # 只上传操作人员选中的那一个文件，且不手写 multipart content-type
+    assert facts["formEntries"] == [["file", "custom.pt"]]
+    assert "Content-Type" not in facts["headers"]
+    assert "X-CSRF-Token" in facts["headers"]
+    # pending 期间重复点击只发一次
+    assert facts["duplicateUploads"] == 0
+    # 上传成功后两个选择器一起刷新并选中新权重，按钮恢复可用
+    assert facts["hpoValue"] == MODEL_ID_MANAGED
+    assert facts["trainValue"] == MODEL_ID_MANAGED
+    assert facts["btnDisabled"] is False
+    assert "上传权重" in facts["btnLabel"]
+    # 列表失败不清空既有合法选项，只给出提示
+    assert facts["afterFailureValue"] == facts["keptValue"] != ""
+    assert "暂不可用" in facts["afterFailureStatus"]
+
+
 # ── A1/A2/A3: 布局稳定、单一开始操作、技术细节折叠 ─────────────────
 
 
@@ -51,6 +358,19 @@ def test_layout_keeps_mode_and_primary_action_in_one_common_block():
     assert facts["order"]["hpoDraftAfterCommon"] is True
     # 正式结果区在整页中只有一处（不再有重复 id/重复空区）
     assert facts["order"]["formalRunsListCount"] == 1
+
+
+def test_hpo_regions_keep_the_one_to_four_order_in_the_real_dom():
+    """F1.1-A 最终返修 Task 3：区域 1→2→3→4 的 DOM 顺序在真实页面上成立。"""
+    hpo_order = _run("layout_and_defaults")["hpoOrder"]
+    assert hpo_order["everySectionPresent"] is True
+    assert hpo_order["commonBeforeArea"] is True
+    assert hpo_order["draftBeforeProgress"] is True
+    assert hpo_order["areaBeforeSearch"] is True
+    assert hpo_order["searchBeforeBest"] is True
+    assert hpo_order["createBtnBeforeProgress"] is True
+    # 监控宿主仍在最佳结果区域内，重排没有把它挪出正式训练区
+    assert hpo_order["formalMonitorInsideBest"] is True
 
 
 def test_exactly_one_start_action_is_visible_in_every_mode():
@@ -87,8 +407,8 @@ def test_draft_summary_shows_real_data_count_and_budget():
     assert facts["draftDefaults"]["budget"] == "10"
     assert facts["draftDefaults"]["epochs"] == "30"
     assert facts["draftDefaults"]["seed"] == "42"
-    # 绑定只来自受控列表；主界面只给名称，不给任何物理路径
-    assert facts["draftDefaults"]["modelValue"] == "E:/project/yolov8n.pt"
+    # 绑定只来自受控列表；选择值是安全 model_id，主界面只给名称，不给任何物理路径
+    assert facts["draftDefaults"]["modelValue"] == MODEL_ID_MANAGED
     assert facts["modelSummary"] == "模型名称：yolov8n.pt"
     assert facts["datasetSummary"] == "数据集 demo　总图片 230　训练集 184　验证集 46"
     summary = facts["mainSummary"]
@@ -97,6 +417,7 @@ def test_draft_summary_shows_real_data_count_and_budget():
     assert "329" not in summary
     assert "设备 0" in summary        # 服务端给出的设备默认
     assert "试验次数 10" in summary
+    assert "sha256:" not in summary   # 内部身份不进主摘要
     assert "E:/project" not in summary
 
 
@@ -403,12 +724,13 @@ def test_reliable_binding_shows_selectors_directly_with_a_short_summary():
 
 def test_weight_binding_comes_only_from_the_controlled_selector():
     facts = _run("binding_convergence")
-    # 自动绑定后选择器必须就是那个值，不能显示成“请选择”
-    assert facts["reliable"]["modelSelectValue"] == "E:/project/yolov8n.pt"
-    # 选择即绑定：提交值随之改变，摘要只反映名称
-    assert facts["afterSelect"]["selectValue"] == "E:/models/other.pt"
-    assert facts["afterSelect"]["modelSummary"] == "模型名称：other.pt"
-    assert "other.pt" in facts["afterSelect"]["confirm"]
+    # 自动绑定后选择器必须就是那个安全标识，不能显示成“请选择”
+    assert facts["reliable"]["modelSelectValue"] == MODEL_ID_MANAGED
+    # 选择即绑定：提交值是 model_id（绝不是路径），摘要只反映名称
+    assert facts["afterSelect"]["selectValue"] == MODEL_ID_LEGACY
+    assert facts["afterSelect"]["modelSummary"] == "模型名称：yolov8s.pt"
+    assert "yolov8s.pt" in facts["afterSelect"]["confirm"]
+    assert "sha256:" not in facts["afterSelect"]["confirm"]
     # 主界面没有可编辑的路径输入
     assert facts["modelPathExists"] == 0
 
@@ -417,7 +739,7 @@ def test_binding_survives_a_failed_snapshot_or_model_listing():
     facts = _run("binding_survives_a_failed_listing")
     # 列表读取失败不把已绑定的数据/权重退回“未选择”
     assert facts["snapshotValue"] == "d" * 64
-    assert facts["modelSelectValue"] == "E:/project/yolov8n.pt"
+    assert facts["modelSelectValue"] == MODEL_ID_MANAGED
     assert facts["modelSummary"] == "模型名称：yolov8n.pt"
     # 绑定仍然可靠 → 不显示错误提示
     assert facts["noticeHidden"] is True
@@ -431,7 +753,7 @@ def test_missing_or_illegal_binding_explains_without_swapping_data():
     assert facts["modelSelectVisible"] is True
     assert facts["noticeHidden"] is False
     assert "可靠快照绑定" in facts["noticeText"]
-    assert "初始权重不合法" in facts["noticeText"]
+    assert "受控权重库" in facts["noticeText"]
     # 不自动换数据/权重：两个绑定都保持为空
     assert facts["snapshotValue"] == ""
     assert facts["modelValue"] == ""
@@ -721,6 +1043,57 @@ def test_leaving_hpo_mode_restores_the_other_modes_content():
         assert facts["backToHpo"][key]["visible"] is False, key
 
 
+# ── 最终返修 Task 2：HPO 模式不得显示大模型调优结果 ─────────────────
+#
+# 调优进度卡（五阶段 / LLM 日志 / 最佳迭代）此前只由 ``hidden`` 类控制：LLM 调优跑过
+# 一次以后切到 HPO，整块仍然留在页面上。这些断言的是**真实祖先链上的可见性**，
+# 不是文案或 class 字符串。
+
+# 完整日志（#tuningFullLog）是用户手动展开的折叠区，运行前本就隐藏，不参与模式契约。
+_LLM_PROGRESS_REGIONS = ("tuningProgress", "pipeline", "tuningLog", "bestResult")
+
+
+def test_hpo_mode_hides_the_llm_tuning_progress_log_and_best_iteration(tmp_path):
+    facts = _run_page("llm_regions_hidden_in_hpo_mode", tmp_path)
+    # 刷新后直接以 HPO 初始化：残留的 LLM 区域不得闪现
+    for key in _LLM_PROGRESS_REGIONS:
+        assert facts["afterRefresh"][key] is False, key
+    # 选中研究后同样隐藏，而 HPO 自己的创建/进度区域按权威事实可见
+    for key in _LLM_PROGRESS_REGIONS:
+        assert facts["hpoWithStudy"][key] is False, key
+    assert facts["hpoWithStudy"]["hpoCreateDraft"] is True
+    assert facts["hpoWithStudy"]["hpoProgressCard"] is True
+
+
+def test_full_mode_switch_reveals_then_hides_the_llm_regions_again(tmp_path):
+    facts = _run_page("llm_regions_hidden_in_hpo_mode", tmp_path)
+    # full：LLM 区域全部恢复，HPO 专属区域隐藏
+    for key in _LLM_PROGRESS_REGIONS:
+        assert facts["inFullMode"][key] is True, key
+    for key in ("hpoCreateDraft", "hpoProgressCard", "hpoSearchConfig",
+                "hpoBestArea"):
+        assert facts["inFullMode"][key] is False, key
+    # 切回 HPO：即使此前 LLM 区域已移除 hidden、写入日志并生成了最佳迭代，也必须立即整体隐藏
+    for key in _LLM_PROGRESS_REGIONS:
+        assert facts["inHpoMode"][key] is False, key
+    assert facts["inHpoMode"]["hpoCreateDraft"] is True
+    assert facts["inHpoMode"]["hpoProgressCard"] is True
+    # 不得删除 LLM 运行结果：切回 full 仍能恢复显示
+    for key in _LLM_PROGRESS_REGIONS:
+        assert facts["backToFull"][key] is True, key
+
+
+def test_the_shared_monitor_is_never_treated_as_an_llm_region(tmp_path):
+    facts = _run_page("llm_regions_hidden_in_hpo_mode", tmp_path)
+    # 公共正式训练监控在 HPO 模式下仍然可见，并被既有 placeMonitor() 移到正式训练区
+    assert facts["hpoWithStudy"]["monitorVisible"] is True
+    assert facts["inHpoMode"]["monitorVisible"] is True
+    assert facts["monitorHostAfterHpo"] == "hpoFormalMonitorHost"
+    # 同一组唯一 ID：绝不复制节点，也没有第二套 LLM 进度/DOM
+    assert facts["monitorIdCounts"] == [1, 1, 1, 1, 1, 1]
+    assert facts["llmIdCounts"] == [1, 1, 1]
+
+
 # ── 第五轮 Task 1：正式训练“打开结果文件夹” ────────────────────────
 
 _STUDY_A = "hpo_" + "a" * 32
@@ -881,3 +1254,71 @@ def test_server_field_error_in_the_collapsed_area_also_expands_it():
     assert "sampler" in facts["serverSampler"]["errorText"]
     assert facts["serverSampler"]["snapshot"] == facts["before"]["snapshot"]
     assert facts["serverSampler"]["model"] == facts["before"]["model"]
+
+
+# ── F1.1 收尾：创建并开始调优后进度面板必须自动收敛（无需手动刷新）─────
+
+
+def test_create_and_start_converges_the_progress_panel_to_running():
+    """READY 首读早于启动响应时，/start 的 202 必须自己对当前 study_id 再触发一次
+    权威刷新；否则 finishRound 已在 READY 上收敛（无活动控制器 → 不建轮询），页面会
+    停在“准备就绪”，只能靠用户手动刷新整页才看到运行中。"""
+    facts = _run("create_start_converges_to_running")
+    assert facts["createDisabled"] is False
+    # 创建用的是受控草稿：一次点击只发一次创建、一次启动
+    assert facts["createBody"]["study_config"]["sampler"] == "tpe"
+    assert facts["createBody"]["execution_config"]["device"] == "0"
+    assert facts["afterCreate"]["detailQueued"] is True
+    assert facts["afterCreate"]["startQueued"] is True
+    assert facts["afterCreate"]["studyId"] == _STUDY_A
+    # READY 首读先完整结束：没有轮询器，也绝不伪造运行中
+    ready = facts["afterReadyRound"]
+    assert ready["detailReads"] == 1
+    assert ready["timers"] == 0
+    assert ready["startPending"] is True
+    assert ready["progressStatus"] == "准备就绪"
+    assert "RUNNING" not in ready["statusText"]
+    # 启动被服务端接受后，业务代码必须自己发起第二次详情读取（唯一允许的刷新来源）
+    accepted = facts["afterStartAccepted"]
+    assert accepted["detailQueued"] is True
+    assert accepted["detailReads"] == 2
+    assert accepted["timers"] == 0            # 定时器只由权威事实决定，不提前建立
+    assert accepted["create"] == 1
+    assert accepted["start"] == 1
+    # 第二次读取的权威事实（RUNNING）必须被渲染，并建立唯一的轮询器
+    converged = facts["converged"]
+    assert converged["studyId"] == _STUDY_A
+    assert converged["progressVisible"] is True
+    assert converged["progressCardVisible"] is True
+    assert converged["progressStatus"] == "运行中"
+    assert converged["progressCurrent"] == "当前执行：第 1 项"
+    assert converged["progressCounts"] == "0/3"
+    assert converged["rail"] == ["1 运行中", "2 等待", "3 等待"]
+    assert "RUNNING" in converged["statusText"]
+    assert converged["timers"] == 1
+    assert converged["detailReads"] == 2      # 一次 READY 首读 + 一次启动后权威刷新
+    assert converged["create"] == 1 and converged["start"] == 1
+    # 唯一的轮询器确实在轮询当前研究
+    assert converged["afterTick"] == {"detailReads": 3, "timers": 1}
+
+
+def test_start_accepted_while_the_first_read_is_inflight_coalesces_the_refresh():
+    """202 落在在途首读上时必须合并，不得并发第二轮详情读取，也不得丢掉最后一次刷新。"""
+    facts = _run("create_start_coalesces_inflight_refresh")
+    inflight = facts["inflight"]
+    assert inflight["detailReads"] == 1
+    assert inflight["pendingDetail"] == 1     # 没有并发发出第二轮详情读取
+    assert inflight["timers"] == 0
+    # 在途回合结束后，被合并的那一次才补跑：总共恰好两轮，且不并行
+    coalesced = facts["afterCoalescedRound"]
+    assert coalesced["detailReads"] == 2
+    assert coalesced["pendingDetail"] == 1
+    assert coalesced["timers"] == 0
+    assert coalesced["progressStatus"] == "准备就绪"
+    converged = facts["converged"]
+    assert converged["detailReads"] == 2
+    assert converged["progressStatus"] == "运行中"
+    assert converged["progressCurrent"] == "当前执行：第 1 项"
+    assert converged["timers"] == 1
+    assert converged["create"] == 1
+    assert converged["start"] == 1

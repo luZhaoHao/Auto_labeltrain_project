@@ -7,6 +7,7 @@ not bare string-existence checks.
 """
 
 import json
+import os
 import re
 import threading
 import time
@@ -107,6 +108,14 @@ class FakeRunner:
 class Stack:
     def __init__(self, tmp_path, published_root=None, list_models=None):
         self.snapshot, self.model = _make_inputs(tmp_path)
+        # 新建研究只接受受控模型标识：fixture 权重是项目根遗留来源里的一个文件
+        from auto_tune.modules.model_store import ModelStore
+
+        self.store = ModelStore(tmp_path / "models" / "weights",
+                                legacy_roots=[tmp_path],
+                                max_upload_bytes=1024, max_models=50)
+        self.model_id = {row.name: row.model_id
+                         for row in self.store.list_models()}["fixture.pt"]
         self.root = tmp_path / "storage"
         self.service = HpoService(self.root)
         self.runner = FakeRunner()
@@ -129,15 +138,15 @@ class Stack:
                 return Path(snapshot.snapshot_path)
             raise HpoError("HPO_INVALID_CONFIG", "快照不存在或已失效")
 
-        def validate_model(value):
-            path = Path(value)
-            if path.is_file() and path.suffix == ".pt":
-                return str(path.resolve())
-            raise HpoError("HPO_INVALID_CONFIG", "模型文件不存在或不受支持")
+        def resolve_model(model_id):
+            """受控模型标识 -> 冻结路径；只接受 fixture 权重那一个安全标识。"""
+            if model_id == self.model_id:
+                return Path(model).resolve()
+            raise ModelStoreError("MODEL_NOT_FOUND", "未找到该受控权重，请重新选择。")
 
         router = create_hpo_router(
             service=self.service, runner=self.runner, manager=self.manager,
-            resolve_snapshot=resolve_snapshot, validate_model=validate_model,
+            resolve_snapshot=resolve_snapshot, resolve_model=resolve_model,
             assert_training_slot_free=lambda: None,
             list_snapshots=self._list_snapshots,
             list_models=self._list_models)
@@ -148,7 +157,7 @@ class Stack:
     def create(self, **overrides):
         payload = {
             "snapshot_id": self.snapshot.snapshot_id,
-            "model_path": str(self.model),
+            "model_id": self.model_id,
             "study_config": {},
             "execution_config": {},
         }
@@ -324,7 +333,10 @@ _FIELD_CASES = [
     ("timeout", {"execution_config": {"timeout_seconds": 0}}, "timeout_seconds",
      "FIELD_RANGE"),
     ("snapshot", {"snapshot_id": ""}, "snapshot_id", "FIELD_REQUIRED"),
-    ("model", {"model_path": ""}, "model_path", "FIELD_REQUIRED"),
+    ("model", {"model_id": ""}, "model_id", "FIELD_VALUE"),
+    ("model id shape", {"model_id": "yolov8n.pt"}, "model_id", "FIELD_VALUE"),
+    ("model path forbidden", {"model_path": "C:/m/y.pt"}, "model_path",
+     "FIELD_UNKNOWN"),
     ("unknown", {"unknown_field": 1}, "unknown_field", "FIELD_UNKNOWN"),
     ("unknown nested", {"study_config": {"nope": 1}}, "nope", "FIELD_UNKNOWN"),
 ]
@@ -483,6 +495,13 @@ def _defaults(monkeypatch, tmp_path, *, latest=None, config=None,
                         Path(snapshots_root or (tmp_path / "snapshots")))
     if cwd is not None:
         monkeypatch.chdir(cwd)
+    # 受控权重库同样跟随当前工作目录：默认绑定必须按当前受控事实解析
+    from auto_tune.modules.model_store import ModelStore
+
+    base = Path(os.getcwd())
+    monkeypatch.setattr(app_mod, "_MODEL_STORE", ModelStore(
+        base / "models" / "weights", legacy_roots=[base],
+        max_upload_bytes=1 << 20, max_models=50))
     return app_mod.build_hpo_defaults()
 
 
@@ -546,9 +565,12 @@ def test_defaults_pick_the_legal_local_weight_and_never_a_search_best(
                         config={"project": {"model": "yolov8n.pt"}}, cwd=project)
     model = payload["model"]
     assert model["available"] is True
-    assert model["path"] == str((project / "yolov8n.pt").resolve())
+    # 只暴露安全投影：model_id + 显示名，绝不给服务器路径
+    assert model["model_id"].startswith("sha256:")
+    assert model["name"] == "yolov8n.pt"
     assert model["source"] == "project.model"
-    assert "train1" not in model["path"]      # 绝不自动选搜索产物 best.pt
+    assert "path" not in model
+    assert "train1" not in json.dumps(payload)   # 绝不自动选搜索产物 best.pt
 
 
 def test_defaults_fall_back_to_existing_yolov8n_only_when_unconfigured(
@@ -565,8 +587,10 @@ def test_defaults_fall_back_to_existing_yolov8n_only_when_unconfigured(
     empty.mkdir()
     payload = _defaults(monkeypatch, tmp_path, config={}, cwd=empty)
     assert payload["model"]["available"] is False
-    assert payload["model"]["path"] is None
+    assert payload["model"]["model_id"] is None
     assert payload["model"]["reason_code"] == "MODEL_MISSING"
+    # 空库里绝不触发隐式下载：没有任何 .pt 被创建
+    assert sorted(p.name for p in empty.iterdir()) == []
 
 
 def test_defaults_do_not_silently_replace_an_invalid_configured_model(
@@ -580,8 +604,117 @@ def test_defaults_do_not_silently_replace_an_invalid_configured_model(
     model = payload["model"]
     # 已配置但不合法 → 不静默换成 yolov8n.pt，要求用户确认
     assert model["available"] is False
+    assert model["model_id"] is None
     assert model["reason_code"] == "MODEL_CONFIG_INVALID"
-    assert model["path"] is None
+    assert "path" not in model
+
+
+# ── F1.1-A 第二轮复审 Task 2：HPO 默认绑定复用同一套配置名称校验 ────────────
+
+# 旧实现在 app.py 里用 Path(name.strip()).name 维护了第二套“截断后匹配”逻辑，
+# 于是完整路径在目标文件真实存在时会被静默截成 basename 并认作合法默认绑定。
+_CONFIGURED_MODEL_PATH_FORMS = (
+    r"C:\models\yolov8n.pt",
+    r"\\server\share\yolov8n.pt",
+    "/srv/models/yolov8n.pt",
+    "models/weights/yolov8n.pt",
+    r"models\weights\yolov8n.pt",
+    "C:yolov8n.pt",
+    "../yolov8n.pt",
+    " yolov8n.pt ",
+)
+
+
+@pytest.mark.parametrize("configured", _CONFIGURED_MODEL_PATH_FORMS)
+def test_defaults_reject_a_configured_path_even_when_the_target_exists(
+        tmp_path, monkeypatch, configured):
+    """受控库/项目根中真实存在 yolov8n.pt 时，路径形态的配置值仍不得绑定。"""
+    import hashlib
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "yolov8n.pt").write_bytes(b"weights")   # 目标 basename 真实存在
+
+    payload = _defaults(monkeypatch, tmp_path,
+                        config={"project": {"model": configured}}, cwd=project)
+    model = payload["model"]
+    assert model["available"] is False
+    assert model["reason_code"] == "MODEL_CONFIG_INVALID"
+    assert model["model_id"] is None
+    assert model["name"] is None
+    assert model["source"] is None
+    # 绝不静默改绑到同名受控文件上
+    digest = hashlib.sha256(b"weights").hexdigest()
+    assert digest not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("configured", _CONFIGURED_MODEL_PATH_FORMS)
+def test_defaults_training_section_rejects_configured_paths_too(
+        tmp_path, monkeypatch, configured):
+    """training.model 走同一套校验：路径形态同样不能形成默认绑定。"""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "yolov8n.pt").write_bytes(b"weights")
+
+    payload = _defaults(monkeypatch, tmp_path,
+                        config={"training": {"model": configured}}, cwd=project)
+    model = payload["model"]
+    assert model["available"] is False
+    assert model["reason_code"] == "MODEL_CONFIG_INVALID"
+    assert model["model_id"] is None
+
+
+def test_defaults_bind_a_plain_managed_basename(tmp_path, monkeypatch):
+    """合法 basename 继续可用，且受控来源优先、不泄露服务器路径。"""
+    import hashlib
+
+    project = tmp_path / "project"
+    (project / "models" / "weights").mkdir(parents=True)
+    (project / "models" / "weights" / "yolov8n.pt").write_bytes(b"managed")
+    (project / "yolov8n.pt").write_bytes(b"legacy")
+
+    payload = _defaults(monkeypatch, tmp_path,
+                        config={"project": {"model": "yolov8n.pt"}}, cwd=project)
+    model = payload["model"]
+    assert model["available"] is True
+    assert model["reason_code"] == "MODEL_BOUND"
+    assert model["source"] == "project.model"
+    assert model["name"] == "yolov8n.pt"
+    assert model["model_id"] == "sha256:" + hashlib.sha256(b"managed").hexdigest()
+    assert "path" not in model
+    assert str(project) not in json.dumps(payload)
+
+
+def test_defaults_bind_a_plain_legacy_basename(tmp_path, monkeypatch):
+    """项目根遗留权重按纯 basename 继续可绑定。"""
+    import hashlib
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "yolov8s.pt").write_bytes(b"legacy")
+
+    payload = _defaults(monkeypatch, tmp_path,
+                        config={"project": {"model": "yolov8s.pt"}}, cwd=project)
+    model = payload["model"]
+    assert model["available"] is True
+    assert model["reason_code"] == "MODEL_BOUND"
+    assert model["name"] == "yolov8s.pt"
+    assert model["model_id"] == "sha256:" + hashlib.sha256(b"legacy").hexdigest()
+
+
+def test_defaults_missing_basename_still_reports_config_invalid(tmp_path, monkeypatch):
+    """库中不存在的纯 basename 仍是 MODEL_CONFIG_INVALID，绝不联网下载。"""
+    project = tmp_path / "project"
+    project.mkdir()
+
+    payload = _defaults(monkeypatch, tmp_path,
+                        config={"project": {"model": "yolov8x.pt"}}, cwd=project)
+    model = payload["model"]
+    assert model["available"] is False
+    assert model["reason_code"] == "MODEL_CONFIG_INVALID"
+    assert model["model_id"] is None
+    # 绝不触发隐式下载：没有任何 .pt 被创建
+    assert sorted(p.name for p in project.iterdir()) == []
 
 
 def test_defaults_search_conditions_prefer_the_current_training_config(
@@ -841,6 +974,30 @@ def test_template_keeps_a_single_mode_select_and_primary_action():
     assert html.count('<form id="tuningForm">') == 1
 
 
+def test_progress_rail_and_recent_events_are_inside_the_progress_area():
+    """F1.1-A Task 5：状态轨道与最近事件在进度条之下，各自唯一。
+
+    两者都只由服务端持久事实投影重建；页面不新增第二个轮询器或任何图表。
+    """
+    html = _TEMPLATE
+    assert html.count('id="hpoTrialRail"') == 1
+    assert html.count('id="hpoRecentEvents"') == 1
+    progress = html.index('id="hpoProgress"')
+    bar = html.index('id="hpoProgressBar"')
+    rail = html.index('id="hpoTrialRail"')
+    events = html.index('id="hpoRecentEvents"')
+    assert progress < bar < rail < events
+    assert _element(html, "hpoTrialRail").get("aria-label")
+    assert _element(html, "hpoRecentEvents").get("aria-live") == "polite"
+    assert "hpo-trial-rail" in _element(html, "hpoTrialRail")["class"]
+    assert "hpo-recent-events" in _element(html, "hpoRecentEvents")["class"]
+    script = _js()
+    # 每次响应整体重建两处 DOM，不做 append-only 内存队列
+    for fn in ("renderTrialRail", "renderRecentEvents"):
+        assert "function " + fn in script, fn
+        assert fn + "(body." in script, fn
+
+
 def test_hpo_draft_and_frozen_detail_are_distinct_regions():
     html = _TEMPLATE
     assert 'id="hpoCreateDraft"' in html
@@ -1095,8 +1252,9 @@ def test_js_draft_confirmation_shows_the_actual_bindings():
     assert "完整数据快照 ID" in confirm and "初始权重" in confirm
     # 图片口径：background 是 train/val 子集，不重复相加
     assert "背景" in confirm and "子集" in confirm
-    # 主摘要只给名称/短编号，绝不显示物理路径
-    assert "inputs.model_path" in confirm
+    # 主摘要只给名称/短编号，绝不显示物理路径；绑定值是安全 model_id
+    assert "inputs.model_id" in confirm
+    assert "model_path" not in confirm
     assert "path/" not in _region(_TEMPLATE, "hpoCreateConfirm")
     # it is wired to the draft controls
     assert "updateDraftReadouts" in script.split("addEventListener('DOMContentLoaded'", 1)[1]
@@ -1201,6 +1359,7 @@ def test_js_unload_and_mode_switch_never_stop_training():
 
 
 def test_local_models_lists_only_controlled_roots(tmp_path, monkeypatch):
+    from auto_tune.modules.model_store import ModelStore
     from auto_tune.ui import app as app_mod
 
     project = tmp_path / "project"
@@ -1214,33 +1373,395 @@ def test_local_models_lists_only_controlled_roots(tmp_path, monkeypatch):
     (outside / "secret.pt").write_bytes(b"weights")
 
     monkeypatch.chdir(project)
-    monkeypatch.setattr(app_mod, "_hpo_detect_dir", lambda: str(detect))
+    monkeypatch.setattr(app_mod, "_MODEL_STORE", ModelStore(
+        project / "models" / "weights", legacy_roots=[project],
+        max_upload_bytes=1 << 20, max_models=50))
     rows = app_mod.list_local_models()
-    names = {row["name"] for row in rows}
-    assert names == {"yolov8n.pt", "best.pt"}
+    # 只列受控库与项目根遗留 .pt；训练产物 detect/trainN/weights 不再进入初始权重
+    assert {row["name"] for row in rows} == {"yolov8n.pt"}
     for row in rows:
-        assert row["size_mb"] >= 0
-        assert set(row) == {"name", "path", "size_mb", "kind", "origin"}
-        assert "secret" not in row["path"]
-    by_name = {row["name"]: row for row in rows}
-    # 初始权重与训练产物必须可区分，不能全部显示成同一个 best.pt 标签
-    assert by_name["yolov8n.pt"]["kind"] == "initial"
-    assert by_name["best.pt"]["kind"] == "training_artifact"
-    assert "train1" in by_name["best.pt"]["origin"]
-    assert by_name["yolov8n.pt"]["origin"] != by_name["best.pt"]["origin"]
+        assert set(row) == {"model_id", "name", "size_bytes", "sha256",
+                            "origin", "available"}
+        assert row["model_id"].startswith("sha256:")
+        assert "path" not in row            # 绝不下发服务器路径
+    assert rows[0]["origin"] == "legacy"
+    assert rows[0]["available"] is True
+    # 受控目录不存在时不会被创建，遗留根也没有被写入
+    assert sorted(p.name for p in project.iterdir()) == ["detect", "yolov8n.pt"]
+
+
+# ── F1.1-A Task 1：模式表单关联与主操作宿主 ────────────────────────
+#
+# 模式选择器被移到 #tuningForm 之外后必须**显式**关联表单，否则
+# ``new FormData(tuningForm).get('mode')`` 得到 null，/tuning/start 只能按
+# 严格白名单返回 INVALID_MODE。主操作也必须各自回到可见配置区末尾。
+
+_VOID_TAGS = frozenset((
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+))
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:\"[^\"]*\"|[^>\"])*)>")
+_ATTR_RE = re.compile(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*\"([^\"]*)\"")
+
+
+def _markup(html: str) -> str:
+    """模板里只保留标记：脚本/样式正文、HTML 注释与 Jinja 注释都不参与结构。"""
+    html = re.sub(r"<script\b[\s\S]*?</script>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<style\b[\s\S]*?</style>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<!--[\s\S]*?-->", "", html)
+    return re.sub(r"\{#[\s\S]*?#\}", "", html)
+
+
+def _element(html: str, element_id: str) -> dict:
+    """该元素自己那个开标签上的属性（不含子元素、不含祖先）。"""
+    markup = _markup(html)
+    marker = 'id="%s"' % element_id
+    idx = markup.index(marker)
+    match = _TAG_RE.match(markup, markup.rindex("<", 0, idx))
+    assert match is not None, element_id
+    return dict(_ATTR_RE.findall(match.group(3) or ""))
+
+
+def _ancestors_by_id(html: str) -> dict[str, list[str]]:
+    """每个带 id 的元素 -> 其祖先 id 列表（按标记真实嵌套计算）。"""
+    markup = _markup(html)
+    ancestors: dict[str, list[str]] = {}
+    stack: list[str | None] = []
+    for match in _TAG_RE.finditer(markup):
+        closing, tag, attrs = match.group(1), match.group(2).lower(), match.group(3) or ""
+        if closing:
+            if stack:
+                stack.pop()
+            continue
+        attrs_map = dict(_ATTR_RE.findall(attrs))
+        element_id = attrs_map.get("id")
+        if element_id:
+            ancestors[element_id] = [row for row in stack if row]
+        if tag not in _VOID_TAGS and not attrs.rstrip().endswith("/"):
+            stack.append(element_id)
+    return ancestors
+
+
+def _is_descendant(html: str, child_id: str, ancestor_id: str) -> bool:
+    return ancestor_id in _ancestors_by_id(html).get(child_id, [])
+
+
+@pytest.fixture
+def page_html() -> str:
+    return _TEMPLATE
+
+
+# ── F1.1-A 受控权重库界面：zh 页面不得下发英文文案 ─────────────────────
+#
+# 复验事实（真实浏览器 + 服务端渲染的 HTML）：zh 页面里受控权重库新增控件
+# 直接下发英文原文——上传区标签与按钮显示 "Upload Weight File" / "Upload Weight"，
+# 权重选择器占位仍是 "Select a weight from the controlled library"，直接训练的
+# 缺权重提示弹出的也是英文。这些键在本批次新增，且同一按钮在上传完成后会被
+# hpo.js 改写成中文“上传权重”，同一控件前后语言不一致。
+#
+# 这里断言的是**服务端渲染结果**（zh 翻译器 + 真实模板），即 zh 用户实际收到的
+# DOM 文本，不是模板源码字符串。
+
+_RENDER_DEFAULTS = {
+    "active_page": "agent_suggestion",
+    "experiment_history": [],
+    "experiment_history_source": "sqlite",
+    "experiment_index_warning": None,
+    "dataset_index": [],
+    "tuning_history": [],
+    "dataset": None,
+    "training": {"summary": {"total_runs_analyzed": 0}, "runs": {}, "suggestion": None},
+    "project": {},
+    "latest_suggestion": None,
+    "current_args": None,
+    "dataset_analyzer_config": {},
+    "training_config": {},
+    "llm_analysis": None,
+    "vision_analysis": None,
+    "latest_dataset": None,
+    "ai_config": {},
+    "csrf_token": "",
+}
+
+
+def _render_page(lang: str) -> str:
+    """生产同款渲染：真实 single_page.html + 该语言的翻译器。"""
+    from auto_tune.modules.presentation import build_experiment_labels
+    from auto_tune.ui.app import _jinja_env
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator(lang)
+    context = dict(_RENDER_DEFAULTS)
+    context["_"] = translator
+    context["current_lang"] = lang
+    context["experiment_labels"] = build_experiment_labels(translator)
+    return _jinja_env.get_template("single_page.html").render(**context)
+
+
+def _inner_text(html: str, element_id: str, tag: str) -> str:
+    """该元素自身的文本内容（按真实标记定位，不是源码字符串搜索）。"""
+    markup = _markup(html)
+    idx = markup.index('id="%s"' % element_id)
+    body_start = markup.index(">", idx) + 1
+    body_end = markup.index("</%s>" % tag, body_start)
+    text = re.sub(r"<[^>]*>", "", markup[body_start:body_end])
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _first_option_text(html: str, select_id: str) -> str:
+    markup = _markup(html)
+    idx = markup.index('id="%s"' % select_id)
+    body_start = markup.index(">", idx) + 1
+    body_end = markup.index("</select>", body_start)
+    body = markup[body_start:body_end]
+    option_start = body.index("<option")
+    option_end = body.index("</option>", option_start)
+    text = re.sub(r"<[^>]*>", "", body[option_start:option_end])
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_CJK_RE = re.compile(r"[一-鿿]")
+
+
+def test_zh_page_upload_weight_controls_are_not_english():
+    html = _render_page("zh")
+    label = _inner_text(html, "modelUploadBlock", "div")
+    assert "Upload Weight File" not in label, label
+    button = _inner_text(html, "modelUploadBtn", "button")
+    assert "Upload Weight" not in button, button
+    assert _CJK_RE.search(button), button
+
+
+def test_zh_page_weight_select_placeholder_is_not_english():
+    html = _render_page("zh")
+    placeholder = _first_option_text(html, "hpoModelSelect")
+    assert "Select a weight from the controlled library" not in placeholder, placeholder
+    assert _CJK_RE.search(placeholder), placeholder
+
+
+def test_zh_page_direct_training_missing_weight_prompt_is_not_english():
+    html = _render_page("zh")
+    assert "Please select an initial weight from the controlled library." not in html
+    assert "alert('" in html
+    guard = html[html.index("if (!modelId) { alert("):]
+    guard = guard[:guard.index("return; }") + len("return; }")]
+    assert _CJK_RE.search(guard), guard
+
+
+def test_en_page_keeps_the_original_english_weight_controls():
+    html = _render_page("en")
+    assert "Upload Weight File" in _inner_text(html, "modelUploadBlock", "div")
+    assert "Upload Weight" in _inner_text(html, "modelUploadBtn", "button")
+    assert ("Select a weight from the controlled library"
+            in _first_option_text(html, "hpoModelSelect"))
+    assert "Please select an initial weight from the controlled library." in html
+
+
+# ── F1.1-C Task 1：恢复已批准的干运行模式（四模式，顺序冻结）────────
+#
+# 已批准规格 docs/f1_1_a_experience_model_store_spec_20260917.md §5.1 要求
+# ``FormData(tuningForm).get("mode")`` 分别得到 dry_run、keep_params、hpo、full。
+# F1.1-A 末轮把页面改成三模式属未授权回归：本轮只恢复选项与顺序，不重写布局，
+# dry_run / keep_params / full 继续复用唯一的 startTuningBtn，hpo 继续只走
+# hpoCreateAndStartBtn。后端 /tuning/start 的 dry-run 语义由 test_hpo_ui.py 覆盖。
+
+_APPROVED_TUNING_MODES = ["dry_run", "keep_params", "hpo", "full"]
+
+
+def _mode_select_block(html: str) -> str:
+    """模式选择器自身的标记（开标签之后的全部 option），不含任何外部脚本。"""
+    markup = _markup(html)
+    idx = markup.index('id="tuningModeSelect"')
+    body_start = markup.index(">", idx) + 1
+    body_end = markup.index("</select>", body_start)
+    return markup[body_start:body_end]
+
+
+def _mode_options(html: str) -> list[str]:
+    return re.findall(r'<option value="([^"]*)"', _mode_select_block(html))
+
+
+def test_the_page_mode_selector_offers_the_four_approved_modes(page_html):
+    assert _mode_options(page_html) == _APPROVED_TUNING_MODES
+    assert page_html.count('id="tuningModeSelect"') == 1
+
+
+def test_the_dry_run_option_is_a_real_option_not_css_hidden(page_html):
+    """干运行必须是真实可选 DOM：不得只靠 CSS/属性藏起来。"""
+    block = _mode_select_block(page_html)
+    assert 'value="dry_run"' in block
+    # 选项数量与真实面板一致：藏起来的选项会在这里露馅
+    assert len(_mode_options(page_html)) == len(_APPROVED_TUNING_MODES)
+
+
+def test_the_mode_select_keeps_the_frozen_order_as_the_browser_default(page_html):
+    """四个选项都不带 selected 属性：浏览器默认选中顺序中的第一个（dry_run）。"""
+    block = _mode_select_block(page_html)
+    assert re.findall(r'<option value="([^"]*)"[^>]*\bselected\b', block) == []
+    assert _mode_options(page_html)[0] == "dry_run"
+
+
+def test_tuning_mode_is_explicitly_associated_with_the_shared_form(page_html):
+    select = _element(page_html, "tuningModeSelect")
+    assert select["name"] == "mode"
+    assert select["form"] == "tuningForm"
+
+
+def test_primary_action_hosts_are_inside_their_visible_configuration_areas(page_html):
+    assert _is_descendant(page_html, "startTuningBtn", "llmPrimaryActionHost")
+    assert _is_descendant(page_html, "hpoCreateAndStartBtn", "hpoPrimaryActionHost")
+    assert page_html.count('id="startTuningBtn"') == 1
+    assert page_html.count('id="hpoCreateAndStartBtn"') == 1
+    # 宿主本身必须随模式显隐，且两个宿主互斥：同一模式只有一个可见主操作
+    llm_host = _element(page_html, "llmPrimaryActionHost")["class"]
+    hpo_host = _element(page_html, "hpoPrimaryActionHost")["class"]
+    assert "non-hpo-only" in llm_host
+    assert "hpo-only" in hpo_host and "hpo-mode" in hpo_host
+
+
+# ── F1.1-A 最终返修 Task 3：HPO 区域按 1→2→3→4 排列 ──────────────────
+#
+# 区域 1 模式栏与 HPO 摘要（#tuningCommonControlsCard）
+# 区域 2 HPO 创建控制与 HPO 进度（#hpoWorkArea：左创建、右进度）
+# 区域 3 搜索条件与评价方式（#hpoSearchConfig）
+# 区域 4 最佳结果、正式训练与监控（#hpoBestArea）
+#
+# 非 HPO 区块在 HPO 模式下整体隐藏，所以 HPO 页面的**可见**顺序就是 1→2→3→4。
+# 这里断言的是真实标记顺序与唯一 ID：不复制卡片、按钮或监控节点，也不新增第二套
+# 模式切换器/轮询器。
+
+_HPO_PAGE_SECTIONS = ["tuningCommonControlsCard", "hpoWorkArea",
+                      "hpoSearchConfig", "hpoBestArea"]
+_HPO_UNIQUE_IDS = (
+    "tuningCommonControlsCard", "hpoWorkArea", "hpoCreateDraft",
+    "hpoProgressCard", "hpoSearchConfig", "hpoBestArea",
+    "hpoCreateAndStartBtn", "hpoPrimaryActionHost", "llmPrimaryActionHost",
+    "hpoFormalRuns", "hpoFormalRunsList", "hpoFormalMonitorHost",
+    "sharedMonitorBlock", "hpoHistorySection", "hpoHistoryList",
+)
+
+
+def _section_order(html: str) -> list[str]:
+    return sorted(_HPO_PAGE_SECTIONS, key=lambda name: html.index('id="%s"' % name))
+
+
+def test_hpo_sections_are_ordered_one_to_four(page_html):
+    assert _section_order(page_html) == _HPO_PAGE_SECTIONS
+    # 区域 1 的模式栏仍然排在一切可变内容之前
+    assert page_html.index('id="tuningCommonControls"') \
+        < page_html.index('id="tuningModeSelect"')
+
+
+def test_region_two_holds_the_create_controls_before_the_hpo_progress(page_html):
+    assert _is_descendant(page_html, "hpoCreateDraft", "hpoWorkArea")
+    assert _is_descendant(page_html, "hpoProgressCard", "hpoWorkArea")
+    assert page_html.index('id="hpoCreateDraft"') \
+        < page_html.index('id="hpoProgressCard"')
+
+
+def test_the_create_action_stays_at_the_end_of_the_create_configuration(page_html):
+    assert _is_descendant(page_html, "hpoCreateAndStartBtn", "hpoCreateDraft")
+    assert _is_descendant(page_html, "hpoCreateAndStartBtn", "hpoPrimaryActionHost")
+    draft = _region(page_html, "hpoCreateDraft")
+    buttons = re.findall(r'<button[^>]*id="([^"]+)"', draft)
+    assert buttons[-1] == "hpoCreateAndStartBtn", buttons
+    # 创建按钮排在进度卡之前：进度不会跑到创建控制之前
+    assert page_html.index('id="hpoCreateAndStartBtn"') \
+        < page_html.index('id="hpoProgressCard"')
+
+
+def test_search_config_sits_after_region_two_and_before_the_best_area(page_html):
+    area = page_html.index('id="hpoWorkArea"')
+    search = page_html.index('id="hpoSearchConfig"')
+    best = page_html.index('id="hpoBestArea"')
+    assert page_html.index('id="hpoCreateDraft"') < search
+    assert page_html.index('id="hpoProgressCard"') < search
+    assert area < search < best
+    # 三个区域各自独立：搜索条件与最佳结果不在创建/进度容器内部
+    assert not _is_descendant(page_html, "hpoSearchConfig", "hpoWorkArea")
+    assert not _is_descendant(page_html, "hpoBestArea", "hpoWorkArea")
+    # 搜索条件相关错误与提示继续留在搜索条件区域内
+    for element_id in ("hpoSearchDetails", "hpoSearchError", "hpoObjectiveText"):
+        assert _is_descendant(page_html, element_id, "hpoSearchConfig"), element_id
+
+
+def test_best_area_keeps_the_formal_training_and_monitor_regions(page_html):
+    for element_id in ("hpoResultActions", "hpoFormalForm", "hpoFormalRuns",
+                       "hpoFormalRunsList", "hpoFormalMonitorHost"):
+        assert _is_descendant(page_html, element_id, "hpoBestArea"), element_id
+    # 关联正式训练与监控仍排在最佳参数与正式训练表单之后
+    assert page_html.index('id="hpoFormalForm"') \
+        < page_html.index('id="hpoFormalRuns"') \
+        < page_html.index('id="hpoFormalMonitorHost"')
+
+
+def test_every_moved_hpo_node_keeps_a_single_unique_id(page_html):
+    for element_id in _HPO_UNIQUE_IDS:
+        assert page_html.count('id="%s"' % element_id) == 1, element_id
+    # 不得为布局复制第二套选择器/按钮/进度卡/监控宿主/表单
+    assert page_html.count('id="tuningModeSelect"') == 1
+    assert page_html.count('id="startTuningBtn"') == 1
+    assert page_html.count('id="hpoCreateAndStartBtn"') == 1
+    assert page_html.count('id="hpoProgressCard"') == 1
+    assert page_html.count('id="hpoTrialRail"') == 1
+    assert page_html.count('id="hpoRecentEvents"') == 1
+    assert page_html.count('id="hpoFormalMonitorHost"') == 1
+    assert page_html.count('id="sharedMonitorBlock"') == 1
+    assert page_html.count('<form id="tuningForm">') == 1
+
+
+def test_region_two_stacks_create_control_before_progress_on_narrow_screens(page_html):
+    """窄屏契约（class/style，不做像素截图）：区域 2 用既有 .row/.col 布局，
+    768px 以下每个 .col 占满整行，纵向顺序即标记顺序——创建控制在前、进度在后。"""
+    container = _element(page_html, "hpoWorkArea")
+    assert "row" in container["class"].split()
+
+    region = _region(_markup(page_html), "hpoWorkArea")
+    cols = [m.start() for m in re.finditer(r'<div class="col"', region)]
+    assert len(cols) == 2
+    # 第一列是创建控制，第二列才是 HPO 进度
+    assert cols[0] < region.index('id="hpoCreateDraft"') < cols[1]
+    assert region.index('id="hpoProgressCard"') > cols[1]
+
+    style = page_html[page_html.index("<style>"):page_html.index("</style>")]
+    assert re.search(r"\.row\s*\{[^}]*display:\s*flex", style)
+    narrow = style[style.index("@media (max-width: 768px)"):]
+    assert re.search(r"\.col\s*\{[^}]*min-width:\s*100%", narrow), narrow
+
+
+def test_the_rendered_hpo_page_has_no_duplicate_dom_ids():
+    """真实渲染整页后每个 id 只出现一次：重排不得把同一张卡/按钮/监控节点渲染两遍。"""
+    ids: list[str] = []
+    for match in _TAG_RE.finditer(_markup(_render_page("zh"))):
+        if match.group(1):
+            continue
+        element_id = dict(_ATTR_RE.findall(match.group(3) or "")).get("id")
+        if element_id:
+            ids.append(element_id)
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    assert duplicates == []
+    # 区域 1→2→3→4 的主节点确实都在渲染结果里
+    for element_id in ("tuningCommonControlsCard", "tuningModeSelect",
+                       "hpoWorkArea", "hpoCreateDraft", "hpoProgressCard",
+                       "hpoSearchConfig", "hpoBestArea", "hpoFormalRuns",
+                       "hpoFormalMonitorHost", "sharedMonitorBlock"):
+        assert element_id in ids, element_id
 
 
 def test_local_models_route_is_read_only_and_bounded(tmp_path, monkeypatch, stack):
+    from auto_tune.modules.model_store import ModelStore
     from auto_tune.ui import app as app_mod
 
     project = tmp_path / "project"
     project.mkdir(parents=True)
     (project / "yolov8n.pt").write_bytes(b"weights")
     monkeypatch.chdir(project)
-    monkeypatch.setattr(app_mod, "_hpo_detect_dir", lambda: str(tmp_path / "none"))
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "none"), raising=False)
+    monkeypatch.setattr(app_mod, "_MODEL_STORE", ModelStore(
+        project / "models" / "weights", legacy_roots=[project],
+        max_upload_bytes=1 << 20, max_models=50))
 
     stack._list_models = app_mod.list_local_models
     stack.client = stack._client()
@@ -1249,6 +1770,8 @@ def test_local_models_route_is_read_only_and_bounded(tmp_path, monkeypatch, stac
     body = resp.json()
     assert body["count"] == 1
     assert body["models"][0]["name"] == "yolov8n.pt"
-    assert body["models"][0]["kind"] == "initial"
+    assert body["models"][0]["origin"] == "legacy"
+    assert body["models"][0]["model_id"].startswith("sha256:")
+    assert str(project) not in resp.text
     # the listing never mutates anything
     assert sorted(p.name for p in project.iterdir()) == ["yolov8n.pt"]

@@ -39,6 +39,7 @@ from auto_tune.modules.hpo.models import (
     ObjectiveCode,
 )
 from auto_tune.modules.hpo.search_space import evaluation_mode_label
+from auto_tune.modules.model_store import ModelStoreError
 from auto_tune.modules.run_state.manager import TrainingBusyError
 
 from .hpo_controller import HpoController
@@ -320,7 +321,10 @@ class CreateStudyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     snapshot_id: str = Field(min_length=1, max_length=128)
-    model_path: str = Field(min_length=1, max_length=1024)
+    # 新建研究只接受受控模型标识：客户端不得提交任何服务器路径。
+    # HpoService.create_study 冻结规范化路径/字节数/SHA-256，并新增冻结
+    # model_mtime_ns（旧 hpo-study-v1 记录无该字段时为 None，仍按旧契约复核）。
+    model_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     study_config: CreateStudyConfig = Field(default_factory=CreateStudyConfig)
     execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
 
@@ -488,6 +492,106 @@ def _ranking_display(ranked) -> list[dict]:
     ]
 
 
+_TRIAL_STATE_TEXT = {
+    "SUCCESS": "成功",
+    "FAILED": "失败",
+    "CANCELLED": "已取消",
+    "INTERRUPTED": "已中断",
+    "PENDING": "等待",
+}
+
+_STUDY_EVENT_TEXT = {
+    "READY": "研究已就绪，等待启动。",
+    "RUNNING": "研究正在运行。",
+    "PAUSED": "研究已暂停，可恢复。",
+    "INTERRUPTED": "研究已中断，可恢复。",
+    "COMPLETED": "研究已完成。",
+    "BLOCKED": "研究已阻断，需先处理才能继续。",
+    "FAILED": "研究失败。",
+}
+
+
+def _trial_state_projection(study, attempts, budget: int) -> list[dict]:
+    """按预算顺序给出每个槽位的试验状态（纯只读，不写 storage）。
+
+    终态试验保持真实终态；当前未终态 attempt 对应的试验是 ``RUNNING``；
+    已 ask 但还没起跑的试验是 ``PENDING``；预算内尚未创建的槽位是 ``WAITING``。
+    """
+    terminal = {t.number: t.state for t in study.trials if t.state != "PENDING"}
+    pending = {t.number for t in study.trials if t.state == "PENDING"}
+    running = {a.trial_number for a in attempts if a.phase != "FINALIZED"}
+    try:
+        slots = max(int(budget or 0), len(study.trials))
+    except (TypeError, ValueError):
+        slots = len(study.trials)
+    rows: list[dict] = []
+    for number in range(slots):
+        if number in running:
+            state = "RUNNING"
+        elif number in terminal:
+            state = terminal[number]
+        elif number in pending:
+            state = "PENDING"
+        else:
+            state = "WAITING"
+        rows.append({"trial_number": number + 1, "state": state})
+    return rows
+
+
+def _recent_event_projection(study, execution_status: str,
+                             execution_revision: int, attempts,
+                             ranked) -> list[dict]:
+    """最近三条关键事件：只由持久事实确定性重建，ID 不含时间。
+
+    生成顺序固定为 试验终态 → 当前运行试验 → 当前最佳 → 研究终态，
+    再取最后三条。没有事实就不产生事件，绝不伪造“已开始”。
+    """
+    events: list[dict] = []
+    for trial in sorted(study.trials, key=lambda t: t.number):
+        if trial.state == "PENDING":
+            continue
+        events.append({
+            "event_id": f"trial:{trial.number + 1}:{trial.state}",
+            "kind": "trial_finished",
+            "trial_number": trial.number + 1,
+            "state": trial.state,
+            "message": "试验 %d %s。" % (
+                trial.number + 1, _TRIAL_STATE_TEXT.get(trial.state, trial.state)),
+        })
+
+    running = [a for a in attempts if a.phase != "FINALIZED"]
+    if running:
+        number = max(a.trial_number for a in running) + 1
+        events.append({
+            "event_id": f"trial:{number}:RUNNING",
+            "kind": "trial_running",
+            "trial_number": number,
+            "state": "RUNNING",
+            "message": "试验 %d 正在运行。" % number,
+        })
+
+    best = ranked[0] if ranked else None
+    if best is not None and best.result is not None:
+        value = best.result.value
+        events.append({
+            "event_id": f"best:{best.number + 1}:{value}",
+            "kind": "best_updated",
+            "trial_number": best.number + 1,
+            "state": best.state,
+            "message": "当前最佳来自试验 %d（综合分数 %s）。" % (
+                best.number + 1, "—" if value is None else value),
+        })
+
+    events.append({
+        "event_id": f"study:{execution_revision}:{execution_status}",
+        "kind": "study_status",
+        "trial_number": None,
+        "state": execution_status,
+        "message": _STUDY_EVENT_TEXT.get(execution_status, "研究状态已更新。"),
+    })
+    return events[-3:]
+
+
 def _build_status_payload(service, runner, manager, study_id: str) -> dict:
     """Read-only status projection of one study (never starts or finalizes)."""
     study = service.load_study(study_id)
@@ -572,6 +676,11 @@ def _build_status_payload(service, runner, manager, study_id: str) -> dict:
         "seed": study.config.seed,
         "trials": [_trial_display(t) for t in study.trials],
         "ranking": _ranking_display(ranked),
+        # ── 动态进度：按预算排列的试验状态轨道 + 最近三条关键事件 ──
+        "trial_states": _trial_state_projection(
+            study, attempts, study.config.budget),
+        "recent_events": _recent_event_projection(
+            study, execution_status, execution_revision, attempts, ranked),
         "has_success": bool(success),
         "snapshot_id": study.snapshot_binding.snapshot_id,
         "model_display": os.path.basename(study.model_binding.model_path),
@@ -658,14 +767,15 @@ def _best_payload(service, runner, study, ranked) -> dict:
 # ── Router factory ────────────────────────────────────────────────
 
 
-def create_hpo_router(*, service, runner, manager, resolve_snapshot, validate_model,
+def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_model,
                       assert_training_slot_free, list_snapshots=None,
                       list_models=None) -> APIRouter:
     """Build the read-only/control HPO router bound to the given instances.
 
     ``resolve_snapshot(snapshot_id)`` returns the validated published snapshot
-    directory (or raises ``HpoError``); ``validate_model(value)`` returns the
-    validated absolute model path (or raises ``HpoError``). The three HPO roots
+    directory (or raises ``HpoError``); ``resolve_model(model_id)`` returns the
+    frozen absolute initial-weight path behind a controlled model id, or raises
+    ``ModelStoreError`` (the client never sends a path). The three HPO roots
     are frozen inside ``service``/``runner`` at construction time and can never
     be changed by a request.
 
@@ -706,12 +816,18 @@ def create_hpo_router(*, service, runner, manager, resolve_snapshot, validate_mo
             return _bad_request("请求体不是合法的 JSON。")
         try:
             snapshot_dir = resolve_snapshot(payload.snapshot_id)
-            model_path = validate_model(payload.model_path)
+            model_path = resolve_model(payload.model_id)
             study = service.create_study(
                 payload.study_config, snapshot_dir=snapshot_dir, model_path=model_path)
             runner.prepare(study.study_id, payload.execution_config)
         except HpoError as exc:
             return _hpo_error_response(exc)
+        except ModelStoreError as exc:
+            # 受控模型标识无法解析为当前合法文件：稳定错误码，不带路径或异常原文
+            return JSONResponse(
+                {"error_code": exc.code, "error": exc.message,
+                 "field": "model_id", "next_action": _NEXT_ACTION["input"]},
+                status_code=exc.status_code)
         except Exception as exc:  # defensive
             return _hpo_not_found_or_500(exc)
         return JSONResponse(
