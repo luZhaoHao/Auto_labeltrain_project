@@ -413,7 +413,7 @@ def test_manual_http_events_seq_strictly_increasing(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 200
         events = _sse_events(resp.text)
@@ -469,7 +469,7 @@ def test_duplicate_manual_start_409(tmp_path, monkeypatch):
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 409
         assert "RUN_ALREADY_ACTIVE" in resp.text
@@ -1218,7 +1218,7 @@ def test_http_reconnect_replays_real_events_after_completion(tmp_path, monkeypat
     try:
         client = TestClient(app_mod.app)
         resp = client.post("/api/training/start", json={
-            "data_yaml": str(tmp_path / "data.yaml"), "model": "yolov8n.pt", "epochs": 1,
+            "data_yaml": str(tmp_path / "data.yaml"), "epochs": 1,
         })
         assert resp.status_code == 200
         events = _sse_events(resp.text)

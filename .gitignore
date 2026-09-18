@@ -35,6 +35,10 @@ build_output/
 *.zip
 *.pt
 
+# Controlled weight library (F1.1-A): operator-supplied .pt files only.
+# Binary weights are never committed; the directory itself is not tracked.
+models/weights/
+
 # Config with secrets
 auto_tune/config.yaml
 !auto_tune/config.template.yaml
@@ -51,6 +55,9 @@ auto_tune/config.yaml
 /.codex_*.py
 /.codex_doc_review_*/
 /.codex_doc_render_*/
+/.tmp_h1_*.ps1
+/.tmp_h1_render/
+/papper/
 /tmp_detect/
 
 # Environment

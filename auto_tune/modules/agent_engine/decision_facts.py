@@ -19,7 +19,15 @@ import os
 import re
 from typing import Any
 
-from .parameter_registry import PARAMETER_REGISTRY, ParameterSpec
+from .parameter_registry import (
+    FACT_PARAMETER_SPECS,
+    PARAMETER_REGISTRY,
+    ParameterSpec,
+)
+
+# 参考运行 args.yaml 中可进入事实包的参数规格：可调参数 + 只读事实参数（model）。
+# model 只有「事实可引用」资格，没有「可修改」资格。
+_FACT_SPECS: dict[str, ParameterSpec] = {**PARAMETER_REGISTRY, **FACT_PARAMETER_SPECS}
 
 FACT_PACKAGE_SCHEMA_VERSION = "1.0"
 
@@ -33,9 +41,11 @@ TRAINING_ISSUE_TYPES = frozenset({
     "parse_error", "nan_loss", "overfitting", "underfitting", "plateau",
     "low_final_map", "unstable_training", "early_stop_too_soon",
 })
-CURVE_FIELDS = frozenset({"val_box_loss", "val_cls_loss", "mAP50"})
+# 只包含训练报告真会提供的曲线。TrainAnalyzer 仅并入 analyze_loss_curves 的结果，
+# mAP50 指标趋势（analyze_metric_curves）从未进入报告，因此这里不声明它：声明了
+# 就等于允许一个永远缺失的事实存在，并让依赖它的语义规则成为死规则。
+CURVE_FIELDS = frozenset({"val_box_loss", "val_cls_loss"})
 LOSS_TRENDS = frozenset({"plateaued", "descending", "rising"})
-MAP50_TRENDS = frozenset({"saturated", "improving", "degrading"})
 
 # String parameters (currently only ``model``) are reduced to a safe basename.
 _SAFE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
@@ -190,8 +200,7 @@ def _build_reference_run_facts(perception: dict, reference_run: str) -> list[dic
             continue
         if not isinstance(trend, str):
             raise FactPackageError("unknown curve trend")
-        allowed = MAP50_TRENDS if name == "mAP50" else LOSS_TRENDS
-        if trend not in allowed:
+        if trend not in LOSS_TRENDS:
             raise FactPackageError("unknown curve trend")
         _append(facts, f"training.curve.{name}", trend, "training_report")
     return facts
@@ -236,7 +245,7 @@ def build_tuning_fact_package(
             _append(facts, f"training.metrics.{key}", value, "metrics")
 
     for key, value in (base_args or {}).items():
-        spec = PARAMETER_REGISTRY.get(key)
+        spec = _FACT_SPECS.get(key)
         if spec is None:
             continue
         normalized = _normalize_parameter_fact(key, value, spec)

@@ -12,8 +12,8 @@ config = yaml.safe_load(open("auto_tune/config.yaml", encoding="utf-8"))
 project = {
     "name": "请在此填写项目名称",                    # 项目名称
     "description": "请在此填写项目描述",             # 项目描述，如 "PCB 焊点缺陷检测"
-    "detection_target": "缺陷",        # 检测目标，如 "焊点缺陷（虚焊、连锡、少锡）"
-    "data_type": "工业相机拍摄RGB图片",               # 数据类型，如 "工业 X 光图像 / 灰度 BMP"
+    "detection_target": "请在此填写检测目标",        # 检测目标，如 "焊点缺陷（虚焊、连锡、少锡）"
+    "data_type": "请在此填写数据类型",               # 数据类型，如 "工业 X 光图像 / 灰度 BMP"
     "extra": {},                   # 预留扩展字段
 }
 # 合并到 config（若有内容则覆盖 config.yaml 的同名字段）

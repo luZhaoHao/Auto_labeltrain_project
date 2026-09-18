@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 
+# (kind, 展示名, 相对受控 run_dir 的路径)。标准 YOLO Detect 运行把 results.csv /
+# args.yaml 放在 run_dir 根，权重放在 run_dir/weights/ 下；权重不能按根目录文件判断。
 _ARTIFACT_DERIVED_FILES = (
-    ("results_csv", "results.csv"),
-    ("args_yaml", "args.yaml"),
-    ("best_pt", "best.pt"),
-    ("last_pt", "last.pt"),
+    ("results_csv", "results.csv", "results.csv"),
+    ("args_yaml", "args.yaml", "args.yaml"),
+    ("best_pt", "best.pt", os.path.join("weights", "best.pt")),
+    ("last_pt", "last.pt", os.path.join("weights", "last.pt")),
 )
 
 _STORED_KINDS = (
@@ -88,15 +90,15 @@ def build_artifact_manifest(experiment: dict, dataset: dict | None) -> list[dict
             "name": _safe_name(path, fallback),
             "status": _path_state(path),
         })
-    for kind, filename in _ARTIFACT_DERIVED_FILES:
+    for kind, name, relpath in _ARTIFACT_DERIVED_FILES:
         if run_dir:
             manifest.append({
                 "kind": kind,
-                "name": filename,
-                "status": _path_state(os.path.join(run_dir, filename)),
+                "name": name,
+                "status": _path_state(os.path.join(run_dir, relpath)),
             })
         else:
-            manifest.append({"kind": kind, "name": filename, "status": "unregistered"})
+            manifest.append({"kind": kind, "name": name, "status": "unregistered"})
     manifest.append({
         "kind": "manifest",
         "name": "manifest.json",

@@ -270,3 +270,45 @@ def test_llm_real_endpoint_policy_blocks_private(monkeypatch):
         llm_module.call_deepseek("prompt", cfg)
 
     assert "endpoint_rejected" in str(excinfo.value)
+
+
+def _capture_text_payload(monkeypatch):
+    import auto_tune.modules.train_analyzer.llm_analyzer as llm_module
+
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["payload"] = kwargs["json"]
+        return _FakeLLMResponse()
+
+    monkeypatch.setattr(llm_module, "resolve_credential", lambda purpose: "resolved-secret")
+    monkeypatch.setattr(
+        llm_module, "validate_endpoint", lambda e, a: "https://resolved.example/v1"
+    )
+    monkeypatch.setattr(llm_module.requests, "post", fake_post)
+    return llm_module, captured
+
+
+def test_llm_text_analysis_request_has_no_json_response_format(monkeypatch):
+    """普通文本分析输出的是中文诊断正文，不得被强制成 JSON。"""
+    llm_module, captured = _capture_text_payload(monkeypatch)
+
+    llm_module.call_deepseek("prompt", _yaml_key_config())
+
+    assert "response_format" not in captured["payload"]
+
+
+def test_llm_text_analysis_default_model_is_deepseek_flash(monkeypatch):
+    llm_module, captured = _capture_text_payload(monkeypatch)
+
+    llm_module.call_deepseek("prompt", {"llm": {"endpoint": "https://api.deepseek.com/v1/x"}})
+
+    assert captured["payload"]["model"] == "deepseek-flash"
+
+
+def test_llm_text_analysis_configured_model_still_wins(monkeypatch):
+    llm_module, captured = _capture_text_payload(monkeypatch)
+
+    llm_module.call_deepseek("prompt", _yaml_key_config())
+
+    assert captured["payload"]["model"] == "deepseek-v4-flash"

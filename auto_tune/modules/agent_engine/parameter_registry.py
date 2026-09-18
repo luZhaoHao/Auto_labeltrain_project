@@ -1,4 +1,11 @@
-"""Single source of truth for LLM-tunable YOLO training parameters."""
+"""Single source of truth for LLM-tunable YOLO training parameters.
+
+``model`` is deliberately absent: the auto-tuning LLM must never choose a
+weight, it always inherits the reference run's ``args.yaml`` model. The
+reference model still enters the frozen FactPackage as a read-only, sanitized
+fact, so its normalization spec lives in ``FACT_PARAMETER_SPECS`` instead of in
+the tunable registry.
+"""
 
 from dataclasses import dataclass, field
 
@@ -58,6 +65,12 @@ PARAMETER_REGISTRY: dict[str, ParameterSpec] = {
         group="training",
     ),
     "cos_lr": ParameterSpec("bool", "cos_lr"),
+}
+
+# 只读事实规格：参考运行 args.yaml 里已经使用的 ``model`` 会作为事实进入事实包
+# （值经 basename 安全化），但它不是可调参数，因此不进入 PARAMETER_REGISTRY。
+# 大模型调优只能继承该权重，不得在决策中修改它。
+FACT_PARAMETER_SPECS: dict[str, ParameterSpec] = {
     "model": ParameterSpec("string", "model", group="training"),
 }
 

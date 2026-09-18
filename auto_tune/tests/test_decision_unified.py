@@ -127,7 +127,7 @@ def test_parse_failure_retry_fix_succeeds(monkeypatch):
     calls = []
     valid = VALID_JSON
 
-    def fake_call(prompt, config):
+    def fake_call(prompt, config, **kwargs):
         calls.append(prompt)
         if len(calls) == 1:
             return "not valid json at all {{"
@@ -173,7 +173,7 @@ def _tuning_json():
 def test_decide_hyperparameters_also_retries_once(monkeypatch):
     calls = []
 
-    def fake_call(prompt, config):
+    def fake_call(prompt, config, **kwargs):
         calls.append(prompt)
         if len(calls) == 1:
             return "```json\n{oops}"
@@ -190,7 +190,7 @@ def test_decide_hyperparameters_also_retries_once(monkeypatch):
 def test_retry_both_fail_stable_error_no_raw_leak(monkeypatch):
     leaky = "secret-key-sk1234567890 at C:\\Users\\evil\\path not json"
 
-    def fake_call(prompt, config):
+    def fake_call(prompt, config, **kwargs):
         return leaky
 
     monkeypatch.setattr(decision_agent, "call_decision_llm", fake_call)
@@ -208,7 +208,7 @@ def test_retry_schema_failure_after_fix_is_stable(monkeypatch):
     # also fails the strict check. The final error is stable and honest.
     bad = json.dumps({"hyperparameter_changes": {"lr0": 0.002}})
 
-    def fake_call(prompt, config):
+    def fake_call(prompt, config, **kwargs):
         return bad
 
     monkeypatch.setattr(decision_agent, "call_decision_llm", fake_call)
@@ -277,18 +277,13 @@ def test_latest_suggestion_plain_diagnosis_is_not_a_suggestion():
 # ── template rendering: success / keep_params / structured failure ─────────
 
 
-def _render_suggestion_page(latest_suggestion, current_args=None, lang="zh"):
+def _render_suggestion_page(latest_suggestion, current_args=None, lang="zh",
+                            training=None, llm_analysis=None):
     from auto_tune.ui.app import _jinja_env
 
     translator = make_translator(lang)
-    return _jinja_env.get_template("single_page.html").render(
-        _=translator,
-        current_lang=lang,
-        active_page="agent_suggestion",
-        experiment_history=[],
-        tuning_history=[],
-        dataset=None,
-        training={
+    if training is None:
+        training = {
             "summary": {
                 "total_runs_analyzed": 0,
                 "best_mAP50": None,
@@ -298,13 +293,21 @@ def _render_suggestion_page(latest_suggestion, current_args=None, lang="zh"):
             },
             "runs": {},
             "suggestion": None,
-        },
+        }
+    return _jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang=lang,
+        active_page="agent_suggestion",
+        experiment_history=[],
+        tuning_history=[],
+        dataset=None,
+        training=training,
         project={},
         latest_suggestion=latest_suggestion,
         current_args=current_args,
         dataset_analyzer_config={},
         training_config={},
-        llm_analysis=None,
+        llm_analysis=llm_analysis,
         vision_analysis=None,
         latest_dataset=None,
     )
@@ -554,7 +557,7 @@ def test_analyze_folder_uses_strict_parser_not_extract_json(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         decision_agent, "call_decision_llm",
-        lambda prompt, config: json.dumps({"hyperparameter_changes": {"lr0": 0.002}}),
+        lambda prompt, config, **kwargs: json.dumps({"hyperparameter_changes": {"lr0": 0.002}}),
     )
 
     resp = _client().post("/api/training/analyze-folder", json={"path": str(tmp_path / "train")})
@@ -575,7 +578,7 @@ def test_analyze_folder_plain_diagnosis_kept_structured_failure_no_executable(tm
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         decision_agent, "call_decision_llm",
-        lambda prompt, config: json.dumps({"hyperparameter_changes": {"lr0": 0.002}}),
+        lambda prompt, config, **kwargs: json.dumps({"hyperparameter_changes": {"lr0": 0.002}}),
     )
 
     resp = _client().post("/api/training/analyze-folder", json={"path": str(tmp_path / "train")})
@@ -597,7 +600,7 @@ def test_analyze_folder_valid_suggestion_written(tmp_path, monkeypatch):
     _enable_llm(monkeypatch)
     _mock_training_analysis(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda prompt, config: VALID_JSON)
+    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda prompt, config, **k: VALID_JSON)
 
     resp = _client().post("/api/training/analyze-folder", json={"path": str(tmp_path / "train")})
     assert resp.status_code == 200
@@ -637,7 +640,7 @@ def test_legacy_zip_and_folder_analyze_reject_bad_schema_consistently(tmp_path, 
     _mock_training_analysis(monkeypatch)
     monkeypatch.chdir(tmp_path)
     bad = json.dumps({"hyperparameter_changes": {"lr0": 0.002}})
-    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda prompt, config: bad)
+    monkeypatch.setattr(decision_agent, "call_decision_llm", lambda prompt, config, **k: bad)
 
     # folder entry
     _train_dir(tmp_path)
@@ -696,3 +699,263 @@ def test_loop_schema_error_aborts_before_launch(tmp_path, monkeypatch):
     assert launched == []
     assert result["failure"]["error_type"] == "decision_schema_error"
     assert result["failure"]["stage"] == "decision"
+
+
+# ── F1.1: current training report must not be crossed with unrelated history ─
+
+TRAIN64_TRAINING = {
+    "runs": {"train64": {"name": "train64"}},
+    "summary": {"best_overall_run": "train64"},
+    "suggestion": {
+        "diagnosis": "train64 诊断",
+        "action": "调整 train64",
+        "hyperparameter_changes": {
+            "weight_decay": 0.0015,
+            "mixup": 0.1,
+            "lr0": 0.0005,
+        },
+        "training_overrides": {},
+        "error": None,
+    },
+}
+
+UNRELATED_KEEP_PARAMS_HISTORY = [{
+    "train_name": "autotune_9ff8be0f_iter01",
+    "decision": {
+        "diagnosis": "按原有参数训练，不做超参数调整",
+        "action": "keep_params",
+        "hyperparameter_changes": {},
+        "training_overrides": {},
+    },
+}]
+
+
+def test_latest_suggestion_prefers_current_report_over_unrelated_history():
+    result = app_mod._get_latest_suggestion(
+        UNRELATED_KEEP_PARAMS_HISTORY, TRAIN64_TRAINING)
+
+    assert result is not None
+    assert result["diagnosis"] == "train64 诊断"
+    assert result["action"] == "调整 train64"
+    assert result["hyperparameter_changes"] == {
+        "weight_decay": 0.0015, "mixup": 0.1, "lr0": 0.0005,
+    }
+    assert result["action"] != "keep_params"
+
+
+def test_latest_suggestion_history_fallback_requires_run_match():
+    decision = {
+        "diagnosis": "同运行诊断",
+        "action": "降低学习率",
+        "hyperparameter_changes": {"lr0": 0.002},
+        "training_overrides": {},
+    }
+    # Unrelated history must not fill in for a report without its own suggestion.
+    assert app_mod._get_latest_suggestion(
+        UNRELATED_KEEP_PARAMS_HISTORY,
+        {"runs": {"train64": {}}, "suggestion": None},
+    ) is None
+    # A history entry bound to the same run is a valid fallback.
+    matched = [{"train_name": "autotune_same", "decision": decision}]
+    fallback = app_mod._get_latest_suggestion(
+        matched, {"runs": {"autotune_same": {}}, "suggestion": None})
+    assert fallback is not None
+    assert fallback["action"] == decision["action"]
+    assert fallback["hyperparameter_changes"] == {"lr0": 0.002}
+    # Without a training report the legacy "latest history" behaviour stays.
+    assert app_mod._get_latest_suggestion(
+        UNRELATED_KEEP_PARAMS_HISTORY, None) is not None
+
+
+def test_latest_suggestion_scans_history_backwards_for_matching_run():
+    stale = {
+        "diagnosis": "较早的同运行建议",
+        "action": "提高 imgsz",
+        "hyperparameter_changes": {"imgsz": 960},
+        "training_overrides": {},
+    }
+    newer = {
+        "diagnosis": "其他运行的建议",
+        "action": "降低学习率",
+        "hyperparameter_changes": {"lr0": 0.001},
+        "training_overrides": {},
+    }
+    history = [
+        {"train_name": "autotune_same", "decision": stale},
+        {"train_name": "autotune_other", "decision": newer},
+    ]
+    result = app_mod._get_latest_suggestion(
+        history, {"runs": {"autotune_same": {}}, "suggestion": None})
+    assert result is not None
+    assert result["action"] == "提高 imgsz"
+    assert result["hyperparameter_changes"] == {"imgsz": 960}
+
+
+def test_latest_suggestion_report_failure_wins_over_history():
+    training = {
+        "runs": {"train64": {}},
+        "summary": {"best_overall_run": "train64"},
+        "suggestion": {"error": "Suggestion generation failed"},
+    }
+    result = app_mod._get_latest_suggestion(
+        UNRELATED_KEEP_PARAMS_HISTORY, training)
+    assert result is not None
+    assert result["error"] == "Suggestion generation failed"
+    assert result["action"] == ""
+
+
+def test_latest_suggestion_report_keep_params_wins_over_history():
+    training = {
+        "runs": {"train64": {}},
+        "summary": {"best_overall_run": "train64"},
+        "suggestion": {
+            "diagnosis": "指标稳定",
+            "action": "keep_params",
+            "hyperparameter_changes": {},
+            "training_overrides": {},
+            "error": None,
+        },
+    }
+    history = [{
+        "train_name": "autotune_other",
+        "decision": {
+            "diagnosis": "其他运行",
+            "action": "降低学习率",
+            "hyperparameter_changes": {"lr0": 0.002},
+            "training_overrides": {},
+        },
+    }]
+    result = app_mod._get_latest_suggestion(history, training)
+    assert result is not None
+    assert result["action"] == "keep_params"
+    assert result["hyperparameter_changes"] == {}
+
+
+# ── F1.1: blank LLM analysis must not leave a title-only card ──────────────
+
+TRAIN64_STRUCTURED_DIAGNOSIS = "验证损失上升而训练损失下降，出现中度过拟合。"
+
+
+def _train64_training_with_llm(llm_diagnosis="", suggestion_diagnosis=TRAIN64_STRUCTURED_DIAGNOSIS):
+    return {
+        "runs": {"train64": {"name": "train64"}},
+        "summary": {"best_overall_run": "train64"},
+        "llm_analysis": {
+            "train64": {
+                "llm_diagnosis": llm_diagnosis,
+                "model_used": "deepseek-v4-flash",
+                "error": None,
+            },
+        },
+        "suggestion": {
+            "diagnosis": suggestion_diagnosis,
+            "action": "调整正则化和学习率",
+            "hyperparameter_changes": {"weight_decay": 0.0015},
+            "training_overrides": {},
+            "error": None,
+        },
+    }
+
+
+def test_llm_analysis_falls_back_to_same_report_diagnosis():
+    training = _train64_training_with_llm()
+    display = app_mod._get_llm_analysis_display(training)
+    assert display is not None
+    assert display["train64"]["llm_diagnosis"] == TRAIN64_STRUCTURED_DIAGNOSIS
+    assert display["train64"]["model_used"] == "deepseek-v4-flash"
+    # the source report must not be mutated in place
+    assert training["llm_analysis"]["train64"]["llm_diagnosis"] == ""
+
+
+def test_llm_analysis_does_not_cross_runs():
+    training = {
+        "runs": {"train64": {"name": "train64"}, "train65": {"name": "train65"}},
+        "summary": {"best_overall_run": "train64"},
+        "llm_analysis": {
+            "train65": {"llm_diagnosis": "", "model_used": "m", "error": None},
+        },
+        "suggestion": {
+            "diagnosis": TRAIN64_STRUCTURED_DIAGNOSIS,
+            "action": "调整正则化和学习率",
+            "hyperparameter_changes": {"weight_decay": 0.0015},
+            "training_overrides": {},
+            "error": None,
+        },
+    }
+    assert app_mod._get_llm_analysis_display(training) is None
+
+    # An unresolvable multi-run identity must not guess either.
+    ambiguous = dict(training)
+    ambiguous["summary"] = {"best_overall_run": "train99"}
+    assert app_mod._get_llm_analysis_display(ambiguous) is None
+
+
+def test_llm_analysis_blank_or_missing_returns_none():
+    training = _train64_training_with_llm(suggestion_diagnosis="")
+    assert app_mod._get_llm_analysis_display(training) is None
+    assert app_mod._get_llm_analysis_display({"runs": {}, "llm_analysis": {}}) is None
+    assert app_mod._get_llm_analysis_display(None) is None
+
+
+def test_llm_analysis_whitespace_treated_as_empty():
+    training = _train64_training_with_llm(llm_diagnosis="   \n  ")
+    display = app_mod._get_llm_analysis_display(training)
+    assert display is not None
+    assert display["train64"]["llm_diagnosis"] == TRAIN64_STRUCTURED_DIAGNOSIS
+
+
+def test_llm_analysis_keeps_existing_diagnosis():
+    training = _train64_training_with_llm(llm_diagnosis="普通诊断文本")
+    display = app_mod._get_llm_analysis_display(training)
+    assert display["train64"]["llm_diagnosis"] == "普通诊断文本"
+
+
+def test_llm_analysis_error_not_masked_by_suggestion():
+    training = _train64_training_with_llm()
+    training["llm_analysis"]["train64"]["error"] = "LLM request failed"
+    display = app_mod._get_llm_analysis_display(training)
+    assert display is not None
+    assert display["train64"]["error"] == "LLM request failed"
+    assert display["train64"]["llm_diagnosis"] == ""
+    assert TRAIN64_STRUCTURED_DIAGNOSIS not in (display["train64"]["llm_diagnosis"] or "")
+
+
+def test_selected_report_page_shows_bound_diagnosis_and_hides_unrelated_keep_params():
+    training = _train64_training_with_llm()
+    display = app_mod._get_llm_analysis_display(training)
+    latest = app_mod._get_latest_suggestion(UNRELATED_KEEP_PARAMS_HISTORY, training)
+    html = _render_suggestion_page(
+        latest,
+        current_args={"weight_decay": 0.0005, "lr0": 0.01},
+        training=training,
+        llm_analysis=display,
+    )
+    assert "train64" in html
+    assert "deepseek-v4-flash" in html
+    assert TRAIN64_STRUCTURED_DIAGNOSIS in html
+    assert "weight_decay" in html
+    assert "按原有参数训练" not in html
+
+
+def test_blank_analysis_card_not_rendered_when_nothing_to_show():
+    training = _train64_training_with_llm(suggestion_diagnosis="")
+    display = app_mod._get_llm_analysis_display(training)
+    latest = app_mod._get_latest_suggestion([], training)
+    html = _render_suggestion_page(
+        latest, training=training, llm_analysis=display)
+    # The card (and its title span) must be gone; the label string also lives in
+    # an unrelated client-side template, so the card element is the discriminator.
+    assert 'id="llmAnalysisCard"' not in html
+    assert '<span class="card-title" style="border:none; margin:0; padding:0;">' \
+        + make_translator("zh")("LLM Analysis Report") not in html
+
+
+def test_llm_analysis_fallback_text_is_html_escaped():
+    malicious = "<script>alert(1)</script>"
+    training = _train64_training_with_llm(suggestion_diagnosis=malicious)
+    display = app_mod._get_llm_analysis_display(training)
+    latest = app_mod._get_latest_suggestion([], training)
+    html = _render_suggestion_page(
+        latest, training=training, llm_analysis=display)
+    assert malicious not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html

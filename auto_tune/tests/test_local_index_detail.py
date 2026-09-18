@@ -84,8 +84,33 @@ def _make_run_dir(tmp_path, name, files=()):
     run_dir = tmp_path / "detect" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     for fname in files:
-        (run_dir / fname).write_text("x", encoding="utf-8")
+        path = run_dir / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
     return str(run_dir)
+
+
+def _yolo_run_dir(tmp_path, name, *, results_csv=True, args_yaml=True,
+                  best_pt=False, last_pt=False, weights_dir=True):
+    """Standard YOLO Detect run directory (weights live under ``weights/``)."""
+    run_dir = tmp_path / "detect" / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if results_csv:
+        (run_dir / "results.csv").write_text("epoch\n1\n", encoding="utf-8")
+    if args_yaml:
+        (run_dir / "args.yaml").write_text("epochs: 2\n", encoding="utf-8")
+    if best_pt or last_pt or weights_dir:
+        (run_dir / "weights").mkdir(exist_ok=True)
+    if best_pt:
+        (run_dir / "weights" / "best.pt").write_bytes(b"best")
+    if last_pt:
+        (run_dir / "weights" / "last.pt").write_bytes(b"last")
+    return str(run_dir)
+
+
+def _manifest_of(svc, run_id="manual:train1"):
+    detail = svc.get_experiment_detail(run_id)
+    return {a["kind"]: a for a in detail["artifacts"]}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -170,7 +195,8 @@ def test_detail_no_full_path_leak(tmp_path):
 
 def test_detail_artifact_manifest_statuses(tmp_path):
     svc = _service(tmp_path)
-    run_dir = _make_run_dir(tmp_path, "train1", files=("results.csv", "args.yaml", "best.pt"))
+    # 标准 YOLO 目录：results.csv/args.yaml 在根，权重在 weights/ 子目录
+    run_dir = _yolo_run_dir(tmp_path, "train1", best_pt=True)
     report = tmp_path / "log" / "train1_report.json"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text("{}", encoding="utf-8")
@@ -186,6 +212,94 @@ def test_detail_artifact_manifest_statuses(tmp_path):
     assert by_kind["args_yaml"]["status"] == "exists"
     assert by_kind["best_pt"]["status"] == "exists"
     assert by_kind["last_pt"]["status"] == "missing"
+
+
+# ── P2 返修：权重必须从受控 run_dir 的 weights/ 子目录判断 ─────────────
+#
+# 真实 YOLO Detect 运行把权重放在 ``run_dir/weights/``，而 results.csv 与
+# args.yaml 在 ``run_dir`` 根。修复前四项统一按根目录文件判断，导致真实存在
+# 的 best.pt/last.pt 被标为 missing。以下反例用 tmp_path 构造真实目录结构。
+
+
+def test_manifest_finds_weights_under_the_yolo_weights_dir(tmp_path):
+    svc = _service(tmp_path)
+    run_dir = _yolo_run_dir(tmp_path, "train1", best_pt=True, last_pt=True)
+    _seed_experiment(svc, "manual:train1", run_dir=run_dir)
+
+    by_kind = _manifest_of(svc)
+    assert by_kind["results_csv"]["status"] == "exists"
+    assert by_kind["args_yaml"]["status"] == "exists"
+    assert by_kind["best_pt"]["status"] == "exists"
+    assert by_kind["last_pt"]["status"] == "exists"
+    assert by_kind["best_pt"]["name"] == "best.pt"
+    assert by_kind["last_pt"]["name"] == "last.pt"
+
+
+def test_manifest_reports_only_the_missing_weight(tmp_path):
+    svc = _service(tmp_path)
+    run_dir = _yolo_run_dir(tmp_path, "train1", best_pt=True, last_pt=False)
+    _seed_experiment(svc, "manual:train1", run_dir=run_dir)
+
+    by_kind = _manifest_of(svc)
+    assert by_kind["best_pt"]["status"] == "exists"
+    assert by_kind["last_pt"]["status"] == "missing"
+
+
+def test_manifest_reports_both_weights_missing_without_a_weights_dir(tmp_path):
+    svc = _service(tmp_path)
+    run_dir = _yolo_run_dir(tmp_path, "train1", weights_dir=False)
+    _seed_experiment(svc, "manual:train1", run_dir=run_dir)
+
+    by_kind = _manifest_of(svc)
+    assert by_kind["results_csv"]["status"] == "exists"
+    assert by_kind["args_yaml"]["status"] == "exists"
+    assert by_kind["best_pt"]["status"] == "missing"
+    assert by_kind["last_pt"]["status"] == "missing"
+
+
+def test_manifest_keeps_unregistered_without_a_registered_run_dir(tmp_path):
+    svc = _service(tmp_path)
+    _seed_experiment(svc, "manual:train1")
+
+    by_kind = _manifest_of(svc)
+    for kind in ("results_csv", "args_yaml", "best_pt", "last_pt"):
+        assert by_kind[kind]["status"] == "unregistered", kind
+
+
+def test_manifest_weights_error_is_unavailable_and_isolated(tmp_path, monkeypatch):
+    """读取权重失败只影响该项，其他产物状态不被改变。"""
+    svc = _service(tmp_path)
+    run_dir = _yolo_run_dir(tmp_path, "train1", best_pt=True, last_pt=True)
+    _seed_experiment(svc, "manual:train1", run_dir=run_dir)
+    from auto_tune.modules.local_index import detail as detail_mod
+
+    real_exists = os.path.exists
+
+    def fake_exists(path):
+        if os.path.basename(str(path)) in ("best.pt", "last.pt"):
+            raise OSError("permission denied")
+        return real_exists(path)
+
+    monkeypatch.setattr(detail_mod.os.path, "exists", fake_exists)
+    by_kind = _manifest_of(svc)
+    assert by_kind["best_pt"]["status"] == "unavailable"
+    assert by_kind["last_pt"]["status"] == "unavailable"
+    assert by_kind["results_csv"]["status"] == "exists"
+    assert by_kind["args_yaml"]["status"] == "exists"
+
+
+def test_manifest_weight_projection_never_leaks_paths(tmp_path):
+    svc = _service(tmp_path)
+    run_dir = _yolo_run_dir(tmp_path, "train1", best_pt=True, last_pt=True)
+    _seed_experiment(svc, "manual:train1", run_dir=run_dir)
+
+    detail = svc.get_experiment_detail("manual:train1")
+    blob = json.dumps(detail, ensure_ascii=False)
+    assert run_dir not in blob
+    assert str(tmp_path) not in blob
+    assert "weights" not in blob
+    for artifact in detail["artifacts"]:
+        assert set(artifact) == {"kind", "name", "status"}
 
 
 def test_detail_artifact_unregistered(tmp_path):
