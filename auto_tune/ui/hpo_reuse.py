@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from auto_tune.modules.hpo import HpoError, rank_trials
+from auto_tune.modules.hpo import HpoError, rank_trials, require_gpu_device
 from auto_tune.modules.hpo.execution_adapter import FIXED_PARAMS
 from auto_tune.modules.hpo.search_space import validate_candidate
 
@@ -78,6 +78,11 @@ def resolve_hpo_verification(service, runner, study_id, trial_id) -> VerifiedHpo
     effective["imgsz"] = execution.config.imgsz
     effective["device"] = execution.config.device
     effective.update(top.candidate_params)
+
+    # F1.2-C 交付设备约束：正式交付只交付 GPU 训练。历史 CPU 研究仍可读取、
+    # 排名与展示，但重建出的验证训练条件若是 CPU，就在创建任何训练目录、状态、
+    # 控制器或进程之前拒绝（与 HPO 创建/启动/恢复同一个 ``HPO_GPU_REQUIRED``）。
+    require_gpu_device(effective.get("device"))
 
     source_public = {
         "study_id": study_id,

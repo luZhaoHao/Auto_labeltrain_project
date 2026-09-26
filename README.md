@@ -2,7 +2,16 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-当前发布版本：`v0.1`
+> [!IMPORTANT]
+> **最终稳定版本：Auto-Tune Studio `v0.2.0`（2026-09-25）**
+> 本版本已完成 Windows 完全离线安装、Docker NVIDIA GPU 交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
+>
+> - [安装手册（Markdown）](docs/Auto-Tune软件安装手册_20260924.md) · [安装手册（DOCX）](docs/Auto-Tune软件安装手册.docx)
+> - [操作手册（Markdown）](docs/Auto-Tune软件操作手册_20260918.md) · [操作手册（DOCX）](docs/Auto-Tune软件操作手册.docx)
+> - [v0.2.0 发布文件与 SHA-256 清单](docs/release_manifest_0.2.0_20260925.md)
+> - [F1.2 联合验收报告](docs/f1_2_e_joint_acceptance_20260924.md)
+>
+> Windows 安装包和 Docker 镜像归档体积较大，按发布清单单独交付，不提交 GitHub；本仓库保留可审查源码、测试、构建脚本和用户文档。
 
 Auto LabelTrain 是一个面向 YOLO 操作人员的本地 Web 工具。它把数据集质量检查、YOLO 训练、训练结果诊断、LLM 超参数建议、安全护栏、训练审计和实验历史整合在同一套界面中。
 
@@ -13,7 +22,7 @@ Auto LabelTrain 是一个面向 YOLO 操作人员的本地 Web 工具。它把�
 - LLM 建议的超参数是否安全，实际训练使用了什么命令？
 - 普通训练和自动调优的结果能否在同一处比较和追溯？
 
-> 当前已验证环境：Windows、Python 3.10、Ultralytics YOLOv8 detection。Linux、YOLO11/26、其他视觉任务和模型结构自调整仍在后续计划中。
+> 当前正式验证环境：Windows 10/11 完全离线安装，以及 Docker Desktop Linux Engine + NVIDIA GPU；运行时使用 Python 3.10、CUDA 12.1 和 Ultralytics YOLOv8 detection。YOLO11/26、其他视觉任务和模型结构自调整不在本版本范围内。
 
 ## 工作流程
 
@@ -33,19 +42,27 @@ flowchart LR
 
 ## 界面示例
 
-以下截图用于帮助操作人员快速理解核心流程；界面细节可能随版本迭代调整。
+以下截图为 v0.2.0 最终界面演示。更完整的操作步骤和安装截图请查看顶部链接的安装手册与操作手册。
 
-### 数据集选择与质量报告
+### Studio 首页
 
-![数据集选择与质量报告](img/%E4%B8%BB%E7%95%8C%E9%9D%A2.png)
+![Auto-Tune Studio v0.2.0 首页](img/v0.2-01-studio-home.png)
 
-### 训练结果诊断
+### 模型库与 ONNX 导出
 
-![训练结果诊断](img/%E8%BE%93%E5%85%A5%E8%AE%AD%E7%BB%83%E7%BB%93%E6%9E%9C.png)
+![受控模型库与 FP32 ONNX 导出](img/v0.2-02-onnx-export.png)
 
-### 视觉大模型分析
+### HPO 排名与最佳参数
 
-![视觉大模型分析](img/%E8%A7%86%E8%A7%89%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%88%86%E6%9E%90.png)
+![HPO 排名与最佳参数正式训练](img/v0.2-03-hpo-ranking.png)
+
+### LLM 调优建议
+
+![LLM 调优建议与参数变化](img/v0.2-04-llm-tuning.png)
+
+### 统一训练历史
+
+![普通训练与自动调优的统一历史](img/v0.2-05-training-history.png)
 
 ## 当前可用能力
 
@@ -74,6 +91,12 @@ flowchart LR
 - 使用短 epoch 探针决定继续、重试或终止
 - 保存基线、实际参数、训练结果和指标差值
 
+### HPO 与模型交付
+
+- Optuna HPO 研究、试验排名、恢复与最佳参数正式训练
+- HPO 和 LLM 调优均强制使用已探测到的 NVIDIA GPU，不提供 CPU 训练降级
+- 受控模型库与 FP32 ONNX 导出、结构校验和 ONNX Runtime 最小推理
+
 ### 统一训练历史
 
 - 普通训练与自动调优共享同一套训练收尾和 KPI 口径
@@ -84,12 +107,12 @@ flowchart LR
 
 ## 使用前准备
 
-建议配置：
+正式运行要求：
 
-- Windows 10/11
-- Anaconda 或 Miniconda
-- Python 3.10
-- NVIDIA GPU 与可用的 CUDA 环境（推荐；CPU 也可运行，但训练较慢）
+- Windows 10/11 完全离线安装，或可用的 Docker Desktop Linux Engine
+- NVIDIA GPU 与兼容驱动；本版本训练不支持 CPU 降级
+- Windows 用户不需要预装 Anaconda、Miniconda、Python、CUDA Toolkit、Docker 或 WSL
+- Docker 用户需要 Docker Desktop、NVIDIA 驱动及可用的 GPU 容器运行环境
 - 可访问的 YOLO 格式数据集
 - 可选：DeepSeek API Key、Qwen-VL API Key
 
@@ -97,38 +120,45 @@ flowchart LR
 
 ## 安装
 
-### 方式一：Windows 脚本
+### 方式一：Windows 完全离线 ZIP
 
-在项目根目录运行：
-
-```powershell
-.\setup.bat
-```
-
-脚本完成后，可使用：
+获取并解压 `AutoTuneStudio-Setup-0.2.0.zip`，双击：
 
 ```powershell
-.\start_app.bat
+install.bat
 ```
 
-### 方式二：Conda 命令行
+安装完成后，通过桌面快捷方式或安装目录中的以下入口启动：
 
 ```powershell
-conda env create -f environment.yml
-conda activate auto_tune
-python -m auto_tune.main
+start.bat
 ```
+
+安装包包含锁定的私有 Python 3.10 GPU 运行环境和全部依赖，安装过程不访问网络。升级、卸载、数据保留和磁盘要求见[安装手册](docs/Auto-Tune软件安装手册_20260924.md)。
+
+### 方式二：Docker GPU
+
+使用单独交付的镜像归档：
+
+```powershell
+docker load -i AutoTuneStudio-Docker-0.2.0-image.tar
+docker tag auto-tune:0.2.0 auto-tune:local
+docker compose up -d
+```
+
+也可以在源码根目录构建后启动：
+
+```powershell
+docker build --pull=false -t auto-tune:local .
+docker compose up -d
+```
+
+Compose 正式启动会申请 NVIDIA GPU，并把配置、SQLite 索引、数据集、训练结果和权重持久化到宿主机 `docker-data/`（可通过环境变量改到其他目录）。
 
 服务默认地址：
 
 ```text
 http://127.0.0.1:8000/
-```
-
-也可以运行：
-
-```powershell
-python start_server.py
 ```
 
 ## 配置
@@ -309,28 +339,31 @@ python -m pytest auto_tune\tests -q -p no:cacheprovider
 auto_tune/
 ├── main.py                         # 统一入口
 ├── config.template.yaml            # 安全配置模板
+├── delivery/                        # 交付预检与运行时目录契约
 ├── modules/
 │   ├── dataset_analyzer/            # Module A：数据集分析
 │   ├── train_analyzer/              # Module B：训练分析与统一收尾
-│   └── agent_engine/                # Module C：决策、护栏、执行、探针和审计
+│   ├── agent_engine/                # Module C：决策、护栏、执行、探针和审计
+│   ├── hpo/                         # HPO 研究、执行、恢复和排名
+│   └── model_store/                 # 模型库与 ONNX 导出
 ├── ui/
 │   ├── app.py                       # FastAPI 后端
 │   └── templates/single_page.html   # 单页操作界面
 └── tests/                            # 自动化测试
 
-docs/                                # 审查、路线图、规格和实施计划
-start_app.bat                         # Windows 启动脚本
-run_tests.bat                         # Windows 测试脚本
-environment.yml                       # Conda 环境
+docker/                               # Docker 入口和运行依赖锁
+windows/                              # Windows 离线安装、升级和卸载脚本
+docs/                                 # 用户手册、验收、路线图和发布清单
+Dockerfile / compose.yaml             # Docker GPU 交付入口
 ```
 
 ## 当前限制
 
 - 当前为本地、单用户、单机模式。
 - 当前稳定支持 YOLOv8 detection。
-- JSON 文件仍是主要持久化方式，尚未接入数据库。
-- 不支持训练队列、多人隔离、GPU 并发调度或服务重启恢复。
-- Linux 迁移仍在计划中。
+- 当前使用 SQLite 本地索引配合原子 JSON 审计文件；不提供远程数据库服务。
+- 不支持多人隔离、跨主机训练队列或多用户 GPU 调度。
+- Windows 与 Docker Linux 容器已经验收；不提供通用 Linux 主机安装器。
 - YOLO11/26、分类、分割和 OBB 尚未完成全链路验证。
 - 当前 LLM 只调整超参数，不修改模型网络结构。
 
@@ -349,7 +382,9 @@ environment.yml                       # Conda 环境
 - [项目路线规划](docs/roadmap_20260814.md)
 - [后续实施计划](docs/implementation_plan_20260814.md)
 - [当前开发交接记录](docs/development_handoff_20260814.md)
-- [操作工手册](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C_20260821.md)
+- [软件安装手册](docs/Auto-Tune软件安装手册_20260924.md)
+- [软件操作手册](docs/Auto-Tune软件操作手册_20260918.md)
+- [v0.2.0 发布清单](docs/release_manifest_0.2.0_20260925.md)
 
 ## GitHub 安全边界
 

@@ -364,6 +364,12 @@
     <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
     {{ _("History") }}
   </button>
+  {# F1.2-A：受控权重库的独立入口。上传、选择、来源可信确认、ONNX 导出与下载
+     都集中在这一页；直接训练与 HPO 仍保留各自的初始权重选择器，共用同一份列表。 #}
+  <button class="tab {% if active_page == 'model_library' %}active{% endif %}" onclick="switchPage(5)">
+    <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+    {{ _("Model Library") }}
+  </button>
 </div>
 
 {# ─── Page 0: Dashboard ─── #}
@@ -1213,17 +1219,10 @@
               <button type="button" class="btn btn-sm" id="hpoModelSelectBtn" onclick="hpoLoadLocalModels()">{{ _("Reload") }}</button>
             </div>
             <div id="hpoModelSummary" style="font-size:12px; margin-top:4px;"></div>
-            {# 受控权重库的唯一上传入口：单文件控件 + 单按钮，绝不复制出第二份 DOM ID。
-               上传只安全保存 .pt，不反序列化、不执行、不下载；成功后两个选择器
-               （#hpoModelSelect 与直接训练的 #trainModelSelect）一起刷新并选中新权重。 #}
-            <div id="modelUploadBlock" style="margin-top:8px;">
-              <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Upload Weight File") }}</label>
-              <div style="display:flex; gap:6px; align-items:center;">
-                <input type="file" id="modelUploadInput" accept=".pt" style="flex:1; min-width:0; font-size:12px;">
-                <button type="button" class="btn btn-sm" id="modelUploadBtn" onclick="uploadModelFile()">{{ _("Upload Weight") }}</button>
-              </div>
-              <div id="modelUploadStatus" style="font-size:12px; margin-top:4px;"></div>
-            </div>
+            {# 上传与 ONNX 导出的唯一入口已移到独立的“模型库”页（#page5）：
+               本页只保留初始权重选择器，与直接训练的 #trainModelSelect 共用
+               同一份受控权重列表。 #}
+            <div class="text-muted" style="font-size:12px; margin-top:4px;">{{ _("Upload weights and export ONNX in the Model Library page.") }}</div>
           </div>
           <details id="hpoDraftDetails" style="margin-top:10px;">
             <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Advanced Technical Options") }}</summary>
@@ -2003,6 +2002,87 @@
 </div>
 </div>
 
+{# ─── Page 5: Model Library ─── #}
+{# F1.2-A：受控权重库的独立页面。上传、选择、来源可信确认、ONNX 导出状态与
+   下载都在这里；直接训练与 HPO 的初始权重选择器仍在各自流程中，共用同一份
+   受控权重列表（上传成功后一起刷新）。整页只有一份上传控件与一份导出控件。 #}
+<div class="page {% if active_page == 'model_library' %}active{% endif %}" id="page5">
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+  <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("Model Library") }}</div>
+</div>
+
+<div class="row">
+  <div class="col" style="flex: 1;">
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+        <div style="width:32px; height:32px; background:#EFF6FF; border-radius:6px; display:flex; align-items:center; justify-content:center;">
+          <svg viewBox="0 0 24 24" style="width:18px; height:18px; stroke:var(--primary); stroke-width:2; fill:none; stroke-linecap:round; stroke-linejoin:round;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        </div>
+        <div style="flex:1;">
+          <div style="font-weight:600; font-size:14px;">{{ _("Controlled Weight Library") }}</div>
+          <div style="font-size:12px; color:var(--text-secondary);">{{ _("Upload a trusted .pt, select it, confirm its source, then export ONNX.") }}</div>
+        </div>
+      </div>
+
+      {# 受控权重库的唯一上传入口：单文件控件 + 单按钮，绝不复制出第二份 DOM ID。
+         上传只安全保存 .pt，不反序列化、不执行、不下载；成功后模型库、HPO 与
+         直接训练三个选择器一起刷新并选中新权重。 #}
+      <div id="modelUploadBlock">
+        <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Upload Weight File") }}</label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input type="file" id="modelUploadInput" accept=".pt" style="flex:1; min-width:0; font-size:13px;">
+          <button type="button" class="btn btn-sm" id="modelUploadBtn" onclick="uploadModelFile()">{{ _("Upload Weight") }}</button>
+        </div>
+        <div id="modelUploadStatus" style="font-size:12px; margin-top:4px;"></div>
+      </div>
+
+      {# 模型库自己的权重选择器：value 只能是安全 model_id，不提供路径输入 #}
+      <div style="margin-top:14px;">
+        <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Controlled Weight") }}</label>
+        <div style="display:flex; gap:6px;">
+          <select id="libraryModelSelect" style="flex:1; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:13px; font-family:inherit;">
+            <option value="">{{ _("Select a weight from the controlled library") }}</option>
+          </select>
+          <button type="button" class="btn btn-sm" id="libraryModelReloadBtn" onclick="refreshModelLibrary()">{{ _("Reload") }}</button>
+        </div>
+        <div id="libraryModelSummary" style="font-size:12px; margin-top:4px;"></div>
+      </div>
+
+      {# F1.2-A 手动导出 ONNX：导出对象是**当前选中的受控权重**。页面只提供精度
+         选择（默认 FP32，半精度仅在实测通过后出现）与一次显式的“来源可信”
+         确认；不提供路径、输出目录或导出参数输入，目标文件由服务端按权重
+         同目录推导。确认绑定当前 model_id：切换权重即撤销。 #}
+      <div id="modelExportBlock" style="margin-top:14px;">
+        <label style="font-size:12px; font-weight:500; display:block; margin-bottom:3px;">{{ _("Export ONNX") }}</label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button type="button" class="btn btn-sm" id="modelExportBtn" onclick="exportModelOnnx()" disabled>{{ _("Export ONNX") }}</button>
+          <span id="modelExportHint" class="text-muted" style="font-size:12px;"></span>
+        </div>
+        <label style="display:flex; gap:6px; align-items:center; font-size:12px; margin-top:6px;">
+          <input type="checkbox" id="modelExportTrust">
+          <span>{{ _("I confirm this weight comes from a trusted source") }}</span>
+        </label>
+        <details id="modelExportAdvanced" class="hidden" style="margin-top:6px;">
+          <summary style="cursor:pointer; font-size:12px; color:var(--text-secondary);">{{ _("Advanced Export Options") }}</summary>
+          <div style="margin-top:6px;">
+            <label style="font-size:12px;">{{ _("Export Precision") }}</label>
+            <select id="modelExportPrecision" style="width:100%; padding:6px; border:1px solid var(--border); border-radius:6px; font-size:12px;">
+              <option value="fp32">{{ _("FP32 (default)") }}</option>
+              <option value="fp16" id="modelExportFp16Option">{{ _("Half precision (FP16)") }}</option>
+            </select>
+            <div class="text-muted" style="font-size:12px; margin-top:4px;">{{ _("Fixed export settings") }}: imgsz=640 · opset=17 · dynamic=False · simplify=False · nms=False</div>
+          </div>
+        </details>
+        <div id="modelExportStatus" style="font-size:12px; margin-top:4px;"></div>
+        <div id="modelExportDownload" class="hidden" style="font-size:12px; margin-top:4px;">
+          <a id="modelExportDownloadLink" href="#" download>{{ _("Download ONNX") }}</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
 <!-- ── Browse Modal ── -->
 <div id="browseModal" class="modal-overlay" onclick="closeBrowseModal(event)">
   <div class="modal-dialog" onclick="event.stopPropagation()">
@@ -2103,6 +2183,40 @@ window._DATASET_IDS = [
 // (auto_tune.modules.presentation) that future P5 report generators will use.
 window._EXPERIMENT_LABELS = {{ experiment_labels|default({})|tojson }};
 
+// 模型库页（受控权重上传 / 选择 / ONNX 导出与下载）的动态文案：由服务端按当前
+// 语言注入，前端只读这条通道。中文页与英文页看到的是同一套词条，脚本里不再
+// 写死任何中文。每个值都经 tojson 转义（本模板 autoescape=False）。
+window._MODEL_LIBRARY_TEXT = {
+  selectPlaceholder: {{ _("Select a weight from the controlled library")|tojson }},
+  originManaged: {{ _("Weight library")|tojson }},
+  originLegacy: {{ _("Compatibility source")|tojson }},
+  listUnavailable: {{ _("Weight list is temporarily unavailable; keeping the current selection.")|tojson }},
+  pickFileFirst: {{ _("Select a .pt weight file first.")|tojson }},
+  uploadingButton: {{ _("Uploading...")|tojson }},
+  uploadingStatus: {{ _("Uploading the weight...")|tojson }},
+  uploadFailed: {{ _("Upload failed; nothing was saved.")|tojson }},
+  uploadUnknown: {{ _("Upload result unknown; refresh the list and retry.")|tojson }},
+  uploadExists: {{ _("Weight already exists")|tojson }},
+  uploadCreated: {{ _("Uploaded")|tojson }},
+  uploadAutoNamed: {{ _("Saved automatically as")|tojson }},
+  currentWeight: {{ _("Current weight")|tojson }},
+  labelSeparator: {{ _(": ")|tojson }},
+  chosen: {{ _("Chosen")|tojson }},
+  notChosen: {{ _("Not selected")|tojson }},
+  chooseWeightFirst: {{ _("Select a weight from the controlled library first.")|tojson }},
+  readingExportStatus: {{ _("Reading this weight's export status...")|tojson }},
+  exportIncompatible: {{ _("Compatibility-source weights cannot be exported.")|tojson }},
+  exportAlreadyDone: {{ _("This weight already has an ONNX for this precision; download it below.")|tojson }},
+  confirmTrust: {{ _("Please confirm this weight comes from a trusted source first.")|tojson }},
+  exportingButton: {{ _("Exporting...")|tojson }},
+  exportingStatus: {{ _("Exporting ONNX... (the weight is loaded and converted in a controlled subprocess)")|tojson }},
+  exportFailed: {{ _("Export failed; no file was produced.")|tojson }},
+  exportDone: {{ _("Export finished")|tojson }},
+  exportUnknown: {{ _("Export result unknown; refresh this page to confirm whether an ONNX file was produced.")|tojson }},
+  exportStatusUnavailable: {{ _("Export status is temporarily unavailable; please retry later.")|tojson }},
+  downloadPrefix: {{ _("Download ONNX")|tojson }},
+};
+
 function _experimentFieldLabel(key) {
   var labels = (typeof window._EXPERIMENT_LABELS === 'object' && window._EXPERIMENT_LABELS) ? window._EXPERIMENT_LABELS : {};
   var map = labels.fields || {};
@@ -2143,6 +2257,9 @@ function switchPage(idx) {
   // When entering intelligent analysis (page 2), load the recent training
   // shortcut once per page lifecycle.
   if (idx === 2) loadRecentTraining();
+  // Entering the model library (page 5) re-reads the controlled library and the
+  // current weight's export facts from the server (not from a previous page).
+  if (idx === 5 && window.refreshModelLibrary) window.refreshModelLibrary();
 }
 
 // ── S1.5 unified run-state rendering ──

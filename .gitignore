@@ -22,6 +22,9 @@ build/
 /runs/
 /log/
 
+# F1.2-B Docker bind-mount root (runtime config, logs, detection output, weights)
+/docker-data/
+
 # SQLite local index + backups (rebuildable query projection; never committed)
 *.db
 *.db-wal
@@ -34,6 +37,15 @@ build_output/
 *.tar.gz
 *.zip
 *.pt
+
+# Windows offline delivery bundle (F1.2-D): the three core files the operator
+# downloads once (a 2.4 GB wheel cannot live in this repository) and the offline
+# cache prepare_offline_bundle.ps1 builds from them. Both are local build inputs
+# for windows\build_zip.ps1 and never committed; the delivery scripts, the
+# manifest and the locks stay tracked.
+/依赖/
+/offline_cache/
+/windows/offline/
 
 # Controlled weight library (F1.1-A): operator-supplied .pt files only.
 # Binary weights are never committed; the directory itself is not tracked.
@@ -59,6 +71,8 @@ auto_tune/config.yaml
 /.tmp_h1_render/
 /papper/
 /tmp_detect/
+/.superpowers/sdd/
+/文档所需截图/
 
 # Environment
 env/

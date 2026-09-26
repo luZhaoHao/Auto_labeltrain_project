@@ -20,12 +20,14 @@ from .models import (
 from .search_space import search_space_summary, suggest_candidate, validate_candidate
 from .service import HpoService
 from .execution_models import (
+    GPU_REQUIRED_CODE,
     ExecutionAttempt,
     ExecutionConfig,
     ExecutionEnvironment,
     ExecutionRecord,
     ExecutionRoots,
     MetricDiagnostics,
+    require_gpu_device,
 )
 from .metrics import extract_objective, read_objective
 from .ranking import rank_trials
@@ -43,6 +45,8 @@ __all__ = [
     "ModelBinding",
     "SnapshotBinding",
     "HpoError",
+    "GPU_REQUIRED_CODE",
+    "require_gpu_device",
     "ExecutionConfig",
     "ExecutionRecord",
     "ExecutionAttempt",

@@ -89,7 +89,7 @@ def test_hpo_config_defaults_and_ranges():
     assert 'value="16" min="1" max="256"' in html            # batch
     assert 'value="640" min="32" max="2048" step="32"' in html  # imgsz
     assert 'value="3600" min="1" max="86400"' in html        # timeout
-    # 设备是明确选择控件；模板不预置 cpu，选项由服务端探测结果填充
+    # 设备是明确选择控件；模板不预置任何设备值，选项由服务端探测到的 GPU 编号填充
     device_block = html.split('id="hpoDevice"', 1)[0].rsplit("<", 1)[1]
     assert device_block.startswith("select")
     assert 'value="cpu"' not in html.split('id="hpoDevice"', 1)[1].split("</select>", 1)[0]

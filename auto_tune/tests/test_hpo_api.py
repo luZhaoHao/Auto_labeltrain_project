@@ -146,7 +146,8 @@ class FakeRunner:
 
 class Stack:
     def __init__(self, tmp_path, gate=None, snapshot=None, model=None,
-                 list_snapshots=None):
+                 list_snapshots=None, available_gpus=None):
+        self.available_gpus = available_gpus
         if snapshot is None or model is None:
             snapshot, model = _make_inputs(tmp_path)
         self.snapshot, self.model = snapshot, model
@@ -193,7 +194,8 @@ class Stack:
             service=self.service, runner=self.runner, manager=self.manager,
             resolve_snapshot=resolve_snapshot, resolve_model=resolve_model,
             assert_training_slot_free=gate or (lambda: None),
-            list_snapshots=published_snapshots)
+            list_snapshots=published_snapshots,
+            available_gpus=self.available_gpus)
         app = FastAPI()
         app.include_router(router, prefix="/api/hpo")
         return TestClient(app)
@@ -302,6 +304,112 @@ def test_create_rejects_a_client_supplied_model_path(stack):
     assert resp.json()["error_code"] == "INVALID_HPO_FIELD"
     assert resp.json()["field"] == "model_path"
     assert list(stack.root.glob("hpo_*")) == []
+
+
+# ── F1.2-C P1：正式交付只交付 GPU 训练，创建边界拒绝任何 CPU 研究 ─────
+
+
+def _legacy_cpu_study(stack, *, device="cpu"):
+    """绕过创建边界直接写一条旧记录：模型/快照绑定与执行配置都是历史事实。
+
+    旧 ``hpo-execution-v1`` 记录里确实存在 ``device="cpu"``，读取与展示必须
+    继续可用；本 helper 只负责把这条历史事实放到磁盘上。
+    """
+    study = stack.service.create_study(
+        StudyConfig(budget=2, epochs=2),
+        snapshot_dir=Path(stack.snapshot.snapshot_path),
+        model_path=Path(stack.model).resolve())
+    stack.runner.prepare(study.study_id, ExecutionConfig(
+        batch=2, imgsz=64, device=device, timeout_seconds=120))
+    return study.study_id
+
+
+def test_create_rejects_cpu_device_with_the_delivery_error(stack):
+    """服务端创建边界拒绝 ``device="cpu"``：稳定错误码 + 422 + 零副作用。"""
+    resp = stack.create(execution_config={"batch": 4, "imgsz": 64,
+                                          "device": "cpu"})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "HPO_GPU_REQUIRED"
+    assert body["error"] and body["next_action"]
+    # 错误文本只来自固定模板：无路径、无堆栈、无底层异常原文
+    assert str(stack.root) not in resp.text
+    assert "Traceback" not in resp.text
+    # 零副作用：没有研究、没有执行记录、没有启动任何训练
+    assert list(stack.root.glob("hpo_*")) == []
+    assert stack.runner._execs == {}
+    assert stack.runner.run_calls == 0
+
+
+def test_create_accepts_a_probed_gpu_device(tmp_path):
+    """已探测到的 GPU 编号仍可正常创建；登记的就是服务端冻结的执行配置。"""
+    gpu_stack = Stack(tmp_path, available_gpus=lambda: [0])
+    resp = gpu_stack.create(execution_config={"batch": 4, "imgsz": 64,
+                                              "device": "0",
+                                              "timeout_seconds": 60})
+    assert resp.status_code == 201, resp.text
+    record = gpu_stack.runner._get(resp.json()["study_id"])
+    assert record.config.device == "0"
+
+
+def test_create_rejects_a_gpu_index_that_was_never_probed(tmp_path):
+    """机器人式的“合法索引”仍须是本机真实可用的设备，不能只信正则。"""
+    gpu_stack = Stack(tmp_path, available_gpus=lambda: [0])
+    resp = gpu_stack.create(execution_config={"batch": 4, "imgsz": 64,
+                                              "device": "1"})
+    assert resp.status_code == 422
+    assert resp.json()["error_code"] == "HPO_GPU_REQUIRED"
+    assert list(gpu_stack.root.glob("hpo_*")) == []
+    assert gpu_stack.runner._execs == {}
+
+
+def test_create_rejects_every_device_when_the_probe_sees_no_gpu(tmp_path):
+    """没有可用 GPU 时不静默降级到 CPU：任何设备都拒绝，并保持零副作用。"""
+    cpu_stack = Stack(tmp_path, available_gpus=lambda: [])
+    for device in ("0", "cpu"):
+        resp = cpu_stack.create(execution_config={"batch": 4, "imgsz": 64,
+                                                  "device": device})
+        assert resp.status_code == 422, device
+        assert resp.json()["error_code"] == "HPO_GPU_REQUIRED", device
+    assert list(cpu_stack.root.glob("hpo_*")) == []
+
+
+def test_legacy_cpu_study_stays_readable_but_cannot_start_or_resume(stack):
+    """旧 CPU 记录只读展示仍然可用；新建/启动/恢复一律拒绝且不启动训练。"""
+    study_id = _legacy_cpu_study(stack)
+
+    # 只读事实仍然可读：历史 CPU 执行配置照常投影出来
+    status = stack.client.get(f"/api/hpo/studies/{study_id}")
+    assert status.status_code == 200
+    body = status.json()
+    assert body["device"] == "cpu"
+    assert body["execution_status"] == "READY"
+    # 历史研究也照常出现在列表里
+    rows = stack.client.get("/api/hpo/studies?offset=0&limit=10").json()["studies"]
+    assert study_id in {row["study_id"] for row in rows}
+
+    start = stack.client.post(f"/api/hpo/studies/{study_id}/start", json={})
+    assert start.status_code == 422
+    assert start.json()["error_code"] == "HPO_GPU_REQUIRED"
+    assert stack.runner.run_calls == 0
+
+    resume = stack.client.post(f"/api/hpo/studies/{study_id}/resume", json={})
+    assert resume.status_code == 422
+    assert resume.json()["error_code"] == "HPO_GPU_REQUIRED"
+    assert stack.runner.resume_calls == 0
+    # 记录本身没有被改写：仍然停在 READY
+    assert stack.client.get(
+        f"/api/hpo/studies/{study_id}").json()["execution_status"] == "READY"
+
+
+def test_legacy_cpu_study_cannot_be_stopped_into_a_gpu_start(stack):
+    """旧 CPU 研究即使先被停止，也不能借恢复入口启动一次 CPU 训练。"""
+    study_id = _legacy_cpu_study(stack)
+    stack.runner._get(study_id).set("PAUSED", "user_stopped")
+    resume = stack.client.post(f"/api/hpo/studies/{study_id}/resume", json={})
+    assert resume.status_code == 422
+    assert resume.json()["error_code"] == "HPO_GPU_REQUIRED"
+    assert stack.runner.resume_calls == 0
 
 
 def test_create_freezes_the_controlled_weight_identity(stack):

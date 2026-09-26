@@ -79,6 +79,10 @@
     stopPendingAt: 0,
     resumePending: false,     // 恢复请求已提交、等待执行器收敛（页面禁止重复提交）
     uploadPending: false,     // 权重上传进行中：按钮禁用且重复点击只发一次
+    // F1.2-A ONNX 导出：pending 期间不可重复提交；exportState 是当前选中权重的
+    // 服务端只读投影（是否可导出、各精度是否已存在导出、下载入口）
+    exportPending: false,
+    exportState: null,
     watchFormal: false,
     formalRunName: null,
     formalInitialized: false,
@@ -368,6 +372,10 @@
   };
 
   document.addEventListener('DOMContentLoaded', function () {
+    // 上传与导出按钮的常态文案由页面按当前语言渲染：首屏先记住它，
+    // pending 结束后原样恢复，避免把任一语言写死在脚本里。
+    uploadButtonLabel();
+    exportButtonLabel();
     var watch = ['hpoSnapshotSelect', 'hpoSampler', 'hpoEvaluationMode',
                  'hpoBudget', 'hpoEpochs', 'hpoSeed', 'hpoBatch', 'hpoImgsz',
                  'hpoDevice', 'hpoTimeout', 'hpoFormalEpochs'];
@@ -381,6 +389,18 @@
     var modelSelect = $('hpoModelSelect');
     if (modelSelect) {
       modelSelect.addEventListener('change', onModelSelectChanged);
+    }
+    var librarySelect = $('libraryModelSelect');
+    if (librarySelect) {
+      librarySelect.addEventListener('change', onLibraryModelSelectChanged);
+    }
+    var precisionSelect = $('modelExportPrecision');
+    if (precisionSelect) {
+      precisionSelect.addEventListener('change', renderExportControls);
+    }
+    var trustCheckbox = $('modelExportTrust');
+    if (trustCheckbox) {
+      trustCheckbox.addEventListener('change', renderExportControls);
     }
     var sel = $('tuningModeSelect');
     if (sel) window.onTuningModeChange(sel.value);
@@ -577,8 +597,17 @@
     return (value / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
   }
 
+  // 模型库页的词条只来自服务端按当前语言注入的 #_MODEL_LIBRARY_TEXT（见
+  // single_page.html）。脚本里不再写死中文；缺键时如实显示键名，而不是退回中文。
+  function T(key) {
+    var bundle = (typeof window._MODEL_LIBRARY_TEXT === 'object'
+      && window._MODEL_LIBRARY_TEXT) ? window._MODEL_LIBRARY_TEXT : {};
+    var value = bundle[key];
+    return (value == null) ? String(key) : String(value);
+  }
+
   function weightOriginLabel(origin) {
-    return origin === 'legacy' ? '兼容来源' : '权重库';
+    return origin === 'legacy' ? T('originLegacy') : T('originManaged');
   }
 
   function weightOptionText(row) {
@@ -609,27 +638,36 @@
   function loadModelLibrary() {
     var hpoSelect = $('hpoModelSelect');
     var trainSelect = $('trainModelSelect');
+    var librarySelect = $('libraryModelSelect');
     var previousHpo = hpoSelect ? hpoSelect.value : '';
     var previousTrain = trainSelect ? trainSelect.value : '';
+    var previousLibrary = librarySelect ? librarySelect.value : '';
     return api('/api/models', {}).then(function (res) {
       if (!res.ok) {
-        setModelUploadStatus('权重列表暂不可用，已保留当前选择。', true);
+        setModelUploadStatus(T('listUnavailable'), true);
         return null;
       }
       var rows = (res.body && res.body.models) || [];
       if (hpoSelect) {
-        fillWeightSelect(hpoSelect, rows, '请从受控权重库选择权重');
+        fillWeightSelect(hpoSelect, rows, T('selectPlaceholder'));
         if (previousHpo) hpoSelect.value = previousHpo;
       }
       if (trainSelect) {
-        fillWeightSelect(trainSelect, rows, '请从受控权重库选择权重');
+        fillWeightSelect(trainSelect, rows, T('selectPlaceholder'));
         if (previousTrain) trainSelect.value = previousTrain;
+      }
+      if (librarySelect) {
+        fillWeightSelect(librarySelect, rows, T('selectPlaceholder'));
+        if (previousLibrary) librarySelect.value = previousLibrary;
       }
       setModelUploadStatus('');
       renderModelSummary();
+      renderLibrarySummary();
+      // 导出入口始终跟随当前选择：权限、已有导出与精度可用性都由服务端事实决定
+      refreshExportStatus();
       return rows;
     }).catch(function () {
-      setModelUploadStatus('权重列表暂不可用，已保留当前选择。', true);
+      setModelUploadStatus(T('listUnavailable'), true);
       return null;
     });
   }
@@ -652,6 +690,27 @@
     el.style.color = isError ? 'var(--destructive)' : 'var(--text-secondary)';
   }
 
+  // 服务端会把“同名但内容不同”的新权重自动命名保存；此时提示必须显示**实际**
+  // 落盘的文件名，而不是用户选中的那一个。
+  function uploadResultLabel(status, savedName, uploadedName) {
+    if (status === 200) return T('uploadExists');
+    var renamed = !!(savedName && uploadedName
+      && String(savedName) !== String(uploadedName));
+    return renamed ? T('uploadAutoNamed') : T('uploadCreated');
+  }
+
+  var uploadBtnDefaultLabel = null;
+
+  // 上传按钮的常态文案由页面（已按当前语言渲染）提供，脚本只负责在 pending
+  // 结束后原样恢复，不写死任何一种语言。
+  function uploadButtonLabel() {
+    var btn = $('modelUploadBtn');
+    if (uploadBtnDefaultLabel === null && btn) {
+      uploadBtnDefaultLabel = String(btn.textContent || '');
+    }
+    return uploadBtnDefaultLabel || '';
+  }
+
   // 上传只做一件事：把操作人员给的单个 .pt 安全保存进受控目录。
   // pending 期间按钮禁用且重复点击只发一次；失败绝不清空既有合法选项。
   window.uploadModelFile = function () {
@@ -659,41 +718,244 @@
     var input = $('modelUploadInput');
     var file = input && input.files && input.files[0];
     if (!file) {
-      setModelUploadStatus('请先选择要上传的 .pt 权重文件。', true);
+      setModelUploadStatus(T('pickFileFirst'), true);
       return;
     }
     state.uploadPending = true;
     var btn = $('modelUploadBtn');
-    disable(btn, true, '上传中…');
-    setModelUploadStatus('正在上传…', false);
+    disable(btn, true, T('uploadingButton'));
+    setModelUploadStatus(T('uploadingStatus'), false);
     var body = new FormData();
     body.append('file', file, file.name);
     jsonPostMultipart('/api/models/upload', body).then(function (res) {
       if (res.status !== 201 && res.status !== 200) {
-        setModelUploadStatus(errText(res.body) || '上传失败，未保存任何文件。', true);
+        setModelUploadStatus(errText(res.body) || T('uploadFailed'), true);
         return null;
       }
       var model = (res.body && res.body.model) || {};
       return loadModelLibrary().then(function () {
-        // 上传成功即选中新权重（两个选择器保持一致）
+        // 上传成功即选中新权重（模型库、HPO 与直接训练三个选择器保持一致）
         var hpoSelect = $('hpoModelSelect');
         if (hpoSelect && model.model_id) selectOptionByValue(hpoSelect, model.model_id);
         var trainSelect = $('trainModelSelect');
         if (trainSelect && model.model_id) selectOptionByValue(trainSelect, model.model_id);
+        var librarySelect = $('libraryModelSelect');
+        if (librarySelect && model.model_id) {
+          selectOptionByValue(librarySelect, model.model_id);
+        }
+        // 另一个权重需要重新确认来源可信：绝不继承上一个权重的勾选
+        clearTrustConfirmation();
+        state.exportState = null;
         renderModelSummary();
+        renderLibrarySummary();
+        refreshExportStatus();
         updateDraftReadouts();
         setModelUploadStatus(
-          (res.status === 200 ? '权重已存在：' : '已上传：') + (model.name || ''), false);
+          uploadResultLabel(res.status, model.name, file && file.name)
+          + T('labelSeparator') + (model.name || ''), false);
         if (input) input.value = '';
         return model;
       });
     }).catch(function () {
-      setModelUploadStatus('上传结果未知，请刷新列表确认后再重试。', true);
+      setModelUploadStatus(T('uploadUnknown'), true);
       return null;
     }).then(function (model) {
       state.uploadPending = false;
-      disable(btn, false, '上传权重');
+      disable(btn, false, uploadButtonLabel());
       return model;
+    });
+  };
+
+  // ── F1.2-A 手动导出 ONNX ──────────────────────────────────────────
+  //
+  // 导出对象是**当前选中的受控权重**（安全 model_id，绝不是路径）；精度之外的
+  // 固定参数与目标文件由服务端按权重同目录推导。页面只负责：如实显示可用性、
+  // 在用户确认来源可信后发起一次导出、把已落盘的导出作为下载入口。
+  // 导出进行中按钮禁用且重复点击只发一次请求；失败只显示稳定错误码与提示。
+
+  var exportBtnDefaultLabel = null;
+
+  function exportButtonLabel() {
+    var btn = $('modelExportBtn');
+    if (exportBtnDefaultLabel === null && btn) {
+      exportBtnDefaultLabel = String(btn.textContent || '');
+    }
+    return exportBtnDefaultLabel || '';
+  }
+
+  // 导出对象只来自**本页自己的**权重选择器：HPO 与直接训练的初始权重选择
+  // 与 ONNX 导出是两件事，互不驱动。
+  function selectedExportModelId() {
+    var select = $('libraryModelSelect');
+    return String((select && select.value) || '').trim();
+  }
+
+  // 可信来源确认绑定**当前** model_id：切换权重、上传新权重或清空选择都必须
+  // 撤销上一次确认，绝不让另一个权重继承上一个权重的勾选。
+  function clearTrustConfirmation() {
+    var trust = $('modelExportTrust');
+    if (trust && trust.checked) trust.checked = false;
+  }
+
+  function trustConfirmedFor(modelId) {
+    var trust = $('modelExportTrust');
+    return !!(modelId && trust && trust.checked);
+  }
+
+  function renderLibrarySummary() {
+    var select = $('libraryModelSelect');
+    var value = String((select && select.value) || '').trim();
+    setText('libraryModelSummary',
+      T('currentWeight') + T('labelSeparator') +
+      (value ? (selectedOptionText(select) || T('chosen')) : T('notChosen')));
+  }
+
+  function onLibraryModelSelectChanged() {
+    // 换一个权重就是换一个对象：撤销确认并丢弃上一个权重的导出状态
+    clearTrustConfirmation();
+    state.exportState = null;
+    renderLibrarySummary();
+    refreshExportStatus();
+  }
+
+  function exportPrecision() {
+    var select = $('modelExportPrecision');
+    return String((select && select.value) || '') === 'fp16' ? 'fp16' : 'fp32';
+  }
+
+  function setExportStatus(text, isError) {
+    var el = $('modelExportStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = isError ? 'var(--destructive)' : 'var(--text-secondary)';
+  }
+
+  function currentExportInfo() {
+    var exports = (state.exportState && state.exportState.exports) || {};
+    return exports[exportPrecision()] || null;
+  }
+
+  function renderExportDownload() {
+    var host = $('modelExportDownload');
+    var link = $('modelExportDownloadLink');
+    if (!host || !link) return;
+    var info = currentExportInfo();
+    if (!info || !info.download_url) {
+      setHidden(host, true);
+      link.removeAttribute('href');
+      return;
+    }
+    link.setAttribute('href', String(info.download_url));
+    link.setAttribute('download', String(info.name || ''));
+    link.textContent = T('downloadPrefix') + ' · ' + String(info.name || '');
+    setHidden(host, false);
+  }
+
+  // 半精度只有服务端实测通过后才出现；未通过时整块高级选项都不显示，
+  // 精度也强制回到 FP32（绝不提交一个服务端已停用的选项）。
+  function renderExportPrecision() {
+    var available = !!(state.exportState && state.exportState.fp16_available);
+    setHidden($('modelExportAdvanced'), !available);
+    setHidden($('modelExportFp16Option'), !available);
+    var select = $('modelExportPrecision');
+    if (select && !available) select.value = 'fp32';
+  }
+
+  function exportBlockedReason() {
+    var modelId = selectedExportModelId();
+    if (!modelId) return T('chooseWeightFirst');
+    if (!state.exportState || state.exportState.model_id !== modelId) {
+      return T('readingExportStatus');
+    }
+    if (!state.exportState.exportable) return T('exportIncompatible');
+    if (currentExportInfo()) return T('exportAlreadyDone');
+    if (!trustConfirmedFor(modelId)) return T('confirmTrust');
+    return '';
+  }
+
+  function renderExportControls() {
+    var btn = $('modelExportBtn');
+    if (!btn) return;
+    var reason = exportBlockedReason();
+    var pending = !!state.exportPending;
+    disable(btn, pending || !!reason,
+      pending ? T('exportingButton') : exportButtonLabel());
+    setText('modelExportHint', pending ? '' : reason);
+    renderExportPrecision();
+    renderExportDownload();
+  }
+
+  function refreshExportStatus(opts) {
+    var keepStatus = !!(opts && opts.keepStatus);
+    var modelId = selectedExportModelId();
+    if (!modelId) {
+      state.exportState = null;
+      renderExportControls();
+      return Promise.resolve(null);
+    }
+    return api('/api/models/export?model_id=' + encodeURIComponent(modelId), {})
+      .then(function (res) {
+        // 迟到的响应无权改写当前选择（与权重列表同样的收敛规则）
+        if (selectedExportModelId() !== modelId) return null;
+        if (!res.ok) {
+          state.exportState = null;
+          setExportStatus(T('exportStatusUnavailable'), true);
+          renderExportControls();
+          return null;
+        }
+        state.exportState = res.body || null;
+        // 刚完成的导出必须继续显示完成提示；只有普通刷新才清掉上一次的提示
+        if (!keepStatus) setExportStatus('');
+        renderExportControls();
+        return state.exportState;
+      })
+      .catch(function () {
+        if (selectedExportModelId() !== modelId) return null;
+        state.exportState = null;
+        renderExportControls();
+        return null;
+      });
+  }
+  window.refreshExportStatus = refreshExportStatus;
+
+  window.exportModelOnnx = function () {
+    if (state.exportPending) return;
+    var modelId = selectedExportModelId();
+    var reason = exportBlockedReason();
+    if (reason) {
+      setExportStatus(reason, true);
+      return;
+    }
+    var precision = exportPrecision();
+    state.exportPending = true;
+    renderExportControls();
+    setExportStatus(T('exportingStatus'), false);
+    var headers = { 'Content-Type': 'application/json' };
+    if (window._CSRF_TOKEN) headers['X-CSRF-Token'] = window._CSRF_TOKEN;
+    api('/api/models/export', {
+      method: 'POST',
+      headers: headers,
+      // 确认值随请求显式提交；服务端只接受明确的 true，缺失即拒绝
+      body: JSON.stringify({ model_id: modelId, precision: precision,
+                             source_trusted: trustConfirmedFor(modelId) })
+    }).then(function (res) {
+      if (res.status !== 201 && res.status !== 200) {
+        setExportStatus(errText(res.body) || T('exportFailed'), true);
+        return null;
+      }
+      var info = (res.body && res.body.export) || {};
+      var size = formatWeightBytes(info.size_bytes);
+      setExportStatus(T('exportDone') + T('labelSeparator') + String(info.name || '') +
+        (size ? ' (' + size + ')' : ''), false);
+      // 以磁盘事实刷新可用性与下载入口，而不是只依赖这次响应
+      return refreshExportStatus({ keepStatus: true });
+    }).catch(function () {
+      setExportStatus(T('exportUnknown'), true);
+      return null;
+    }).then(function () {
+      state.exportPending = false;
+      renderExportControls();
+      return null;
     });
   };
 
@@ -752,9 +1014,9 @@
   window.hpoLoadDefaults = function () {
     return api('/api/hpo/defaults', {}).then(function (res) {
       if (!res.ok || !res.body || !res.body.search) {
-        // 读取失败绝不静默启用 CPU 创建：给出可见、可操作的错误并保持不可创建
+        // 读取失败绝不静默改用任何设备：给出可见、可操作的错误并保持不可创建
         state.defaultsLoaded = false;
-        state.defaultsError = '读取服务端默认配置失败：请检查服务端状态后重新进入本模式重试（未使用 CPU 代替）。';
+        state.defaultsError = '读取服务端默认配置失败：请检查服务端状态后重新进入本模式重试（不会使用 CPU 代替）。';
         updateDraftReadouts();
         return null;
       }
@@ -766,13 +1028,14 @@
       return res.body;
     }).catch(function () {
       state.defaultsLoaded = false;
-      state.defaultsError = '读取服务端默认配置失败：网络暂不可用，请稍后重试（未使用 CPU 代替）。';
+      state.defaultsError = '读取服务端默认配置失败：网络暂不可用，请稍后重试（不会使用 CPU 代替）。';
       updateDraftReadouts();
       return null;
     });
   };
 
-  // 设备选择器：只列服务端已探测到的 GPU 编号与 CPU，绝不接受自由文本。
+  // 设备选择器：只列服务端已探测到的 GPU 编号（正式交付只交付 GPU 训练，
+  // 没有 CPU 选项），绝不接受自由文本，也绝不补造探测结果里没有的编号。
   function renderDeviceOptions(devices, fallback) {
     var select = $('hpoDevice');
     if (!select) return;
@@ -783,7 +1046,6 @@
       var index = gpus[i];
       select.appendChild(option(String(index), 'GPU ' + index));
     }
-    select.appendChild(option('cpu', 'CPU'));
     // 已经选定的值优先（用户选择不被覆盖）；否则用服务端权威默认
     var wanted = current || ((devices && devices.default) || fallback || '');
     if (wanted) selectOptionByValue(select, String(wanted));
@@ -958,7 +1220,8 @@
       return reasons;
     }
     if (!inputs.device) {
-      reasons.push('计算设备未就绪：请在“计算设备”中选择一个 GPU 编号或 CPU。');
+      reasons.push('计算设备未就绪：请在“计算设备”中选择一个已探测到的 GPU 编号'
+        + '（本版本只交付 GPU 训练，不提供 CPU）。');
     }
     if (!inputs.snapshot_id) {
       reasons.push(dataset.reason_code === 'NO_REGISTERED_DATASET'
@@ -1027,8 +1290,8 @@
       (imgsz.value != null && imgsz.value % 32 !== 0
         ? { field: '图像尺寸', message: '图像尺寸必须是 32 的整数倍。' } : null) ||
       rangeError('单试验超时（秒）', timeout, 1, 86400) ||
-      (!/^(cpu|[0-9]|[1-5][0-9]|6[0-3])$/.test(device)
-        ? { field: '计算设备', message: '计算设备必须是 cpu 或单个 GPU 编号 0..63。' } : null);
+      (!/^([0-9]|[1-5][0-9]|6[0-3])$/.test(device)
+        ? { field: '计算设备', message: '计算设备必须是已探测到的单个 GPU 编号 0..63（本版本不提供 CPU 训练）。' } : null);
   }
 
   function showFieldError(fieldError, targetId) {

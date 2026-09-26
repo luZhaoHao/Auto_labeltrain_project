@@ -702,7 +702,62 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # F1.1-A 受控权重库：上传入口、权重占位与缺省提示统一中文
         "Upload Weight File": "上传权重文件",
         "Upload Weight": "上传权重",
+        # F1.2-A 手动导出 ONNX
+        "Export ONNX": "导出 ONNX",
+        "I confirm this weight comes from a trusted source": "我确认该权重来源可信",
+        "Advanced Export Options": "导出高级选项",
+        "Export Precision": "导出精度",
+        "FP32 (default)": "FP32（默认）",
+        "Half precision (FP16)": "半精度（FP16）",
+        "Fixed export settings": "固定导出参数",
+        "Download ONNX": "下载 ONNX",
         "Select a weight from the controlled library": "请从受控权重库选择权重",
+        # 模型库页的动态文案（模板经 window._MODEL_LIBRARY_TEXT 注入）
+        "Weight library": "权重库",
+        "Compatibility source": "兼容来源",
+        "Weight list is temporarily unavailable; keeping the current selection.":
+            "权重列表暂不可用，已保留当前选择。",
+        "Select a .pt weight file first.": "请先选择要上传的 .pt 权重文件。",
+        "Uploading...": "上传中…",
+        "Uploading the weight...": "正在上传…",
+        "Upload failed; nothing was saved.": "上传失败，未保存任何文件。",
+        "Upload result unknown; refresh the list and retry.":
+            "上传结果未知，请刷新列表确认后再重试。",
+        "Weight already exists": "权重已存在",
+        "Uploaded": "已上传",
+        # 同名不同内容时新权重会被自动命名保存，提示显示实际文件名
+        "Saved automatically as": "已自动保存为",
+        "Current weight": "当前权重",
+        # 标签与值之间的分隔符：中文用全角冒号+空格，英文沿用键本身（半角冒号+空格）
+        ": ": "：",
+        "Chosen": "已选择",
+        "Not selected": "未选择",
+        "Select a weight from the controlled library first.":
+            "请先从受控权重库选择权重。",
+        "Reading this weight's export status...": "正在读取该权重的导出状态…",
+        "Compatibility-source weights cannot be exported.":
+            "兼容来源的权重不支持导出。",
+        "This weight already has an ONNX for this precision; download it below.":
+            "该权重已有同精度 ONNX，可直接下载。",
+        "Please confirm this weight comes from a trusted source first.":
+            "请先确认该权重来源可信。",
+        "Exporting...": "导出中…",
+        "Exporting ONNX... (the weight is loaded and converted in a controlled subprocess)":
+            "正在导出 ONNX…（权重加载与转换在受控子进程中进行）",
+        "Export failed; no file was produced.": "导出失败，未生成任何文件。",
+        "Export finished": "导出完成",
+        "Export result unknown; refresh this page to confirm whether an ONNX file was produced.":
+            "导出结果未知，请刷新本页后确认该权重是否已生成 ONNX。",
+        "Export status is temporarily unavailable; please retry later.":
+            "导出状态暂不可用，请稍后重试。",
+        # F1.2-A 返修：独立的“模型库”页（顶部导航第六项）
+        "Model Library": "模型库",
+        "Controlled Weight Library": "受控权重库",
+        "Controlled Weight": "受控权重",
+        "Upload a trusted .pt, select it, confirm its source, then export ONNX.":
+            "上传来源可信的 .pt，选择权重，确认来源可信后导出 ONNX。",
+        "Upload weights and export ONNX in the Model Library page.":
+            "上传权重与导出 ONNX 请在“模型库”页面进行。",
         "Please select an initial weight from the controlled library.":
             "请先从受控权重库选择初始权重。",
         "Trial Count (includes failed/cancelled slots)":

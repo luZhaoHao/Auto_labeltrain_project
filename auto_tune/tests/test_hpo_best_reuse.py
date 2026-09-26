@@ -56,7 +56,7 @@ def _make_inputs(tmp_path):
 class Source:
     """Real HPO source study with deterministic SUCCESS trials."""
 
-    def __init__(self, tmp_path, values=(0.5, 0.9)):
+    def __init__(self, tmp_path, values=(0.5, 0.9), device="0"):
         self.snapshot, self.model = _make_inputs(tmp_path)
         self.root = tmp_path / "storage"
         self.service = HpoService(self.root)
@@ -65,7 +65,7 @@ class Source:
             model_path=self.model)
         self.runner = HpoRunner(self.root, tmp_path / "out", tmp_path / "log")
         self.runner.prepare(self.study.study_id,
-                            ExecutionConfig(batch=4, imgsz=64, device="cpu",
+                            ExecutionConfig(batch=4, imgsz=64, device=device,
                                             timeout_seconds=120))
         for value in values:
             trial = self.service.ask(self.study.study_id, request_id=_rid())
@@ -173,7 +173,7 @@ def test_reuse_builds_command_from_authoritative_params(tmp_path, monkeypatch, s
     assert "seed=42" in cmd
     assert "batch=4" in cmd
     assert "imgsz=64" in cmd
-    assert "device=cpu" in cmd
+    assert "device=0" in cmd
     assert "task=detect" in cmd and "workers=0" in cmd
 
     # args.yaml mirrors the same effective config
@@ -184,7 +184,7 @@ def test_reuse_builds_command_from_authoritative_params(tmp_path, monkeypatch, s
     for key in _SEARCH_KEYS:
         assert args[key] == top_params[key]
     assert args["model"] == study.model_binding.model_path
-    assert args["batch"] == 4 and args["imgsz"] == 64 and args["device"] == "cpu"
+    assert args["batch"] == 4 and args["imgsz"] == 64 and args["device"] == "0"
 
     # source metadata recorded in the run dir
     src_meta = json.loads(
@@ -193,6 +193,40 @@ def test_reuse_builds_command_from_authoritative_params(tmp_path, monkeypatch, s
     assert src_meta["trial_id"] == source.top.trial_id
 
     # HPO facts untouched
+    assert (source.root / source.study_id / "study.json").read_bytes() == study_before
+    assert (source.root / source.study_id / "execution.json").read_bytes() == exec_before
+
+
+def test_legacy_cpu_source_is_readable_but_cannot_start(tmp_path, monkeypatch):
+    """F1.2-C：历史 COMPLETED CPU 研究仍只读可用，但不得据此启动正式训练。"""
+    from auto_tune.modules.hpo import rank_trials
+
+    source = Source(tmp_path, device="cpu")        # 历史 CPU 研究的执行事实
+    app_mod, launched = _patch_app(monkeypatch, tmp_path, source)
+    study_before = (source.root / source.study_id / "study.json").read_bytes()
+    exec_before = (source.root / source.study_id / "execution.json").read_bytes()
+
+    resp = _post(app_mod, {"source_hpo": {
+        "study_id": source.study_id, "trial_id": source.top.trial_id}})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "HPO_GPU_REQUIRED"
+    assert set(body) == {"error_code", "error", "next_action"}
+    assert body["error"] and body["next_action"]
+    # 固定安全文案：不回显路径、异常或设备以外的内部事实
+    assert str(tmp_path) not in resp.text
+    assert "Traceback" not in resp.text
+
+    # 零副作用：零进程、零训练目录、零来源元数据、槽位未占用
+    assert launched == []
+    assert not (tmp_path / "detect").exists()
+    assert list(tmp_path.rglob("hpo_source.json")) == []
+    assert list(tmp_path.rglob("args.yaml")) == []
+    assert app_mod._RUN_MANAGER.reservation_owner() is None
+
+    # 只读事实照常可用：研究可读、排名不变、记录逐字节未改写
+    study = source.service.load_study(source.study_id)
+    assert rank_trials(study)[0].trial_id == source.top.trial_id
     assert (source.root / source.study_id / "study.json").read_bytes() == study_before
     assert (source.root / source.study_id / "execution.json").read_bytes() == exec_before
 

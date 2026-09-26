@@ -404,7 +404,7 @@ def test_history_second_page_returns_only_the_second_page(stack):
 def test_status_payload_exposes_frozen_authoritative_summary(stack):
     study_id = stack.create(
         study_config={"sampler": "random", "budget": 3, "epochs": 7, "seed": 11},
-        execution_config={"batch": 4, "imgsz": 128, "device": "cpu",
+        execution_config={"batch": 4, "imgsz": 128, "device": "0",
                           "timeout_seconds": 60},
     ).json()["study_id"]
     body = stack.client.get(f"/api/hpo/studies/{study_id}").json()
@@ -415,7 +415,7 @@ def test_status_payload_exposes_frozen_authoritative_summary(stack):
     assert body["study_epochs"] == 7
     assert body["batch"] == 4
     assert body["imgsz"] == 128
-    assert body["device"] == "cpu"
+    assert body["device"] == "0"
     assert body["snapshot_id"] == stack.snapshot.snapshot_id
     assert body["snapshot_short_id"] == stack.snapshot.snapshot_id[:8]
     assert body["model_display"] == "fixture.pt"
@@ -458,7 +458,7 @@ def test_best_config_keeps_legacy_shape_and_adds_display_fields(stack):
     assert set(payload["source"]) == {"study_id", "trial_id", "trial_number"}
     assert set(payload["search"]) == {
         "optimizer", "lr0", "lrf", "momentum", "weight_decay", "warmup_epochs"}
-    assert payload["fixed"] == {"epochs": 10, "batch": 4, "imgsz": 64, "device": "cpu"}
+    assert payload["fixed"] == {"epochs": 10, "batch": 4, "imgsz": 64, "device": "0"}
     assert payload["value"] == 0.9
     assert payload["epoch"] == 1
     # display-only additions
@@ -719,7 +719,7 @@ def test_defaults_missing_basename_still_reports_config_invalid(tmp_path, monkey
 
 def test_defaults_search_conditions_prefer_the_current_training_config(
         tmp_path, monkeypatch):
-    payload = _defaults(monkeypatch, tmp_path, config={
+    payload = _defaults(monkeypatch, tmp_path, cuda=True, config={
         "training": {"batch": 8, "imgsz": 512, "default_epochs": 7}})
     search = payload["search"]
     assert search["sampler"] == "tpe"         # 算法默认 TPE
@@ -728,16 +728,16 @@ def test_defaults_search_conditions_prefer_the_current_training_config(
     assert search["seed"] == 42
     assert search["timeout_seconds"] == 3600
     assert search["batch"] == 8 and search["imgsz"] == 512
-    assert search["device"] == "cpu"
+    assert search["device"] == "0"            # 缺省设备来自 GPU 探测
 
 
 def test_defaults_search_fall_back_only_when_absent(tmp_path, monkeypatch):
-    payload = _defaults(monkeypatch, tmp_path, config={})
+    payload = _defaults(monkeypatch, tmp_path, cuda=True, config={})
     assert payload["search"]["batch"] == 16
     assert payload["search"]["imgsz"] == 640
-    assert payload["search"]["device"] == "cpu"
+    assert payload["search"]["device"] == "0"
     assert payload["formal"] == {"epochs": 100, "batch": 16, "imgsz": 640,
-                                 "device": "cpu"}
+                                 "device": "0"}
 
 
 def test_defaults_never_silently_replace_illegal_configured_values(
@@ -756,7 +756,7 @@ def test_defaults_never_silently_replace_illegal_configured_values(
 
 def test_defaults_formal_conditions_come_from_ordinary_training_config(
         tmp_path, monkeypatch):
-    payload = _defaults(monkeypatch, tmp_path, config={
+    payload = _defaults(monkeypatch, tmp_path, cuda=True, config={
         "training": {"default_epochs": 120, "batch": 32, "imgsz": 128,
                      "device": "0"}})
     formal = payload["formal"]
@@ -765,21 +765,41 @@ def test_defaults_formal_conditions_come_from_ordinary_training_config(
     assert formal["epochs"] != 1 and formal["imgsz"] != 64
 
 
-def test_defaults_project_the_probed_device_list(tmp_path, monkeypatch):
-    """设备列表只给已探测的 GPU 编号与 CPU，权威默认与探测结果一致。"""
+def test_defaults_project_only_the_probed_gpu_list(tmp_path, monkeypatch):
+    """设备列表只给已探测的 GPU 编号，权威默认与探测结果一致（无 CPU）。"""
     gpu = _defaults(monkeypatch, tmp_path, cuda=True)
     assert gpu["devices"]["gpus"] and gpu["devices"]["gpus"][0] == 0
     assert gpu["devices"]["default"] == "0"
 
-    cpu = _defaults(monkeypatch, tmp_path, cuda=False)
-    assert cpu["devices"]["gpus"] == []
-    assert cpu["devices"]["default"] == "cpu"
-    assert cpu["device_notice"]["code"] == "GPU_NOT_AVAILABLE_CPU_FALLBACK"
-
-    # 配置里显式指定的 device 优先，并且不在列表里也不会被静默替换
+    # 配置里显式指定的合法 GPU 编号优先，并且不在列表里也不会被静默替换
     configured = _defaults(monkeypatch, tmp_path, cuda=True,
                            config={"training": {"device": "2"}})
     assert configured["devices"]["default"] == "2"
+
+
+def test_defaults_without_a_gpu_never_fall_back_to_cpu(tmp_path, monkeypatch):
+    """无 GPU 时不降级成 CPU：没有可提交设备 + 稳定、可操作的中文提示。"""
+    cpu = _defaults(monkeypatch, tmp_path, cuda=False)
+    assert cpu["devices"]["gpus"] == []
+    assert cpu["devices"]["default"] is None
+    assert cpu["search"]["device"] is None
+    assert cpu["device_notice"]["code"] == "GPU_NOT_AVAILABLE"
+    assert "GPU" in cpu["device_notice"]["message"]
+    # 提示必须是可操作的中文，且不包含任何路径/堆栈
+    assert "Traceback" not in cpu["device_notice"]["message"]
+    assert str(tmp_path) not in cpu["device_notice"]["message"]
+
+
+def test_defaults_treat_a_configured_cpu_as_unusable_not_as_a_default(
+        tmp_path, monkeypatch):
+    """配置里写着 cpu：GPU 可用也不把它当成可提交默认值，并如实提示。"""
+    payload = _defaults(monkeypatch, tmp_path, cuda=True,
+                        config={"training": {"device": "cpu"}})
+    assert payload["devices"]["default"] is None
+    assert payload["search"]["device"] is None
+    assert payload["device_notice"]["code"] == "GPU_REQUIRED"
+    # 设备列表本身仍然只列 GPU，选项里不出现 CPU
+    assert payload["devices"]["gpus"] and "cpu" not in payload["search"]
 
 
 def test_defaults_route_is_read_only_and_available(stack, tmp_path, monkeypatch):
@@ -860,7 +880,7 @@ def test_device_is_an_explicit_selector_without_a_cpu_staged_default():
                       _TEMPLATE.index(">", _TEMPLATE.index('id="hpoDevice"'))]
     assert "hpoDevice" in region
     assert 'value="cpu"' not in opener
-    # 选项由服务端探测结果动态填充（GPU 编号 + CPU），模板不预置任何设备值
+    # 选项由服务端探测结果动态填充（只有 GPU 编号），模板不预置任何设备值
     assert _TEMPLATE.count('id="hpoDevice"') == 1
     assert 'type="text" id="hpoDevice"' not in _TEMPLATE
 
@@ -1559,7 +1579,7 @@ def test_en_page_keeps_the_original_english_weight_controls():
 
 # ── F1.1-C Task 1：恢复已批准的干运行模式（四模式，顺序冻结）────────
 #
-# 已批准规格 docs/f1_1_a_experience_model_store_spec_20260917.md §5.1 要求
+# 已批准规格 历史文档/已验收批次_20260925_F1.1-F1.2D/docs/f1_1_a_experience_model_store_spec_20260917.md §5.1 要求
 # ``FormData(tuningForm).get("mode")`` 分别得到 dry_run、keep_params、hpo、full。
 # F1.1-A 末轮把页面改成三模式属未授权回归：本轮只恢复选项与顺序，不重写布局，
 # dry_run / keep_params / full 继续复用唯一的 startTuningBtn，hpo 继续只走

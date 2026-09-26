@@ -1,0 +1,76 @@
+# F1.2-B build context control.
+# The image must never receive local state, secrets, datasets, weights, logs,
+# training outputs or development tooling.
+
+# Version control and tooling state
+.git
+.gitignore
+.gitattributes
+.github
+.claude
+.codex*
+.vscode
+.vscode-test
+
+# Local configuration (the sanitized template stays in the build context)
+auto_tune/config.yaml
+qwen.txt
+*.local.yaml
+
+# Local credential files
+.env
+.env.*
+
+# Compose runtime root: config, SQLite index, logs, training dirs and weights
+docker-data
+
+# Local datasets, weights and training outputs
+dataset_*
+train_*
+train_images_*
+tmp_detect
+detect
+runs
+log
+build_output
+models/weights
+*.pt
+*.onnx
+*.zip
+*.tar.gz
+data.yaml
+
+# Python caches and local environments
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+env
+venv
+.venv
+*.egg
+
+# Test and scratch scripts
+_test_*.py
+test_modelb.py
+test_modelc.py
+test_module_a.py
+run_tests.bat
+ui_mockup.html
+_final_test.py
+
+# Documentation, render output and historical archives
+docs
+历史文档
+papper
+img
+*.docx
+*.pdf
+*.png
+*.jpg
+.codex_doc_review_*
+.codex_doc_render_*
+.tmp_*_render*
+*_render*

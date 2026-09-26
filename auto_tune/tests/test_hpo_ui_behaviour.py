@@ -72,6 +72,25 @@ def _run_page(scenario: str, tmp_path) -> dict:
     return payload
 
 
+def _run_page_in(lang: str, scenario: str, tmp_path) -> dict:
+    """The same real page, rendered by the shipped app in ``lang``."""
+    from fastapi.testclient import TestClient
+
+    from auto_tune.ui.app import app
+
+    page = tmp_path / ("rendered_page_%s.html" % lang)
+    page.write_text(
+        TestClient(app, cookies={"lang": lang}).get("/agent_suggestion").text,
+        encoding="utf-8")
+    result = subprocess.run(
+        [_NODE, str(_HARNESS), scenario, str(_UI_DIR), str(page)],
+        capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload.get("error")
+    return payload
+
+
 # ── F1.1-A Task 1：模式必须进入表单，页面模式各自走自己的入口 ────────
 
 
@@ -338,14 +357,275 @@ def test_upload_saves_once_refreshes_both_selectors_and_keeps_options(
     assert "X-CSRF-Token" in facts["headers"]
     # pending 期间重复点击只发一次
     assert facts["duplicateUploads"] == 0
-    # 上传成功后两个选择器一起刷新并选中新权重，按钮恢复可用
+    # 上传成功后三个选择器（模型库 / HPO / 直接训练）一起刷新并选中新权重
     assert facts["hpoValue"] == MODEL_ID_MANAGED
     assert facts["trainValue"] == MODEL_ID_MANAGED
+    assert facts["libraryValue"] == MODEL_ID_MANAGED
+    # 新权重是另一个对象：上一次对旧权重的“来源可信”确认不得被继承
+    assert facts["trustAfterUpload"] is False
     assert facts["btnDisabled"] is False
     assert "上传权重" in facts["btnLabel"]
     # 列表失败不清空既有合法选项，只给出提示
     assert facts["afterFailureValue"] == facts["keptValue"] != ""
     assert "暂不可用" in facts["afterFailureStatus"]
+
+
+# ── F1.2-A：手动导出 ONNX 的唯一入口、显式确认与下载 ───────────────
+#
+# 断言的是脚本真实写进 DOM 的事实：可用性判定、提交体、pending 期间的重复点击、
+# 失败提示与成功后的下载入口（后者必须来自磁盘状态，而不是那次响应）。
+
+
+def test_onnx_export_control_exposes_no_path_or_parameter_input(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+    structure = facts["structure"]
+
+    # 导出与上传控件在整页唯一：没有复制出第二份 DOM id
+    assert structure["exportBlocks"] == 1
+    assert structure["exportButtons"] == 1
+    assert structure["uploadBlocks"] == 1
+    assert structure["uploadInputs"] == 1
+    assert structure["uploadButtons"] == 1
+    assert structure["fileInputs"] == 1
+    # 导出区内唯一的输入控件是“来源可信”勾选框 + 精度选择器：
+    # 没有路径/目录/文件名输入，也没有 imgsz/opset/dynamic/simplify/nms 输入
+    assert structure["blockInputs"] == ["modelExportTrust:checkbox",
+                                        "modelExportPrecision:SELECT"]
+    # 固定参数只作为说明文本出现
+    assert "imgsz=640" in structure["blockText"]
+    assert "opset=17" in structure["blockText"]
+    # 精度只有 FP32 与半精度两项，默认 FP32；未验证半精度时高级选项整体不显示
+    assert facts["precisionValues"] == ["fp32", "fp16"]
+    assert facts["defaultPrecision"] == "fp32"
+    assert facts["advancedHiddenWhenUnverified"] is True
+
+
+def test_onnx_export_requires_the_trust_confirmation(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    # 一个权重都没选：按钮不可用，并提示先选择权重
+    assert facts["disabledWithNoTrust"] is True
+    assert "请先从受控权重库选择权重" in facts["hintWithNoTrust"]
+    # 选了受控权重但还没确认来源：仍然不可导出，且明确要求确认
+    assert facts["disabledBeforeTrust"] is True
+    assert "来源可信" in facts["hintBeforeTrust"]
+    # 勾选之后才可用
+    assert facts["managedEnabled"] is True
+    assert facts["managedHint"] == ""
+
+
+def test_the_trust_confirmation_is_bound_to_the_current_model(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    # 已确认 A 之后切到 B：勾选被撤销（B 是兼容来源，另有其自身的禁用原因）
+    assert facts["trustAfterSwitch"] is False
+    assert facts["legacyDisabled"] is True
+    assert "兼容来源" in facts["legacyHint"]
+    # 再切回 A 也必须重新确认：勾选为空、按钮不可用、提示要求确认
+    assert facts["trustAfterSwitchBack"] is False
+    assert facts["disabledAfterSwitchBack"] is True
+    assert "来源可信" in facts["hintAfterSwitchBack"]
+    # 清空选择同样撤销确认，并回到“未选择”
+    assert facts["trustAfterClear"] is False
+    assert facts["disabledAfterClear"] is True
+    assert "未选择" in facts["summaryAfterClear"]
+    assert facts["requestsWhileNoSelection"] == 0
+
+
+def test_onnx_export_rejects_a_borrowed_weight_without_any_request(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    # 兼容来源的权重：按钮禁用、原因明确，且绕过禁用点击也不发请求
+    assert facts["legacyDisabled"] is True
+    assert "兼容来源" in facts["legacyHint"]
+    assert facts["legacyRequests"] == 0
+
+
+def test_onnx_export_submits_only_the_model_id_precision_and_confirmation(
+        tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    request = facts["request"]
+    assert request["method"] == "POST"
+    # 确认值必须显式随请求提交（服务端拒绝缺失或 false），其余只有身份与精度
+    assert request["body"] == {"model_id": MODEL_ID_MANAGED, "precision": "fp32",
+                               "source_trusted": True}
+    # 导出是变更操作：必须带 CSRF 头，且客户端不提交任何路径/参数
+    assert request["hasCsrf"] is True
+    assert request["contentType"] == "application/json"
+    # pending 期间按钮禁用并显示进行中，重复点击不产生第二次请求
+    assert "导出中" in facts["pendingLabel"]
+    assert facts["pendingDisabled"] is True
+    assert facts["requestsWhilePending"] == 1
+
+
+def test_onnx_export_conflict_is_reported_and_never_offers_a_download(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    # 已存在同精度导出：稳定错误码 + 提示，不静默覆盖，也不给出下载入口
+    assert "MODEL_EXPORT_CONFLICT" in facts["conflictStatus"]
+    assert facts["conflictDownloadHidden"] is True
+    # 失败后按钮恢复可操作（用户可换权重或改名后重试）
+    assert facts["conflictButtonEnabled"] is True
+
+
+def test_onnx_export_completion_offers_the_download_from_disk_facts(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+    after = facts["afterSuccess"]
+
+    assert "导出完成" in facts["successStatus"]
+    assert "yolov8n.onnx" in facts["successStatus"]
+    # 下载入口来自随后读取的磁盘状态（刷新页面后同样可见）
+    assert after["downloadVisible"] is True
+    assert after["href"].startswith("/api/models/export/download?")
+    assert "precision=fp32" in after["href"]
+    assert after["downloadAttr"] == "yolov8n.onnx"
+    # 已有导出 → 不再重复导出，完成提示不被刷新清掉
+    assert after["buttonDisabled"] is True
+    assert "已有同精度" in after["hint"]
+    assert "导出完成" in after["status"]
+
+
+def test_fp16_only_appears_once_the_server_reports_it_verified(tmp_path):
+    facts = _run_page("onnx_export_ui", tmp_path)
+
+    # 服务端报告半精度可用后，高级选项展开；此时 FP32 已导出，按钮仍不可重复导出
+    assert facts["verified"]["advancedHidden"] is False
+    assert facts["verified"]["buttonEnabled"] is False
+    assert facts["verified"]["fp32DownloadVisible"] is True
+    # 切到半精度：没有半精度导出文件时按钮可用，且不再沿用 FP32 的下载入口
+    assert facts["onFp16"]["buttonEnabled"] is True
+    assert facts["onFp16"]["downloadVisible"] is False
+
+
+# ── 追加：同名不同内容自动命名后的提示与选择 ──────────────────────
+
+
+def test_an_auto_named_upload_shows_the_actual_saved_file_name(tmp_path):
+    facts = _run_page("upload_autoname", tmp_path)
+
+    # 提示里出现的是**实际**落盘名，而不是用户选中的 best.pt
+    assert "已自动保存为" in facts["status"]
+    assert facts["autoName"] in facts["status"]
+    assert "best.pt" not in facts["status"].replace(facts["autoName"], "")
+    # 三个选择器仍然选中这次上传的那个 model_id
+    assert facts["libraryValue"] == facts["autoId"]
+    assert facts["hpoValue"] == facts["autoId"]
+    assert facts["trainValue"] == facts["autoId"]
+    # 列表里也是自动命名后的身份
+    assert any(facts["autoName"] in text for text in facts["libraryTexts"])
+
+
+def test_a_same_content_upload_keeps_the_plain_uploaded_wording(tmp_path):
+    facts = _run_page("upload_autoname", tmp_path)
+
+    # 没有改名（同名同内容复用）时不出现“已自动保存为”
+    assert "已自动保存为" not in facts["unnamedStatus"]
+    assert "已存在" in facts["unnamedStatus"]
+    assert facts["autoName"] in facts["unnamedStatus"]
+
+
+def test_the_auto_named_wording_is_english_on_the_english_page(tmp_path):
+    facts = _run_page_in("en", "upload_autoname", tmp_path)
+
+    assert "Saved automatically as" in facts["status"]
+    assert facts["autoName"] in facts["status"]
+    assert not _CJK_RE_UI.search(facts["status"]), facts["status"]
+
+
+# ── 返修 4：独立的“模型库”页面 ──────────────────────────────────────
+#
+# 断言的是真实渲染页上的导航结构、控件归属与模式隔离：模型库是第六个页签，
+# 排在同一排的“历史记录”之后；上传与导出都在该页；训练模式不受影响。
+
+
+def test_the_model_library_is_the_sixth_tab_right_after_history(tmp_path):
+    facts = _run_page("model_library_nav", tmp_path)
+
+    assert facts["tabCount"] == 6
+    assert facts["pageCount"] == 6
+    assert facts["tabTexts"][4] == "历史记录"
+    assert facts["tabTexts"][5] == "模型库"
+    # 同一排、同一个容器：不是另起一行或另一个导航区
+    assert facts["oneRow"] is True
+    assert facts["libraryAfterHistory"] is True
+    assert facts["libraryIsAdjacentToHistory"] is True
+    # 页签与页面一一对应，页签下标就是页面下标
+    assert facts["pageIds"] == ["page0", "page1", "page2", "page3", "page4",
+                                "page5"]
+
+
+def test_the_model_library_page_owns_the_upload_and_export_controls(tmp_path):
+    facts = _run_page("model_library_nav", tmp_path)
+    page = facts["libraryPage"]
+
+    assert page["upload"] is True
+    assert page["select"] is True
+    assert page["export"] is True
+    # 从 HPO 草稿里移出，不再藏在该模式的高级区域
+    assert page["uploadNotInHpoDraft"] is True
+    assert page["exportNotInHpoDraft"] is True
+    # 直接训练与 HPO 的初始权重选择器仍留在各自流程里（没有被搬到模型库页）
+    assert page["hpoSelectStillBound"] is True
+    assert page["hpoSelectNotOnLibraryPage"] is True
+    assert page["trainSelectPresent"] is True
+    # 模型库不属于任何模式专属区域，切换训练模式不会将整页显隐
+    assert page["pageIsNotModeScoped"] is True
+
+
+def test_the_four_training_modes_are_untouched_by_the_new_page(tmp_path):
+    facts = _run_page("model_library_nav", tmp_path)
+
+    assert facts["modeValues"] == ["dry_run", "keep_params", "hpo", "full"]
+    # 模式切换只影响各自的配置区：模型库的控件显示属性保持空值（照常可见）
+    assert facts["displayByMode"] == {"hpo": "", "dryRun": "", "uploadHpo": "",
+                                      "uploadDryRun": ""}
+
+
+def test_entering_the_model_library_reloads_the_controlled_weights(tmp_path):
+    facts = _run_page("model_library_nav", tmp_path)
+
+    # 切到第六页后只有该页处于活动状态，并按服务端事实重新读取列表
+    assert facts["activePageIds"] == ["page5"]
+    assert facts["reloadCalls"] >= 2          # 首屏一次 + 进入本页一次
+    # 选项 value 只能是安全 model_id，绝不出现服务器路径
+    assert facts["libraryValues"][0] == ""
+    for value in facts["libraryValues"]:
+        assert value == "" or re.fullmatch(r"sha256:[0-9a-f]{64}", value), value
+
+
+_CJK_RE_UI = re.compile(r"[一-鿿]")
+
+
+def test_the_model_library_is_chinese_on_the_chinese_page(tmp_path):
+    facts = _run_page("model_library_nav", tmp_path)
+    texts = facts["libraryTexts"]
+
+    assert texts["placeholder"] == "请从受控权重库选择权重"
+    assert texts["summary"].startswith("当前权重：")
+    assert "权重库" in " ".join(texts["options"])
+    assert texts["uploadButton"] == "上传权重"
+    assert texts["downloadText"].startswith("下载 ONNX")
+
+
+def test_the_model_library_dynamic_text_is_english_on_the_english_page(tmp_path):
+    """模型库页自己的动态文案必须随语言切换：脚本里不得再写死中文。"""
+    facts = _run_page_in("en", "model_library_nav", tmp_path)
+    texts = facts["libraryTexts"]
+
+    assert facts["tabTexts"][-1] == "Model Library"
+    assert texts["placeholder"] == "Select a weight from the controlled library"
+    assert texts["summary"].startswith("Current weight:")
+    assert texts["options"][0] == "Select a weight from the controlled library"
+    assert texts["uploadButton"] == "Upload Weight"
+    assert texts["exportButton"] == "Export ONNX"
+    assert texts["downloadText"].startswith("Download ONNX")
+    # 选中一个已导出的权重后，提示与选项文案同样是英文
+    assert "already has an ONNX" in texts["exportHint"]
+    assert "Weight library" in " ".join(texts["options"])
+    for value in [texts["summary"], texts["exportHint"], texts["downloadText"],
+                  texts["uploadButton"], texts["exportButton"]] + texts["options"]:
+        assert not _CJK_RE_UI.search(value), value
 
 
 # ── A1/A2/A3: 布局稳定、单一开始操作、技术细节折叠 ─────────────────
@@ -427,9 +707,10 @@ def test_direct_inputs_carry_the_server_evaluation_mode_and_device():
 
 
 # ── 最终返修 Task 5：设备默认必须等权威事实，且用明确选择控件 ─────────
+# ── F1.2-C P1：正式交付只交付 GPU 训练，设备控件不提供 CPU ─────────
 
 
-def test_device_is_a_selector_without_a_staged_cpu_default():
+def test_device_is_a_selector_without_a_staged_default():
     facts = _run("hpo_device_defaults")
     pending = facts["pending"]
     # 明确选择控件，不是自由文本；defaults 到达前没有可提交的暂存默认值
@@ -442,35 +723,49 @@ def test_device_is_a_selector_without_a_staged_cpu_default():
     assert facts["afterEarlyClick"]["createDisabled"] is True
 
 
-def test_cuda_available_defaults_to_gpu_zero_and_enables_creation():
+def test_the_selector_lists_only_the_probed_gpu_indices():
+    """选项逐一对应服务端探测结果：没有 CPU，也不补造任何编号。"""
     facts = _run("hpo_device_defaults")
     gpu = facts["gpu"]
-    # GPU 可用且配置未指定 device：权威默认必须是 GPU 0，绝不静默回退 CPU
-    assert gpu["options"] == ["0", "cpu"]
+    assert gpu["options"] == ["0", "1"]
+    assert "cpu" not in gpu["options"]
+    # GPU 可用且配置未指定 device：权威默认必须是探测到的第一张卡
     assert gpu["value"] == "0"
     assert gpu["createDisabled"] is False
-    # 用户主动改选 CPU 后，后续无关异步响应不覆盖该选择
-    assert facts["afterUserChoice"]["value"] == "cpu"
-    # 提交值仍是现有合法值
-    assert facts["createDevice"] == "cpu"
 
 
-def test_creation_sends_gpu_zero_when_the_server_default_is_gpu_zero():
+def test_user_gpu_choice_is_not_overwritten_and_is_submitted():
     facts = _run("hpo_device_defaults")
-    assert facts["gpu"]["value"] == "0"
-    assert facts["createDevice"] in ("0", "cpu")     # 用户最后选择的是 cpu
+    # 用户主动改选 GPU 1 后，后续无关异步响应不覆盖该选择
+    assert facts["afterUserChoice"]["value"] == "1"
+    assert facts["createDevice"] == "1"
 
 
-def test_without_a_gpu_cpu_is_selected_with_a_visible_notice():
-    facts = _run("hpo_device_fallback")
-    cpu = facts["cpu"]
-    assert cpu["options"] == ["cpu"]
-    assert cpu["value"] == "cpu"
-    assert cpu["createDisabled"] is False
+def test_a_forged_cpu_device_is_rejected_before_any_create_request():
+    """控件里没有 CPU；即使设备值被外部改成 cpu，前端也不发送创建请求。"""
+    facts = _run("hpo_device_rejects_cpu")
+    assert facts["options"] == ["0"]
+    assert facts["selected"] == "0"       # 控件选中的仍是合法 GPU 编号
+    assert facts["createCalls"] == 0
+    # 稳定、可操作的中文提示，且出错字段所在的折叠区自动展开
+    assert facts["errorHidden"] is False
+    assert "计算设备" in facts["errorText"]
+    assert facts["deviceExpanded"] is True
+
+
+def test_without_a_gpu_there_is_no_submittable_device_and_no_fallback():
+    """无 GPU：不选 CPU、不降级，创建按钮不可用并给出可见提示，零创建。"""
+    facts = _run("hpo_device_no_gpu")
+    state = facts["noGpu"]
+    assert state["options"] == []
+    assert state["value"] == ""
+    assert state["createDisabled"] is True
     # 简短、可操作的提示必须可见（不能藏在折叠区里）
-    assert cpu["noticeVisible"] is True
-    assert "未检测到可用 GPU" in cpu["notice"]
-    assert facts["cpuDevice"] == "cpu"
+    assert state["noticeVisible"] is True
+    assert "未检测到可用的 GPU" in state["notice"]
+    assert "CPU" in state["bindingNotice"] or "GPU" in state["bindingNotice"]
+    assert facts["createCalls"] == 0
+    assert facts["createDevice"] is None
 
 
 def test_defaults_failure_shows_a_visible_error_and_creates_nothing():
@@ -1199,7 +1494,7 @@ def test_main_summary_tracks_every_collapsed_setting():
     assert "算法 随机搜索" in facts["afterSampler"]
     assert "图像尺寸 320" in facts["afterImgsz"]
     assert "Batch 8" in facts["afterBatch"]
-    assert "设备 cpu" in facts["afterDevice"]
+    assert "设备 1" in facts["afterDevice"]
     assert "快速" in facts["afterMode"]
     # 展开本身不改变任何已生效的选择
     assert facts["afterExpand"]["summary"].count("TPE") == 1
@@ -1210,7 +1505,7 @@ def test_create_request_still_carries_the_collapsed_settings():
     assert body is not None, "a valid draft must still submit"
     assert body["study_config"]["sampler"] == "random"
     assert body["study_config"]["evaluation_mode"] == "quick"
-    assert body["execution_config"]["device"] == "cpu"
+    assert body["execution_config"]["device"] == "1"
     assert body["execution_config"]["imgsz"] == 320
     assert body["execution_config"]["batch"] == 8
     # 六项搜索参数仍由服务端采样决定，客户端不提交
@@ -1221,7 +1516,7 @@ def test_leaving_and_reentering_hpo_keeps_the_draft_without_duplicate_controls()
     facts = _run("draft_collapsed_settings")["afterModeSwitch"]
     assert facts["sampler"] == "random"
     assert facts["evaluationMode"] == "quick"
-    assert facts["device"] == "cpu"
+    assert facts["device"] == "1"
     assert facts["imgsz"] == "320"
     assert facts["batch"] == "8"
     # 每个控件在整页中仍然唯一：没有为折叠复制第二套控件

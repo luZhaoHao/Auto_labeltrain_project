@@ -1,6 +1,7 @@
 """Tests for the unified training-completion contract consumed by the UI."""
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -934,8 +935,13 @@ def test_s14_browse_error_surfaces_stable_error_not_empty_dir():
 
 def test_s14_page_has_no_zip_upload_control():
     html = _render_dataset_page({"dataset_path": "e:/data/source", "split": False})
-    # The S1.4 page must not reintroduce ZIP/JSON upload widgets.
-    assert 'type="file"' not in html
+    # The S1.4 page must not reintroduce ZIP/JSON upload widgets. 数据集本身只走
+    # 目录选择；整页唯一的文件控件必须是受控权重的 .pt 上传（F1.1-A/F1.2-A），
+    # 不接受任何压缩包/标注文件上传入口。
+    file_inputs = re.findall(r'<input[^>]*type="file"[^>]*>', html)
+    assert len(file_inputs) == 1
+    assert 'id="modelUploadInput"' in file_inputs[0]
+    assert 'accept=".pt"' in file_inputs[0]
     assert "dropZone" not in html
     assert "uploadDataset" not in html
     assert "uploadTraining" not in html

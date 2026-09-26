@@ -2017,6 +2017,190 @@ def test_keep_params_path_records_empty_decision_attempts(tmp_path, monkeypatch)
     assert audit["iterations"][0]["decision_attempts"] == []
 
 
+# ── F1.2-C P1 调查：LLM 响应数与 decision_attempts 的对应关系 ─────────
+#
+# 一线索是"受控桩看到 4 次响应（2 次文字 / 2 次 decision），审计只有 1 个
+# decision_attempt"。要判定它是不是缺陷，必须先把**每一次模型调用的身份**变成
+# 可断言的事实：顺序号、调用用途、json_mode、提示词/响应的摘要哈希。摘要（不是
+# 原文）足以做顺序对应，且不把凭据或提示词原文带进测试。
+
+_LLM_CALL_MARKERS = (
+    # 纠错提示词内嵌原始任务，必须先按纠错标记分类，再落到普通决策
+    ("你上一次的输出未通过自动调优决策校验", "decision_correction"),
+    ("你上一次的输出未通过自动调优语义校验", "semantic_correction"),
+    ("你上一次的输出未通过结构化校验", "json_fix"),
+    ("## 事实包（唯一事实来源）", "decision"),
+    ("请给出简要的调优总结", "final_summary"),
+)
+
+_LLM_CALL_RECORD_KEYS = frozenset(
+    {"seq", "kind", "json_mode", "prompt_sha256", "response_sha256"})
+
+
+def _digest(text) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:12]
+
+
+def _classify_llm_prompt(prompt: str) -> str:
+    for marker, kind in _LLM_CALL_MARKERS:
+        if marker in prompt:
+            return kind
+    return "unknown"
+
+
+def _recording_llm_stub(monkeypatch, replies):
+    """为每次 ``call_decision_llm`` 记录顺序号/用途/json_mode/摘要哈希。
+
+    只记录摘要哈希与调用用途：记录里没有提示词原文、没有响应原文，也没有任何
+    凭据字段（这正是这些记录可以被断言的原因）。
+    """
+    from auto_tune.modules.agent_engine import decision_agent as da_mod
+
+    calls: list[dict] = []
+
+    def _stub(prompt, config, json_mode=False, **kwargs):
+        raw = next(replies)
+        calls.append({
+            "seq": len(calls) + 1,
+            "kind": _classify_llm_prompt(prompt),
+            "json_mode": bool(json_mode),
+            "prompt_sha256": _digest(prompt),
+            "response_sha256": _digest(raw),
+        })
+        return raw
+
+    monkeypatch.setattr(da_mod, "call_decision_llm", _stub)
+    return calls
+
+
+def _tuning_json_without_fact_package_id():
+    return json.dumps({
+        "schema_version": "1.0",
+        "diagnosis": "缺少事实包身份",
+        "action": "keep_params",
+        "hyperparameter_changes": {},
+        "training_overrides": {},
+        "evidence_ids": {},
+    }, ensure_ascii=False)
+
+
+_SUMMARY_TEXT = "本轮调优总结：保持参数，指标稳定。"
+
+
+def _run_one_real_iteration(tmp_path, monkeypatch, *, auto_analyze=True):
+    """跑一轮**真实**决策路径（只有模型与训练被桩住），返回 (result, calls)。
+
+    桩按顺序发放三条响应：缺 fact_package_id 的决策、合法的纠错决策、
+    终局文字总结。任何第 4 次调用都会暴露成 StopIteration（说明出现了
+    预期之外的模型调用），不会静默通过。
+    """
+    from auto_tune.modules.agent_engine.probe_monitor import ProbeDecision
+
+    _loop_basic_mocks(monkeypatch, tmp_path)
+    _mock_fact_package(monkeypatch)
+    replies = iter([_tuning_json_without_fact_package_id(),
+                    _keep_params_tuning_json(),
+                    _SUMMARY_TEXT])
+    calls = _recording_llm_stub(monkeypatch, replies)
+
+    class FakeProc:
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    def _finalize(run_dir, run_name, source, config, **kw):
+        return {
+            "run_id": f"tuning:{kw.get('session_id')}:{run_name}",
+            "run_name": run_name, "source": "tuning", "status": "completed",
+            "analysis_status": "completed",
+            "metrics": {"mAP50": 0.7, "mAP50_95": 0.4, "precision": 0.8,
+                        "recall": 0.7},
+            "epochs": {"configured": 100, "completed": 3, "best": 2},
+            "artifacts": {"report_path": None},
+            "analysis_error": None, "history_error": None,
+            "index_error": None, "error": None,
+        }
+
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.finalize_training_run",
+                        _finalize)
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.monitor_training",
+                        lambda *a, **k: ProbeDecision(ProbeDecision.CONTINUE, "ok"))
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.launch_training",
+                        lambda *a, **k: FakeProc())
+    monkeypatch.setattr("auto_tune.modules.agent_engine.loop.build_yolo_command",
+                        lambda *a, **k: ["yolo", "train"])
+
+    result = run_tuning_loop(
+        {"probe": {"max_retries": 1}, "train_analyzer": {}, "llm": {"enabled": True}},
+        reference_run="train54", log_dir=str(tmp_path),
+        auto_analyze=auto_analyze,
+    )
+    return result, calls
+
+
+def test_llm_calls_are_classified_by_purpose_and_never_echo_prompts(tmp_path, monkeypatch):
+    """一次完整调优里每次模型调用都有确定用途，且记录里只有摘要哈希。"""
+    result, calls = _run_one_real_iteration(tmp_path, monkeypatch)
+
+    assert [c["kind"] for c in calls] == ["decision", "decision_correction",
+                                          "final_summary"]
+    assert [c["json_mode"] for c in calls] == [True, True, False]
+    assert [c["seq"] for c in calls] == [1, 2, 3]
+    # 顺序身份可对账：每条记录的响应摘要都能与桩实际发放的那条对应
+    assert calls[0]["response_sha256"] == _digest(
+        _tuning_json_without_fact_package_id())
+    assert calls[1]["response_sha256"] == _digest(_keep_params_tuning_json())
+    assert calls[2]["response_sha256"] == _digest(_SUMMARY_TEXT)
+    # 记录结构本身就不允许夹带提示词/响应原文或凭据
+    assert all(set(c) == _LLM_CALL_RECORD_KEYS for c in calls)
+    assert result["failure"] is None
+
+
+def test_two_decision_responses_produce_exactly_two_attempts_in_order(tmp_path, monkeypatch):
+    """第一次 decision 缺 fact_package_id、第二次纠错合法 →
+
+    恰好 2 次决策调用、审计恰好 2 条 decision_attempt；第 1 条无效、第 2 条
+    有效，且顺序与调用顺序一致。文字总结调用不属于决策审计。
+    """
+    result, calls = _run_one_real_iteration(tmp_path, monkeypatch)
+
+    decision_calls = [c for c in calls if c["kind"] in
+                      ("decision", "decision_correction", "semantic_correction",
+                       "json_fix")]
+    assert len(decision_calls) == 2
+    assert all(c["json_mode"] for c in decision_calls)
+    # 唯一一次 json_mode=False 的调用是终局文字总结，与决策审计无关
+    assert [c["kind"] for c in calls if not c["json_mode"]] == ["final_summary"]
+
+    audit = json.loads(Path(result["audit_path"]).read_text(encoding="utf-8"))
+    attempts = audit["iterations"][0]["decision_attempts"]
+    assert [a["attempt"] for a in attempts] == [1, 2]
+    assert [a["retried"] for a in attempts] == [False, True]
+    # 第 1 条无效（缺 fact_package_id 的 Q1.1 契约失败），第 2 条有效
+    assert attempts[0]["decision_validation"]["valid"] is False
+    assert attempts[0]["decision"] is None
+    assert attempts[1]["decision_validation"]["valid"] is True
+    # 第 2 条落盘的正是第 2 次响应（顺序一致，不串位）
+    assert attempts[1]["decision"]["diagnosis"] == "保持参数"
+    # 每条 json_mode=True 的响应都对应一条 attempt：一一对应，无孤立响应
+    assert len(attempts) == len(decision_calls)
+
+
+def test_a_json_response_without_an_attempt_is_impossible_in_the_audit(
+        tmp_path, monkeypatch):
+    """反向不变量：审计里的每条 attempt 都必须来自一次 json_mode=True 调用。"""
+    result, calls = _run_one_real_iteration(tmp_path, monkeypatch)
+    audit = json.loads(Path(result["audit_path"]).read_text(encoding="utf-8"))
+    attempts = audit["iterations"][0]["decision_attempts"]
+    json_calls = [c for c in calls if c["json_mode"]]
+    assert len(attempts) == len(json_calls)
+    assert sorted(a["attempt"] for a in attempts) == list(range(1, len(json_calls) + 1))
+
+
 # ── F1.1-A Task 4：大模型调优继承参考运行的初始权重 ─────────────────
 
 

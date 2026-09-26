@@ -115,12 +115,29 @@ def _validate_absolute_path(value: Any) -> str:
     return value
 
 
+# ── 交付设备约束（F1.2-C）─────────────────────────────────────────
+#
+# 正式交付只交付 GPU 训练：CPU 只能作为**历史事实**出现在已落盘的
+# ``hpo-execution-v1`` 记录里（读取/展示/排名继续按原契约工作，所以
+# ``ExecutionConfig`` 本身仍接受 "cpu"）。新建、启动、恢复这三条会产生新训练
+# 的路径必须用 ``require_gpu_device`` 显式拒绝 CPU。
+GPU_REQUIRED_CODE = "HPO_GPU_REQUIRED"
+
+
+def require_gpu_device(device: Any) -> str:
+    """拒绝在任何新建/启动/恢复路径上绑定 CPU 设备。"""
+    if isinstance(device, str) and device.strip() == "cpu":
+        raise HpoError(GPU_REQUIRED_CODE, "delivery runs HPO on GPUs only")
+    return device
+
+
 # ── ExecutionConfig ───────────────────────────────────────────────
 
 class ExecutionConfig(StrictModel):
     batch: StrictInt = Field(default=16, ge=1, le=256)
     imgsz: StrictInt = Field(default=640, ge=32, le=2048)
-    device: str = Field(default="cpu")
+    # 默认值是 GPU 0：省略 device 的新绑定不得得到一次 CPU 训练。
+    device: str = Field(default="0")
     timeout_seconds: StrictInt = Field(default=3600, ge=1, le=86400)
 
     @field_validator("imgsz")

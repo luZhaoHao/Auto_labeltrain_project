@@ -110,19 +110,112 @@ def test_same_name_same_hash_is_idempotent(tmp_path):
     assert _names(tmp_path / "models" / "weights") == ["yolov8n.pt"]
 
 
-def test_same_name_different_content_is_a_stable_conflict(tmp_path):
+def test_same_name_different_content_is_saved_under_an_auto_name(tmp_path):
+    """同名不同内容不再要求用户手工改名：新文件按 <stem>_<哈希前 12 位>.pt 落盘。"""
     store = _store(tmp_path)
     first = _import(store)
+    data = b"different"
+    second = _import(store, data=data)
+
+    expected = "yolov8n_%s.pt" % _sha(data)[:12]
+    assert second.name == expected
+    assert second.created_now is True
+    assert second.sha256 == _sha(data)
+    assert second.path.parent == tmp_path / "models" / "weights"
+    assert second.path.read_bytes() == data
+
+    # 绝不覆盖：原权重原样保留，也没有残留临时文件
+    root = tmp_path / "models" / "weights"
+    assert _names(root) == sorted(["yolov8n.pt", expected])
+    assert (root / "yolov8n.pt").read_bytes() == _PAYLOAD
+    assert first.path.read_bytes() == _PAYLOAD
+    assert not list(root.glob("*.tmp"))
+
+
+def test_repeating_an_auto_named_upload_is_idempotent(tmp_path):
+    store = _store(tmp_path)
+    _import(store)
+    data = b"second-content"
+    first = _import(store, data=data)
+
+    again = _import(store, data=data)
+
+    assert again.name == first.name
+    assert again.model_id == first.model_id
+    assert again.created_now is False
+    assert _names(tmp_path / "models" / "weights") == sorted(
+        ["yolov8n.pt", first.name])
+
+
+def test_the_hash_prefix_extends_when_the_candidate_name_is_taken(tmp_path):
+    """候选名被不同内容占用时逐位延长哈希前缀，仍不覆盖任何既有文件。"""
+    store = _store(tmp_path)
+    _import(store)
+    data = b"taken-candidate"
+    digest = _sha(data)
+    root = tmp_path / "models" / "weights"
+    taken = "yolov8n_%s.pt" % digest[:12]
+    (root / taken).write_bytes(b"someone-elses-file")
+
+    record = _import(store, data=data)
+
+    assert record.name == "yolov8n_%s.pt" % digest[:13]
+    assert record.path.read_bytes() == data
+    assert (root / taken).read_bytes() == b"someone-elses-file"
+    assert _names(root) == sorted(["yolov8n.pt", taken, record.name])
+
+
+def test_the_auto_name_respects_the_255_character_limit(tmp_path):
+    store = _store(tmp_path)
+    name = "w" * 251 + ".pt"
+    assert len(name) == 254
+    _import(store, name=name)
+    data = b"long-name-content"
+
+    record = _import(store, name=name, data=data)
+
+    assert len(record.name) <= service_mod._MAX_FILE_NAME
+    assert record.name.endswith("_%s.pt" % _sha(data)[:12])
+    assert record.name.startswith("w")
+    assert record.path.read_bytes() == data
+    assert (tmp_path / "models" / "weights" / name).read_bytes() == _PAYLOAD
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="大小写不敏感是 Windows 文件系统的规则")
+def test_a_differently_cased_existing_name_is_not_overwritten(tmp_path):
+    store = _store(tmp_path)
+    lower = _import(store, name="yolov8n.pt")
+    data = b"upper-case-upload"
+
+    record = _import(store, name="YOLOV8N.PT", data=data)
+
+    root = tmp_path / "models" / "weights"
+    assert record.name != "YOLOV8N.PT"
+    assert record.name.startswith("YOLOV8N_") and record.name.endswith(".PT")
+    assert record.path.read_bytes() == data
+    assert (root / "yolov8n.pt").read_bytes() == _PAYLOAD
+    assert lower.path.read_bytes() == _PAYLOAD
+
+
+def test_an_exhausted_auto_name_set_is_a_stable_conflict(tmp_path, monkeypatch):
+    """所有候选名都被不同内容占用时回到稳定冲突码——绝不覆盖。"""
+    monkeypatch.setattr(service_mod, "_AUTO_NAME_HASH_LENGTHS", range(12, 13))
+    store = _store(tmp_path)
+    _import(store)
+    data = b"exhausted"
+    root = tmp_path / "models" / "weights"
+    taken = "yolov8n_%s.pt" % _sha(data)[:12]
+    (root / taken).write_bytes(b"occupied")
 
     with pytest.raises(ModelStoreError) as exc:
-        _import(store, data=b"different")
+        _import(store, data=data)
+
     assert exc.value.code == "MODEL_NAME_CONFLICT"
     assert exc.value.status_code == 409
-
-    # 绝不静默覆盖：原文件原样保留，也没有残留临时文件
-    root = tmp_path / "models" / "weights"
-    assert _names(root) == ["yolov8n.pt"]
-    assert (root / "yolov8n.pt").read_bytes() == first.path.read_bytes()
+    assert (root / taken).read_bytes() == b"occupied"
+    assert (root / "yolov8n.pt").read_bytes() == _PAYLOAD
+    assert not list(root.glob("*.tmp"))
 
 
 def test_concurrent_same_name_uploads_with_the_same_content_are_idempotent(tmp_path):
@@ -156,8 +249,8 @@ def test_concurrent_same_name_uploads_with_different_content_never_overwrite(tmp
     def worker(data):
         barrier.wait()
         try:
-            results.append(_import(store, data=data))
-        except ModelStoreError as exc:
+            results.append((data, _import(store, data=data)))
+        except Exception as exc:      # pragma: no cover - reported below
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(data,))
@@ -167,12 +260,23 @@ def test_concurrent_same_name_uploads_with_different_content_never_overwrite(tmp
     for t in threads:
         t.join()
 
-    # 恰好一个赢家，另一个得到稳定冲突码；磁盘上只有赢家的内容
-    assert len(results) == 1
-    assert [e.code for e in errors] == ["MODEL_NAME_CONFLICT"]
+    # 两份内容都保存成功：恰好一个占用原名，另一个落到自己的自动名下
+    assert errors == []
+    assert len(results) == 2
+    names = sorted(record.name for _, record in results)
+    assert len(set(names)) == 2
+    assert "yolov8n.pt" in names
+    auto = [n for n in names if n != "yolov8n.pt"][0]
+    assert auto in {"yolov8n_%s.pt" % _sha(b"alpha")[:12],
+                    "yolov8n_%s.pt" % _sha(b"beta")[:12]}
+
     root = tmp_path / "models" / "weights"
-    assert _names(root) == ["yolov8n.pt"]
-    assert (root / "yolov8n.pt").read_bytes() == results[0].path.read_bytes()
+    assert _names(root) == names
+    for data, record in results:
+        assert record.path.read_bytes() == data
+    winner = [r for _, r in results if r.name == "yolov8n.pt"][0]
+    assert (root / "yolov8n.pt").read_bytes() == winner.path.read_bytes()
+    assert not list(root.glob("*.tmp"))
 
 
 # ── 上传校验 ───────────────────────────────────────────────────────

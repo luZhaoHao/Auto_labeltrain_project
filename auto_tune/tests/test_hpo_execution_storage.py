@@ -73,6 +73,32 @@ def test_mutated_config_revalidated_after_assignment():
         ExecutionConfig(**{**cfg.model_dump(), "batch": 999})
 
 
+# ── F1.2-C P1：交付设备约束（GPU-only）────────────────────────────
+
+
+def test_default_device_is_a_gpu_and_cpu_only_survives_for_reading():
+    """契约模型默认值是 GPU 0；"cpu" 仍可解析，只为读取/复验历史记录。
+
+    新建/启动/恢复的拒绝由 ``require_gpu_device`` + 创建/控制边界负责，
+    不在这里（否则历史 hpo-execution-v1 记录会变成不可读）。
+    """
+    assert ExecutionConfig().device == "0"
+    assert ExecutionConfig(device="cpu").device == "cpu"
+
+
+def test_require_gpu_device_rejects_cpu_and_allows_gpu_indices():
+    from auto_tune.modules.hpo.execution_models import (
+        GPU_REQUIRED_CODE,
+        require_gpu_device,
+    )
+
+    for device in ("0", "1", "63"):
+        assert require_gpu_device(device) == device
+    with pytest.raises(HpoError) as err:
+        require_gpu_device("cpu")
+    assert err.value.code == GPU_REQUIRED_CODE
+
+
 # ── 记录构建 helper ──────────────────────────────────────────────
 
 def _roots(tmp_path):

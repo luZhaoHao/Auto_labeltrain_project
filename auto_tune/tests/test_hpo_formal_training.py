@@ -83,14 +83,15 @@ class CompletingRunner:
 class Source:
     """Real HPO source study with deterministic SUCCESS trials."""
 
-    def __init__(self, tmp_path, values=(0.5, 0.9), epochs=10, status="COMPLETED"):
+    def __init__(self, tmp_path, values=(0.5, 0.9), epochs=10, status="COMPLETED",
+                 device="0"):
         self.snapshot, self.model = _make_inputs(tmp_path)
         self.root = tmp_path / "storage"
         self.service = HpoService(self.root)
         self.study = self.service.create_study(
             StudyConfig(budget=5, epochs=epochs),
             snapshot_dir=self.snapshot.snapshot_path, model_path=self.model)
-        self.exec_config = ExecutionConfig(batch=4, imgsz=64, device="cpu",
+        self.exec_config = ExecutionConfig(batch=4, imgsz=64, device=device,
                                            timeout_seconds=120)
         # real prepare (writes execution.json) before any trial becomes terminal
         inner = HpoRunner(self.root, tmp_path / "out", tmp_path / "log")
@@ -245,9 +246,12 @@ def _valid_body(source, **training):
     """正式训练只允许改 epochs；其余三个条件必须等于研究的权威执行条件。
 
     客户端仍携带完整的 ``training_config``（接口兼容），但 batch/imgsz/device
-    一律由前端取当前研究的权威 execution 值，服务端再严格比对。
+    一律由前端取当前研究的权威 execution 值（这里同样从来源研究读取），服务端
+    再逐项比对；测试里的正例因此对 GPU 与历史 CPU 来源都成立。
     """
-    cfg = {"epochs": 2, "batch": 4, "imgsz": 64, "device": "cpu"}
+    cfg = {"epochs": 2, "batch": source.exec_config.batch,
+           "imgsz": source.exec_config.imgsz,
+           "device": source.exec_config.device}
     cfg.update(training)
     return {"trial_id": source.top.trial_id, "training_config": cfg}
 
@@ -291,12 +295,61 @@ def test_train_best_requires_completed_study(tmp_path, monkeypatch):
     _assert_zero_side_effects(tmp_path, launched, source, app_mod)
 
 
+def test_train_best_rejects_a_legacy_cpu_source_zero_side_effects(
+        tmp_path, monkeypatch):
+    """F1.2-C：历史 COMPLETED CPU 研究仍只读可用，但不得据此启动正式训练。"""
+    from auto_tune.modules.hpo import HpoError, rank_trials
+    from auto_tune.modules.run_state.manager import RunManager
+    from auto_tune.ui.hpo_training import (
+        FormalTrainingConfig,
+        hpo_training_error_response,
+        resolve_hpo_formal_training,
+    )
+
+    source = Source(tmp_path, device="cpu")       # 历史 CPU 研究的执行事实
+    app_mod, launched = _patch_app(monkeypatch, tmp_path, source)
+    study_before = (source.root / source.study_id / "study.json").read_bytes()
+    exec_before = (source.root / source.study_id / "execution.json").read_bytes()
+
+    resp = _post(app_mod, source.study_id, _valid_body(source))
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error_code"] == "HPO_GPU_REQUIRED"
+    assert set(body) == {"error_code", "error", "next_action"}
+    assert body["error"] and body["next_action"]
+    assert str(tmp_path) not in resp.text
+    assert "Traceback" not in resp.text
+    _assert_zero_side_effects(tmp_path, launched, source, app_mod)
+
+    # 只读事实照常可用：研究可读、排名不变、记录逐字节未改写
+    study = source.service.load_study(source.study_id)
+    assert rank_trials(study)[0].trial_id == source.top.trial_id
+    assert (source.root / source.study_id / "study.json").read_bytes() == study_before
+    assert (source.root / source.study_id / "execution.json").read_bytes() == exec_before
+
+    # 同一映射直接验证：稳定错误码 + HTTP 422 + 固定文案（不回显底层 message）。
+    # 这里的条件与该研究的权威执行条件完全一致（device=cpu），因此必然走到设备边界。
+    try:
+        resolve_hpo_formal_training(
+            source.service, source.runner, RunManager(), source.study_id,
+            source.top.trial_id,
+            FormalTrainingConfig(epochs=2, batch=4, imgsz=64, device="cpu"))
+    except HpoError as exc:
+        mapped = hpo_training_error_response(exc)
+    else:  # pragma: no cover - the boundary must have refused above
+        raise AssertionError("a legacy CPU source must not resolve")
+    assert mapped.status_code == 422
+    mapped_body = json.loads(bytes(mapped.body).decode("utf-8"))
+    assert mapped_body["error_code"] == "HPO_GPU_REQUIRED"
+    assert mapped_body["error"] and mapped_body["next_action"]
+
+
 def test_train_best_rejects_non_rank_first_trial(tmp_path, monkeypatch, source):
     app_mod, launched = _patch_app(monkeypatch, tmp_path, source)
     study = source.service.load_study(source.study_id)
     body = {"trial_id": study.trials[0].trial_id,  # the 0.5 trial
             "training_config": {"epochs": 2, "batch": 4, "imgsz": 64,
-                                "device": "cpu"}}
+                                "device": "0"}}
     resp = _post(app_mod, source.study_id, body)
     assert resp.status_code == 409
     assert resp.json()["error_code"] == "HPO_SOURCE_INVALID"
@@ -495,7 +548,7 @@ def test_train_best_uses_new_conditions_and_authoritative_params(
         assert payload["source"]["trial_id"] == source.top.trial_id
         assert payload["source"]["value"] == 0.9
         assert payload["training_config"] == {"epochs": 2, "batch": 4,
-                                              "imgsz": 64, "device": "cpu"}
+                                              "imgsz": 64, "device": "0"}
         # 正常情况下差异只可能来自 epochs
         assert payload["differences"] == {"epochs": {"original": 10,
                                                      "requested": 2}}
@@ -507,7 +560,7 @@ def test_train_best_uses_new_conditions_and_authoritative_params(
         args = json.loads(json.dumps(_read_yaml(train_dir / "args.yaml")))
         # 正式训练继承 HPO 的全部固定条件，只把 epochs 换成本次的正式轮数
         assert args["epochs"] == 2 and args["batch"] == 4
-        assert args["imgsz"] == 64 and args["device"] == "cpu"
+        assert args["imgsz"] == 64 and args["device"] == "0"
         # six search params + seed + bindings from the authoritative record
         for key in _SEARCH_KEYS:
             assert args[key] == source.top.candidate_params[key], key
@@ -521,9 +574,9 @@ def test_train_best_uses_new_conditions_and_authoritative_params(
         assert meta["study_id"] == source.study_id
         assert meta["trial_id"] == source.top.trial_id
         assert meta["training_config"] == {"epochs": 2, "batch": 4, "imgsz": 64,
-                                           "device": "cpu"}
+                                           "device": "0"}
         assert meta["original_conditions"] == {"epochs": 10, "batch": 4,
-                                              "imgsz": 64, "device": "cpu"}
+                                              "imgsz": 64, "device": "0"}
         assert meta["differences"] == {"epochs": {"original": 10, "requested": 2}}
         assert meta["search_params"]["optimizer"] == source.top.candidate_params["optimizer"]
 
@@ -531,7 +584,7 @@ def test_train_best_uses_new_conditions_and_authoritative_params(
     assert launched, "formal training must start one subprocess"
     cmd = launched[0]
     assert cmd[0] == "yolo" and cmd[1] == "train"
-    for key in ("epochs=2", "batch=4", "imgsz=64", "device=cpu"):
+    for key in ("epochs=2", "batch=4", "imgsz=64", "device=0"):
         assert key in cmd, key
     for key in _SEARCH_KEYS:
         assert f"{key}={source.top.candidate_params[key]}" in cmd, key
@@ -573,7 +626,7 @@ def test_formal_training_enables_plots_and_leaves_search_params_alone(
     verified = resolve_hpo_formal_training(
         source.service, source.runner, RunManager(), source.study_id,
         source.top.trial_id,
-        FormalTrainingConfig(epochs=2, batch=4, imgsz=64, device="cpu"))
+        FormalTrainingConfig(epochs=2, batch=4, imgsz=64, device="0"))
 
     assert verified.effective["plots"] is True
     # 搜索阶段（共享常量）仍然关闭绘图：覆盖只作用于本次正式训练的参数副本
@@ -641,7 +694,7 @@ def test_train_best_409_messages_distinguish_the_cause(
     )
 
     app_mod, launched = _patch_app(monkeypatch, tmp_path, source)
-    config = FormalTrainingConfig(epochs=2, batch=4, imgsz=64, device="cpu")
+    config = FormalTrainingConfig(epochs=2, batch=4, imgsz=64, device="0")
     trial_id = source.top.trial_id
     if cause == "source":
         trial_id = source.study_id + "_t9999"

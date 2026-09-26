@@ -34,6 +34,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **本文件 CLAUDE.md 由 Claude Code 维护**（Codex 不编写）。编码期间发现的文档/规范问题，在交付时口头提示即可。
 - 测试结果以 **Codex 的验证为准**；Claude Code 完成编码后不得宣称"已验证通过"，须等 Codex 测试确认。
 - **当前已发布稳定版本为 v0.2**；Studio S1.1–S1.5、S2.0–S2.4、体验修复 P1–P5、Q1、H1 与 **F1.1 产品优化与稳定版本冻结**均已完成独立验收。艾卡于 2026-09-18 确认 F1.1-A、F1.1-B、F1.1-C 整体验收通过；最终完整自动化为 **2738 passed / 2 warnings**，两条 warning 均为既有 sklearn PCA warning。F1.1 已恢复四模式、修正总体最佳展示与目标绑定、完成动态运行名转义、LLM 报告绑定与结构化输出约束，并保持已验收训练/HPO/LLM 协议不变。当前正式任务仍为 **YOLOv8 Detect**，下一入口为 **F1.2 Windows、单 Docker 镜像与 API 交付适配**；不设置 H1.4。软件操作手册已完成，软件安装手册待下一 Part 完成验收后编写。发布状态与下一批范围以交接记录和艾卡的新批准为准。每次只选择一个经艾卡批准的小批次，不要同时展开多个方向。
+- **F1.2-A（上传 PT 后手动导出 ONNX）已于 2026-09-20 通过验收**：受控权重库新增独立“模型库”页（顶部导航第六项），FP32 导出为主路径、FP16 保持硬关闭。返修要点：只有本服务校验并发布、且未被替换的产物才显示为“已导出”并可下载（同名预存文件不算，仍冲突且绝不覆盖）；可信来源确认绑定当前 `model_id` 且必须是请求里的显式 `true`（否则 `MODEL_EXPORT_TRUST_REQUIRED`，零子进程）；`model_store.export.fp16` 配置不再能开放半精度。**同一批次内随附修正（已随本批一并验收）**：同名但内容不同的权重上传不再报 `MODEL_NAME_CONFLICT`，新文件按 `<原 stem>_<SHA-256 前 12 位>.pt` 自动命名保存（候选名被占则逐位延长哈希前缀，原名同内容仍幂等复用，任何情况都不覆盖；255 字符上限、Windows 大小写与并发都按文件系统事实处理），API 与模型库提示给出实际落盘名，导出/下载名跟随实际文件名。完整基线 **2886 passed / 2 warnings**。验收通过后由 Codex 负责提交推送与文档回写；F1.2 后续子批次（B 起）按规格与交接记录推进。
+- **F1.2-B（Docker 可行性基线）已于 2026-09-21 通过 Codex 独立验收**：新增交付边界层 `auto_tune/delivery/runtime.py`（仅解析 `AUTO_TUNE_HOST`/`AUTO_TUNE_PORT`/`AUTO_TUNE_CONFIG_PATH`；未设变量时桌面默认逐字保持 `127.0.0.1:8000` 与包内 `auto_tune/config.yaml`，非法值报错且不回显原值）与最小运维探针 `GET /healthz`（精确 `{"status":"ok","product":"auto-tune-studio"}`，不读数据集/模型/凭据/训练状态，不进导航、不暴露版本/路径/环境/异常）；新增 `Dockerfile`、`.dockerignore`、`docker/entrypoint.sh`、`docker/requirements-runtime.txt`（48 项精确 pin；**不含** torch/torchvision——由 Dockerfile 从 CUDA 12.1 官方索引先装，不含 pytest 与 `pyreadline3`；按本批禁令**亦不含 onnx/onnxruntime/onnxslim**，故容器暂不支持 F1.2-A 的 ONNX 导出，留待 F1.2-C 决策）与单服务 `compose.yaml`（仅发布 `127.0.0.1:${AUTO_TUNE_PORT:-8000}:8000`、六路挂载、GPU 仅注释文档化）。实测：镜像可构建、CPU 容器 `healthy`、首页 200、配置由 sanitized 模板逐字节生成、重启与容器删除后宿主挂载数据保留、`docker run --gpus all` 下 RTX 3060 Laptop 报告 `cuda_available=True`（本批不含真实训练）。Codex 复审返修：`.dockerignore` 补齐 `docker-data` 与 `.env`/`.env.*` 排除（先 RED 后 GREEN），重建时以 40 MB 哨兵实测传输上下文仅 **77 KB**。完整基线 **2968 passed / 2 warnings**。本批未提交、未推送；提交与文档回写归 Codex。
 - 每次测试完后杀死测试用的服务器进程，让用户自己开启服务器自己测试。
 - **测试运行内存约束**：不要一次并行跑多个测试文件；逐个文件运行以节省本机内存（完整套件 `pytest auto_tune/tests` 除外）。
 
@@ -76,7 +78,8 @@ python -m auto_tune.main --train
 # Full suite（正式基线见 docs/development_handoff_20260814.md）
 # 最近官方验收基线：1484 passed / 2 PCA warnings / 0 skipped（Q1.1/Q1.2 验收后完整套件）
 # H1.1 新增 modules/hpo 模块与 6 个测试文件（test_hpo_*.py），已通过 Codex 验收（2026-09-08）；H1.1 验收后完整套件本地 1672 passed / 2 PCA warnings / 0 skipped
-# 最新完整基线：F1.1 验收冻结后 2738 passed / 2 warnings（此前本地运行：H1.3 后 2426、F1.1-A 页面返修后 2616、F1.1-B 后 2732）
+# 最新完整基线：F1.2-A（含同名自动命名修正）2886 passed / 2 warnings（此前：F1.2-A 验收时 2876、F1.1 冻结后 2738；本地运行 H1.3 后 2426、F1.1-A 页面返修后 2616、F1.1-B 后 2732）
+# 注：Codex 首轮记录的 F1.2-A 基线“2838 passed”实为 2838 passed + 1 failed（既有 test_s14_page_has_no_zip_upload_control 与受控权重 .pt 上传控件冲突，返修中收窄该断言后共 2839 + 37 新增 = 2876）
 # 内存约束：新批次定向测试请逐个文件运行，不要一次并行跑多个测试文件
 python -m pytest auto_tune\tests -q -p no:cacheprovider
 

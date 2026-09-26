@@ -26,6 +26,10 @@ _MODEL_ID_PREFIX = "sha256:"
 _EXTENSION = ".pt"
 _MAX_FILE_NAME = 255
 
+# 同名不同内容时的自动命名：<原 stem>_<SHA-256 前 n 位><原后缀>，n 从这里开始
+# 逐位延长，直到候选名唯一。哈希前缀是唯一性的来源，因此截断只动 stem。
+_AUTO_NAME_HASH_LENGTHS = range(12, 65)
+
 MODEL_UPLOAD_INVALID_NAME = "MODEL_UPLOAD_INVALID_NAME"
 MODEL_UPLOAD_INVALID_TYPE = "MODEL_UPLOAD_INVALID_TYPE"
 MODEL_UPLOAD_EMPTY = "MODEL_UPLOAD_EMPTY"
@@ -117,6 +121,28 @@ def _configured_basename(configured) -> str | None:
         # 驱动器路径（C:yolov8n.pt）与 NTFS 备用数据流（yolov8n.pt:stream）
         return None
     return configured
+
+
+def _split_stem_suffix(name: str) -> tuple[str, str]:
+    """拆出 stem 与后缀；后缀保留原始大小写（``.pt`` / ``.PT``）。"""
+    suffix = Path(name).suffix
+    return name[:len(name) - len(suffix)], suffix
+
+
+def _auto_name_candidates(name: str, sha256: str):
+    """候选文件名：先原名，再 ``<stem>_<哈希前 n 位><后缀>``（n 递增）。
+
+    这个名字永远不超过 :data:`_MAX_FILE_NAME`：必要时截断 stem，哈希前缀
+    一位不减——它是唯一性的唯一来源。
+    """
+    yield name
+    stem, suffix = _split_stem_suffix(name)
+    for length in _AUTO_NAME_HASH_LENGTHS:
+        tail = "_%s%s" % (sha256[:length], suffix)
+        room = _MAX_FILE_NAME - len(tail)
+        if room < 1:
+            return
+        yield stem[:room] + tail
 
 
 def _identity_rank(row: ModelRecord) -> tuple:
@@ -277,9 +303,11 @@ class ModelStore:
 
         The bytes are opaque: they are hashed while being written to a unique
         same-directory temporary file, then committed with an atomic
-        ``os.link`` that refuses to overwrite an existing name. Any failure
-        removes this call's temporary file — never a half file, never a stale
-        temp name.
+        ``os.link`` that refuses to overwrite an existing name. A name already
+        taken by *different* content is not an error the operator has to fix by
+        hand: the new file is saved as ``<stem>_<sha256[:12]><suffix>`` and the
+        record reports the name it actually landed on. Any failure removes this
+        call's temporary file — never a half file, never a stale temp name.
         """
         name = self._validated_name(filename)
         root = self._ready_root()
@@ -307,7 +335,7 @@ class ModelStore:
                     raise ModelStoreError(MODEL_UPLOAD_EMPTY, "权重文件为空。")
                 handle.flush()
                 os.fsync(handle.fileno())
-            record = self._commit(temp, target, name, size, digest.hexdigest())
+            record = self._commit(temp, root, name, size, digest.hexdigest())
         except ModelStoreError:
             self._discard(temp)
             raise
@@ -321,21 +349,34 @@ class ModelStore:
             self._known[record.model_id] = record
         return record
 
-    def _commit(self, temp: Path, target: Path, name: str, size: int,
+    def _commit(self, temp: Path, root: Path, name: str, size: int,
                 sha256: str) -> ModelRecord:
-        try:
-            # 原子创建最终名称；目标已存在时该调用失败，绝不覆盖
-            os.link(temp, target)
-        except FileExistsError:
-            existing = self._existing_identity(target)
-            if existing is not None and existing[1] == sha256:
-                return ModelRecord(_MODEL_ID_PREFIX + sha256, name, existing[0],
-                                   sha256, "managed", target, True)
-            raise ModelStoreError(
-                MODEL_NAME_CONFLICT,
-                "受控权重库中已存在同名但内容不同的权重，请改名后重试。")
-        return ModelRecord(_MODEL_ID_PREFIX + sha256, name, size, sha256,
-                           "managed", target, True, True)
+        """Commit the temp file under a name nothing else occupies.
+
+        Candidates start at the requested name and fall back to longer and
+        longer hash suffixes. An existing candidate is only ever read: the same
+        content is reused as-is (idempotent re-upload), different content moves
+        on to the next candidate. Only when every candidate is occupied does
+        this become the stable conflict the operator has to resolve by hand.
+        """
+        for candidate in _auto_name_candidates(name, sha256):
+            target = root / candidate
+            try:
+                # 原子创建最终名称；目标已存在时该调用失败，绝不覆盖
+                os.link(temp, target)
+            except FileExistsError:
+                existing = self._existing_identity(target)
+                if existing is not None and existing[1] == sha256:
+                    # 同名同内容：复用已保存的那一份，不新建、不覆盖
+                    return ModelRecord(_MODEL_ID_PREFIX + sha256, candidate,
+                                       existing[0], sha256, "managed", target,
+                                       True)
+                continue
+            return ModelRecord(_MODEL_ID_PREFIX + sha256, candidate, size,
+                               sha256, "managed", target, True, True)
+        raise ModelStoreError(
+            MODEL_NAME_CONFLICT,
+            "受控权重库中已存在同名但内容不同的权重，自动命名候选也已占满，请改名后重试。")
 
     def _existing_identity(self, target: Path):
         if not _is_plain_file(target):
@@ -385,6 +426,23 @@ class ModelStore:
 
     def resolve(self, model_id: str) -> Path:
         """Re-verify a previously listed id against the current file facts."""
+        return self.resolve_record(model_id).path
+
+    def resolve_managed(self, model_id: str) -> ModelRecord:
+        """Resolve a listed id that must be an operator-uploaded weight.
+
+        Legacy compatibility weights stay readable as initial weights but are
+        only borrowed, so they are not an exportable source. The store reports
+        the forbidden source class here; the caller owns the client-facing code.
+        """
+        record = self.resolve_record(model_id)
+        if record.origin != "managed":
+            raise ModelStoreError(MODEL_PATH_FORBIDDEN,
+                                  "该权重来源不支持该操作，请先上传到受控权重库。")
+        return record
+
+    def resolve_record(self, model_id: str) -> ModelRecord:
+        """Re-verify a previously listed id against the current file facts."""
         if not isinstance(model_id, str) or not model_id.startswith(_MODEL_ID_PREFIX):
             raise ModelStoreError(MODEL_NOT_FOUND, "未找到该受控权重，请重新选择。")
         digest = model_id[len(_MODEL_ID_PREFIX):]
@@ -404,7 +462,7 @@ class ModelStore:
         except OSError as exc:
             raise ModelStoreError(MODEL_NOT_FOUND,
                                   "受控权重文件已不存在，请重新选择。") from exc
-        return record.path
+        return record
 
     def resolve_configured_record(self, configured: str | None) -> ModelRecord:
         """Resolve a configured basename to its controlled-library record.

@@ -5,6 +5,7 @@ gate, the routing table and the error projection are the shipping ones. Only
 the store instance is rebound to a temporary controlled root.
 """
 
+import hashlib
 import io
 import os
 import pickle
@@ -16,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from auto_tune.modules.model_store import ModelStore, ModelStoreError
+from auto_tune.modules.model_store.onnx_export import OnnxExportService
 from auto_tune.ui import app as app_mod
 from auto_tune.ui.model_store_api import create_model_store_router
 
@@ -64,7 +66,8 @@ def isolated_router(tmp_path):
 
     app = FastAPI()
     app.include_router(create_model_store_router(
-        store=store, require_security=lambda request: None))
+        store=store, exports=OnnxExportService(store),
+        require_security=lambda request: None))
     return store, TestClient(app)
 
 
@@ -131,16 +134,43 @@ def test_re_uploading_the_same_content_reports_it_already_exists(api):
     assert sorted(p.name for p in api.root.iterdir()) == ["custom.pt"]
 
 
-def test_upload_rejects_a_different_file_with_the_same_name(api):
+def test_upload_with_a_taken_name_reports_the_actual_saved_name(api):
     first = api.upload(api.client)
-    conflict = api.upload(api.client, data=b"different")
+    data = b"different"
+    second = api.upload(api.client, data=data)
 
-    assert conflict.status_code == 409
-    assert conflict.json()["error_code"] == "MODEL_NAME_CONFLICT"
+    # 同名不同内容不再报冲突：文件被自动命名保存，响应给出**实际**文件名
+    assert second.status_code == 201
+    body = second.json()
+    expected = "custom_%s.pt" % hashlib.sha256(data).hexdigest()[:12]
+    assert body["status"] == "created"
+    assert body["model"]["name"] == expected
+    assert body["model"]["sha256"] == hashlib.sha256(data).hexdigest()
+    assert (api.root / expected).read_bytes() == data
+
+    # 旧权重原样保留，两份都在列表里，响应不泄露服务器路径
     assert (api.root / "custom.pt").read_bytes() == _PAYLOAD
-    assert sorted(p.name for p in api.root.iterdir()) == ["custom.pt"]
+    assert sorted(p.name for p in api.root.iterdir()) == sorted(
+        ["custom.pt", expected])
+    assert str(api.tmp) not in second.text
+    assert "Traceback" not in second.text
     assert first.json()["model"]["model_id"] in api.client.get(
         "/api/models").text
+    assert body["model"]["model_id"] in api.client.get("/api/models").text
+
+
+def test_re_uploading_the_same_content_under_a_taken_name_is_idempotent(api):
+    api.upload(api.client)
+    data = b"different"
+    first = api.upload(api.client, data=data)
+
+    again = api.upload(api.client, data=data)
+
+    assert again.status_code == 200
+    assert again.json()["status"] == "exists"
+    assert again.json()["model"]["name"] == first.json()["model"]["name"]
+    assert sorted(p.name for p in api.root.iterdir()) == sorted(
+        ["custom.pt", first.json()["model"]["name"]])
 
 
 def test_upload_requires_csrf_and_same_origin(api):

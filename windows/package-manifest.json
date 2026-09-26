@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0",
+  "product": "auto-tune-studio",
+  "version": "0.2.0",
+  "python_version": "3.10",
+  "package": {
+    "scripts_include": [
+      "*.bat",
+      "*.ps1",
+      "lib/**",
+      "package-manifest.json",
+      "requirements-windows.lock.txt"
+    ],
+    "scripts_exclude": [
+      "build_zip.ps1",
+      "prepare_offline_bundle.ps1"
+    ]
+  },
+  "payload": {
+    "include": [
+      "auto_tune/"
+    ],
+    "exclude": [
+      "auto_tune/tests/",
+      "auto_tune/scripts/",
+      "auto_tune/evaluation/",
+      "auto_tune/docs/",
+      "auto_tune/requirements.txt",
+      "**/*.md"
+    ]
+  },
+  "install": {
+    "required_free_bytes": 12884901888,
+    "default_port": 8000,
+    "host": "127.0.0.1"
+  },
+  "runtime": {
+    "conda_installer": {
+      "url": "https://repo.anaconda.com/miniconda/Miniconda3-py310_25.1.1-2-Windows-x86_64.exe",
+      "file_name": "Miniconda3-py310_25.1.1-2-Windows-x86_64.exe",
+      "sha256": "80ff6cb7cef57be6ff1c7997fad96de3783934e9cea5c46769f840b8bd5b921f",
+      "size": 90623048
+    },
+    "torch": {
+      "packages": [
+        "torch==2.5.1",
+        "torchvision==0.20.1"
+      ],
+      "index_url": "https://download.pytorch.org/whl/cu121",
+      "wheels": [
+        {
+          "file_name": "torch-2.5.1+cu121-cp310-cp310-win_amd64.whl",
+          "version": "2.5.1+cu121",
+          "sha256": "9b22d6d98aa56f9317902dec0e066814a6edba1aada90110ceea2bb0678df22f",
+          "size": 2449372784,
+          "purpose": "cuda-torch"
+        },
+        {
+          "file_name": "torchvision-0.20.1+cu121-cp310-cp310-win_amd64.whl",
+          "version": "0.20.1+cu121",
+          "sha256": "4cb1e44c1f7a4992f6d38a15633a1e694c093f1c52f3a036b1a719968031507a",
+          "size": 6063665,
+          "purpose": "cuda-torchvision"
+        }
+      ]
+    },
+    "offline": {
+      "directory": "offline",
+      "miniconda_directory": "miniconda",
+      "wheelhouse_directory": "wheelhouse",
+      "lock_file": "offline-lock.json"
+    },
+    "pip_requirements": "requirements-windows.lock.txt",
+    "pip_requirements_sha256": "2f66846ba6f94f9cce3d49e7a472d3a04c6f2a628608b94958787c93ddc201d1"
+  }
+}

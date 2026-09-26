@@ -15,9 +15,15 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from auto_tune.delivery.runtime import (  # noqa: E402  (needs sys.path first)
+    PACKAGE_CONFIG_PATH,
+    resolve_config_path,
+    resolve_server_bind,
+)
+
 
 def load_config() -> dict:
-    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    config_path = resolve_config_path(PACKAGE_CONFIG_PATH)
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -65,8 +71,7 @@ def main():
     # Default: start web UI
     from auto_tune.ui.app import start_server
     config = load_config()
-    host = "127.0.0.1"
-    port = 8000
+    host, port = resolve_server_bind()
     print("=" * 60)
     print("  Auto-Tune Dashboard")
     print("=" * 60)

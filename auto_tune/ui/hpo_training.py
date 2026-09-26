@@ -28,7 +28,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from auto_tune.modules.hpo import HpoError, rank_trials
+from auto_tune.modules.hpo import HpoError, rank_trials, require_gpu_device
 from auto_tune.modules.hpo.models import StrictInt
 from auto_tune.modules.hpo.execution_adapter import FIXED_PARAMS
 from auto_tune.modules.hpo.search_space import validate_candidate
@@ -269,6 +269,11 @@ def resolve_hpo_formal_training(service, runner, manager, study_id: str,
     # 最后施加正式训练覆盖，保证 plots=True 是这一次重建的唯一权威取值
     # （四项条件与六个搜索参数都不含该键，覆盖不会被后续 update 顶掉）。
     effective.update(FORMAL_TRAINING_OVERRIDES)
+
+    # F1.2-C 交付设备约束：正式交付只交付 GPU 训练。历史 COMPLETED CPU 研究仍可
+    # 读取、列排名、下载产物，但重建出的正式训练条件若是 CPU，就在创建任何训练
+    # 目录/状态/控制器/进程之前拒绝（与 HPO 创建/启动/恢复同一个 ``HPO_GPU_REQUIRED``）。
+    require_gpu_device(effective.get("device"))
 
     return VerifiedFormalTraining(
         study_id=study_id,
@@ -1171,6 +1176,7 @@ def _json_accepted(run_state, train_name: str, verified: VerifiedFormalTraining)
 
 
 _TRAINING_ERROR_STATUS = {
+    "HPO_GPU_REQUIRED": 422,
     "HPO_INVALID_CONFIG": 422,
     "HPO_INVALID_EXECUTION_CONFIG": 422,
     "HPO_INVALID_RESULT": 422,
@@ -1193,6 +1199,9 @@ _TRAINING_ERROR_STATUS = {
 
 # 409 必须区分来源失效/绑定失效/占用等，不能一律提示“已有训练”。
 _TRAINING_ERROR_TEXT = {
+    "HPO_GPU_REQUIRED": ("正式交付只交付 GPU 训练：该来源研究以 CPU 运行，"
+                         "不能用于正式训练，系统未启动训练。",
+                         "请改用在 GPU 上完成的研究，或重新以 GPU 创建并完成一次搜索。"),
     "HPO_INVALID_CONFIG": ("正式训练条件不合法，未启动训练。",
                            "请按界面提示的范围修正训练轮数、Batch、图像尺寸与计算设备。"),
     "HPO_INVALID_EXECUTION_CONFIG": ("正式训练条件不合法，未启动训练。",

@@ -32,6 +32,7 @@ from auto_tune.modules.hpo import (
     HpoService,
     StudyConfig,
     rank_trials,
+    require_gpu_device,
     search_space_summary,
 )
 from auto_tune.modules.hpo.models import (
@@ -51,6 +52,7 @@ _HPO_STATUS = {
     "HPO_INVALID_CONFIG": 422,
     "HPO_INVALID_EXECUTION_CONFIG": 422,
     "HPO_INVALID_RESULT": 422,
+    "HPO_GPU_REQUIRED": 422,
     "HPO_NOT_FOUND": 404,
     "HPO_PENDING_TRIAL": 409,
     "HPO_BUDGET_EXHAUSTED": 409,
@@ -69,6 +71,8 @@ _HPO_STATUS = {
 }
 
 _NEXT_ACTION = {
+    # 交付设备约束（F1.2-C）：只有 GPU 训练被交付，提示必须可操作（去哪选）
+    "gpu": "请刷新页面，在“计算设备”中选择一个已探测到的 GPU 编号后重试。",
     "busy": "已有其他训练占用，请先停止或等待其完成后再操作。",
     "conflict": "该任务状态不允许此操作，请按界面提示先恢复或停止。",
     "recovery": "该任务处于需要处理的状态，请先检查并恢复；BLOCKED 不支持强制继续。",
@@ -79,6 +83,8 @@ _NEXT_ACTION = {
 }
 
 _ERR_TEMPLATE = {
+    "HPO_GPU_REQUIRED": ("gpu", "正式交付只交付 GPU 训练，不支持 CPU 调优："
+                                "该计算设备不可用（CPU 或未探测到的 GPU 编号）。"),
     "HPO_INVALID_CONFIG": ("input", "输入不合法。"),
     "HPO_INVALID_EXECUTION_CONFIG": ("input", "执行配置不合法。"),
     "HPO_INVALID_RESULT": ("input", "试验结果不合法。"),
@@ -769,7 +775,7 @@ def _best_payload(service, runner, study, ranked) -> dict:
 
 def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_model,
                       assert_training_slot_free, list_snapshots=None,
-                      list_models=None) -> APIRouter:
+                      list_models=None, available_gpus=None) -> APIRouter:
     """Build the read-only/control HPO router bound to the given instances.
 
     ``resolve_snapshot(snapshot_id)`` returns the validated published snapshot
@@ -807,6 +813,34 @@ def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_mod
             status_code=500,
         )
 
+    def _device_gate(device) -> JSONResponse | None:
+        """交付设备边界：新建/启动/恢复不得绑定 CPU，GPU 编号须已探测到。
+
+        ``require_gpu_device`` 是与硬件无关的硬约束（正式交付只交付 GPU 训练）。
+        本机是否真的看得到那张卡由 ``available_gpus()`` 决定；它由调用方注入
+        （app.py 传本机探测结果），未注入时只保留 CPU 禁令——这样契约测试不依赖
+        宿主机硬件。历史 ``hpo-execution-v1`` 记录里的 ``device="cpu"`` 照常读取
+        与展示，只有会产生新训练的路径经过这里。
+        """
+        try:
+            require_gpu_device(device)
+        except HpoError as exc:
+            return _hpo_error_response(exc)
+        if available_gpus is None:
+            return None
+        try:
+            probed = {int(index) for index in available_gpus()}
+        except Exception:  # 探测失败即"没有可用 GPU"，绝不因此放行
+            probed = set()
+        try:
+            index = int(device)
+        except (TypeError, ValueError):
+            index = -1
+        if index not in probed:
+            return _hpo_error_response(HpoError(
+                "HPO_GPU_REQUIRED", "device is not an available GPU"))
+        return None
+
     async def _create(request: Request):
         try:
             payload = CreateStudyRequest.model_validate(await request.json())
@@ -814,6 +848,10 @@ def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_mod
             return field_error_response(exc)
         except (ValueError, TypeError, json.JSONDecodeError):
             return _bad_request("请求体不是合法的 JSON。")
+        # 设备约束先于任何绑定解析：拒绝时零研究、零执行记录、零进程。
+        device_error = _device_gate(payload.execution_config.device)
+        if device_error is not None:
+            return device_error
         try:
             snapshot_dir = resolve_snapshot(payload.snapshot_id)
             model_path = resolve_model(payload.model_id)
@@ -856,6 +894,11 @@ def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_mod
             if execution is None:
                 return _hpo_error_response(
                     HpoError("HPO_EXECUTION_CONFLICT", "该研究尚未绑定执行配置，无法启动。"))
+            # 旧记录里可能存在 device="cpu" 的执行事实：只能只读展示，
+            # 任何会启动新训练的操作都在这里被稳定拒绝。
+            device_error = _device_gate(execution.config.device)
+            if device_error is not None:
+                return device_error
             if execution.status == "COMPLETED":
                 return _status(study_id)
             if execution.status == "RUNNING":
@@ -983,6 +1026,10 @@ def create_hpo_router(*, service, runner, manager, resolve_snapshot, resolve_mod
             if execution is None:
                 return _hpo_error_response(
                     HpoError("HPO_EXECUTION_CONFLICT", "该研究尚未绑定执行配置，无法恢复。"))
+            # 与 start 同一设备边界：旧 CPU 研究只能读，不能借恢复入口启动训练。
+            device_error = _device_gate(execution.config.device)
+            if device_error is not None:
+                return device_error
             if execution.status == "COMPLETED":
                 return _status(study_id)
             if execution.status == "BLOCKED":

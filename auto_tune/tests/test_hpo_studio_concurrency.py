@@ -228,7 +228,7 @@ class Stack:
             "snapshot_id": self.snapshot.snapshot_id,
             "model_id": self.model_id,
             "study_config": {"budget": self.BUDGET, "epochs": 1},
-            "execution_config": {"batch": 1, "imgsz": 64, "device": "cpu",
+            "execution_config": {"batch": 1, "imgsz": 64, "device": "0",
                                  "timeout_seconds": 120},
         })
         assert resp.status_code == 201, resp.text

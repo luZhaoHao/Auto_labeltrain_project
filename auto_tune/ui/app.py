@@ -46,6 +46,13 @@ from auto_tune.modules.security.endpoint_policy import (
     validate_endpoint,
 )
 from auto_tune.modules.security.redaction import safe_provider_error
+from auto_tune.delivery.runtime import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    PACKAGE_CONFIG_PATH,
+    resolve_config_path,
+    resolve_server_bind,
+)
 
 
 def _safe_extract_zip(zf: zipfile.ZipFile, destination: str | Path) -> None:
@@ -124,6 +131,11 @@ from auto_tune.modules.run_state.manual_controller import ManualRunController
 from auto_tune.modules.run_state.tuning_controller import TuningRunController
 from auto_tune.modules.hpo import HpoError, HpoRunner, HpoService
 from auto_tune.modules.model_store import ModelStore, ModelStoreError
+from auto_tune.modules.model_store.onnx_export import (
+    DEFAULT_TIMEOUT_SECONDS as DEFAULT_EXPORT_TIMEOUT_SECONDS,
+    FP16_VERIFIED_DEFAULT,
+    OnnxExportService,
+)
 from .hpo_api import create_hpo_router, safe_hpo_error_code
 from .hpo_reuse import resolve_hpo_verification
 from .hpo_training import TrainingSubmitDeps, create_hpo_training_router
@@ -577,7 +589,7 @@ _jinja_env.filters["basename"] = _jinja_basename
 _jinja_env.filters["merge_suggestion_changes"] = _merge_suggestion_changes
 
 # Config — plaintext api_key is never loaded into the public APP_CONFIG.
-config_path = Path(__file__).parent.parent / "config.yaml"
+config_path = resolve_config_path(PACKAGE_CONFIG_PATH)
 
 
 def _load_public_config() -> dict:
@@ -3370,6 +3382,7 @@ async def analyze_training_folder(request: Request):
 # ── First-time Training API ──
 
 _HPO_REUSE_STATUS = {
+    "HPO_GPU_REQUIRED": 422,
     "HPO_NO_SUCCESS": 409,
     "HPO_SOURCE_INVALID": 409,
     "HPO_NOT_FOUND": 409,
@@ -3391,10 +3404,12 @@ def _hpo_reuse_error_response(exc: HpoError) -> JSONResponse:
     code = safe_hpo_error_code(exc.code)
     status = _HPO_REUSE_STATUS.get(code, 500)
     message = {
+        422: "正式交付只交付 GPU 训练：该来源研究以 CPU 运行，不能用于验证训练。",
         409: "该最佳配置当前不可用于验证。",
         500: "研究记录暂不可用。",
     }[status]
     next_action = {
+        422: "系统未启动训练；请改用在 GPU 上完成的研究。",
         409: "请刷新研究结果后重试；系统未启动训练。",
         500: "系统未启动训练，请稍后重试。",
     }[status]
@@ -3947,6 +3962,32 @@ def _build_model_store() -> "ModelStore":
 _MODEL_STORE = _build_model_store()
 
 
+def _build_onnx_export_service() -> "OnnxExportService":
+    """Manual PT → ONNX export over the same controlled library.
+
+    The store is passed as an accessor so a rebound module global (tests, a
+    reload) is picked up without rebuilding the service.
+
+    半精度在本批硬关闭：``model_store.export.fp16`` 不再被读取，本地配置为
+    ``true`` 也不能绕过尚未完成的半精度实测验收（原因与开放条件见
+    ``onnx_export.FP16_VERIFIED_DEFAULT``）。开放半精度必须由独立实测与明确
+    的版本变更决定，不是一次配置改动。
+    """
+    cfg = ((APP_CONFIG.get("model_store") or {}).get("export") or {})
+    try:
+        timeout = int(cfg.get("timeout_seconds", DEFAULT_EXPORT_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_EXPORT_TIMEOUT_SECONDS
+    return OnnxExportService(
+        lambda: _MODEL_STORE,
+        timeout_seconds=timeout,
+        fp16_available=FP16_VERIFIED_DEFAULT,
+    )
+
+
+_MODEL_EXPORT_SERVICE = _build_onnx_export_service()
+
+
 def list_local_models() -> list[dict]:
     """Short-term compatibility wrapper over the one controlled weight store.
 
@@ -4113,19 +4154,36 @@ def _available_gpus() -> list[int]:
     return list(range(min(count, 64)))
 
 
-def _default_device(raw) -> tuple[str, dict | None]:
-    """计算设备默认值：配置优先；缺失时 GPU 可用默认 ``0``，否则 CPU + 提示。
+# F1.2-C：正式交付只交付 GPU 训练。无 GPU 时既不降级成 CPU，也不把配置里的
+# ``cpu`` 当作可提交默认值；只给出"没有可提交设备"的事实与可操作提示。
+_HPO_NO_GPU_MESSAGE = ("未检测到可用的 GPU：本版本只交付 GPU 训练，不提供 CPU 运行模式。"
+                       "请确认显卡驱动与容器 GPU 预留后重新进入本模式。")
+_HPO_CPU_CONFIG_MESSAGE = ("当前训练配置的计算设备是 CPU，本版本不交付 CPU 训练："
+                           "请在“计算设备”中选择一个 GPU 编号后再开始。")
 
-    在 GPU 可用的本机绝不静默回退 CPU；无 GPU 时明确给出可操作提示。
+
+def _default_device(raw, gpus=None) -> tuple[str | None, dict | None]:
+    """计算设备默认值：只从**已探测到**的 GPU 编号里取值，绝不回退 CPU。
+
+    规则（F1.2-C 只交付 GPU 训练）：
+    - 没有探测到任何 GPU：返回 ``None`` + 可操作提示。本机没有任何 GPU 训练
+      可言，草稿不得给出一个连选择器都列不出来的"可提交"设备值。
+    - 有 GPU 且配置里写着一个合法 GPU 编号：原值透传（可能不在探测列表里，
+      界面据此保持不可创建），绝不静默替换成别的卡。
+    - 有 GPU 但配置写着 ``cpu``：``None`` + 提示，CPU 永不是可提交默认值。
+    - 非法配置值：原值透传 + ``CONFIG_VALUE_INVALID`` 警告（既有契约）。
     """
-    if raw is not None:
-        if isinstance(raw, str) and _HPO_DEVICE_RE.fullmatch(raw.strip()):
-            return raw.strip(), None
+    gpus = _available_gpus() if gpus is None else list(gpus)
+    if raw is not None \
+            and not (isinstance(raw, str) and _HPO_DEVICE_RE.fullmatch(raw.strip())):
         return raw, {"code": "CONFIG_VALUE_INVALID", "field": "device"}
-    if _cuda_available():
-        return "0", None
-    return "cpu", {"code": "GPU_NOT_AVAILABLE_CPU_FALLBACK",
-                   "message": "未检测到可用 GPU，已使用 CPU；如需 GPU 训练请在“计算设备”中填写显卡编号。"}
+    if not gpus:
+        return None, {"code": "GPU_NOT_AVAILABLE", "message": _HPO_NO_GPU_MESSAGE}
+    if raw is None:
+        return str(gpus[0]), None
+    if raw.strip() == "cpu":
+        return None, {"code": "GPU_REQUIRED", "message": _HPO_CPU_CONFIG_MESSAGE}
+    return raw.strip(), None
 
 
 def _valid_int_in(value, low: int, high: int) -> bool:
@@ -4239,7 +4297,8 @@ def build_hpo_defaults() -> dict:
     batch = number("batch", *_HPO_BATCH_RANGE, fallback=16)
     imgsz = number("imgsz", *_HPO_IMGSZ_RANGE, fallback=640, multiple=32)
     formal_epochs = number("default_epochs", *_HPO_EPOCHS_RANGE, fallback=100)
-    dev, device_notice = _default_device(configured("device"))
+    gpus = _available_gpus()
+    dev, device_notice = _default_device(configured("device"), gpus)
     if device_notice is not None:
         if device_notice.get("code") == "CONFIG_VALUE_INVALID":
             warnings.append({"code": "CONFIG_VALUE_INVALID", "field": "device"})
@@ -4265,10 +4324,11 @@ def build_hpo_defaults() -> dict:
             "imgsz": imgsz,
             "device": dev,
         },
-        # 已探测设备：UI 只列这些 GPU 编号与 CPU（明确选择控件，不用自由文本），
-        # 权威默认来自配置或 GPU 探测，绝不静默回退 CPU。
-        "devices": {"gpus": _available_gpus(), "default": dev},
-        # 无 GPU 时的可操作提示（仅提示，不改变用户已选条件）
+        # 已探测设备：UI 只列这些 GPU 编号（明确选择控件，不用自由文本，也不含
+        # CPU）；权威默认来自配置或 GPU 探测，无 GPU 时 ``default`` 为 None 且
+        # 创建入口保持不可用。
+        "devices": {"gpus": gpus, "default": dev},
+        # 无法提交设备时的可操作提示（仅提示，不改变用户已选条件）
         "device_notice": (device_notice
                           if device_notice and device_notice.get("message")
                           else None),
@@ -4295,13 +4355,15 @@ app.include_router(
         assert_training_slot_free=_assert_training_slot_free,
         list_snapshots=list_published_snapshots,
         list_models=list_local_models,
+        available_gpus=_available_gpus,
     ),
     prefix="/api/hpo",
 )
 app.include_router(
     create_model_store_router(
-        # accessor, not a captured instance: the module global is the truth
+        # accessors, not captured instances: the module globals are the truth
         store=lambda: _MODEL_STORE,
+        exports=lambda: _MODEL_EXPORT_SERVICE,
         require_security=_require_security_verdict,
     ),
 )
@@ -4321,10 +4383,28 @@ app.include_router(
 )
 
 
+# ── Delivery: operational probe ──
+@app.get("/healthz")
+async def healthz():
+    """Infrastructure probe for the container runtime.
+
+    Reads no dataset, model, credential or training state, and reports no
+    version, path, environment value or exception detail. Not part of the
+    user-facing navigation.
+    """
+    return {"status": "ok", "product": "auto-tune-studio"}
+
+
 # ── Run ──
-def start_server(host: str = "127.0.0.1", port: int = 8000):
+def start_server(host: str | None = None, port: int | None = None):
     import uvicorn
     import time
+    # Controlled delivery boundary: desktop defaults stay 127.0.0.1:8000,
+    # a container overrides them through AUTO_TUNE_HOST/AUTO_TUNE_PORT.
+    host, port = resolve_server_bind(
+        DEFAULT_HOST if host is None else host,
+        DEFAULT_PORT if port is None else port,
+    )
     # Preload cache so the first request is fast
     t0 = time.time()
     _log = f"[{time.strftime('%H:%M:%S')}] Preloading data cache ...\n"

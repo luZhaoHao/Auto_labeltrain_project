@@ -1,0 +1,50 @@
+# Auto-Tune Studio — one service, one image, one container (F1.2-C).
+#
+# Build and start:
+#   docker build --pull=false -t auto-tune:local .
+#   docker compose up -d
+#   curl http://127.0.0.1:8000/healthz
+#
+# The normal start requests the NVIDIA GPU: the formal delivery trains on the
+# GPU only, so a host without a usable device stops the container with
+# DELIVERY_GPU_UNAVAILABLE instead of degrading to a CPU run.
+#
+# Host directories are created on first start. Override the data root with
+# AUTO_TUNE_DATA_DIR (and AUTO_TUNE_DATASETS_DIR for the dataset share) when
+# the defaults do not fit. Nothing here contains a credential: the container
+# reads the sanitized template from the image on first start only, and refuses
+# to start when a persistent directory is not mounted.
+
+services:
+  studio:
+    image: auto-tune:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: auto-tune-studio
+    restart: unless-stopped
+    # The Engine's default /dev/shm is 64 MiB: the multi-worker training
+    # DataLoader dies with a bus error (exit code 1) well below 1 GiB.
+    shm_size: 1gb
+    ports:
+      - "127.0.0.1:${AUTO_TUNE_PORT:-8000}:8000"
+    environment:
+      AUTO_TUNE_HOST: "0.0.0.0"
+      AUTO_TUNE_PORT: "8000"
+      AUTO_TUNE_CONFIG_PATH: "/data/config/config.yaml"
+      AUTO_TUNE_APP_ROOT: "/opt/auto-tune"
+      AUTO_TUNE_DATASETS_DIR: "/data/datasets"
+    volumes:
+      - "${AUTO_TUNE_DATA_DIR:-./docker-data}/config:/data/config"
+      - "${AUTO_TUNE_DATA_DIR:-./docker-data}/log:/opt/auto-tune/log"
+      - "${AUTO_TUNE_DATA_DIR:-./docker-data}/detect:/opt/auto-tune/detect"
+      - "${AUTO_TUNE_DATA_DIR:-./docker-data}/runs:/opt/auto-tune/runs"
+      - "${AUTO_TUNE_DATA_DIR:-./docker-data}/models/weights:/opt/auto-tune/models/weights"
+      - "${AUTO_TUNE_DATASETS_DIR:-./docker-data/datasets}:/data/datasets"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

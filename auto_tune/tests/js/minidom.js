@@ -188,6 +188,7 @@ class Element {
 
   setAttribute(key, value) { this.attributes[key] = String(value); }
   getAttribute(key) { return this.attributes[key] === undefined ? null : this.attributes[key]; }
+  removeAttribute(key) { delete this.attributes[key]; }
 
   // ``dataset`` and ``getAttribute('data-*')`` must be one store: the renderers
   // set one and the click handlers read the other (``this.dataset.trainName``),
@@ -804,6 +805,24 @@ function modelLibraryPayload() {
   };
 }
 
+// F1.2-A 导出状态的安全投影：与 UI 期望一致（没有路径、没有子进程细节）。
+// 默认“可导出、尚无任何导出、半精度未验证”，与当前产品默认一致。
+function exportStatusPayload(modelId, overrides) {
+  const base = {
+    model_id: modelId || MODEL_ID_MANAGED,
+    origin: 'managed',
+    exportable: true,
+    fp16_available: false,
+    exports: { fp32: null, fp16: null },
+  };
+  return Object.assign(base, overrides || {});
+}
+
+function exportedOnnx(modelId, precision, name, size, url) {
+  return { model_id: modelId, precision: precision, name: name,
+           size_bytes: size, download_url: url };
+}
+
 function defaultsPayload() {
   return {
     dataset: { registered: true, display_name: 'demo', reason_code: 'REGISTERED_SNAPSHOT',
@@ -1033,6 +1052,10 @@ function defaultHandler(url) {
   }
   if (url.indexOf('/api/models/upload') >= 0) {
     return { status: 200, body: { status: 'exists', model: modelLibraryPayload().models[0] } };
+  }
+  // 导出状态先于 /api/models 匹配：两者前缀相同，顺序错了会拿到权重列表体
+  if (url.indexOf('/api/models/export') >= 0) {
+    return { status: 200, body: exportStatusPayload() };
   }
   if (url.indexOf('/api/models') >= 0) return { status: 200, body: modelLibraryPayload() };
   if (url.indexOf('/formal-runs') >= 0) {
@@ -1567,6 +1590,15 @@ const SCENARIOS = {
   /* 第五轮 Task 2：五项技术设置默认收进“高级技术选项”折叠区。
      默认值/设备探测/校验/提交字段不变，主摘要仍反映真实选择。 */
   async draft_collapsed_settings(api) {
+    // 服务端探测到两张卡：设备只能在这些编号之间切换（没有 CPU 选项）
+    const handler = (url) => {
+      if (url.indexOf('/api/hpo/defaults') >= 0) {
+        const payload = defaultsPayload();
+        payload.devices = { gpus: [0, 1], default: '0' };
+        return { status: 200, body: payload };
+      }
+      return defaultHandler(url);
+    };
     api.setInput('tuningModeSelect', 'hpo');
     api.fireDomReady();
     await api.drain();
@@ -1574,7 +1606,7 @@ const SCENARIOS = {
       open: !!api.$('hpoDraftDetails').open,
       device: api.$('hpoDevice').value,
     };
-    await api.settle(defaultHandler);
+    await api.settle(handler);
     const readCodings = () => ({
       open: !!api.$('hpoDraftDetails').open,
       sampler: api.$('hpoSampler').value,
@@ -1609,7 +1641,7 @@ const SCENARIOS = {
     api.$('hpoBatch').dispatch('change');
     await api.drain();
     const afterBatch = api.$('hpoMainSummary').textContent;
-    api.setInput('hpoDevice', 'cpu');
+    api.setInput('hpoDevice', '1');
     api.$('hpoDevice').dispatch('change');
     await api.drain();
     const afterDevice = api.$('hpoMainSummary').textContent;
@@ -1623,12 +1655,12 @@ const SCENARIOS = {
     await api.drain();
     const createBody = (api.queued('/api/hpo/studies') || {}).body;
     await api.settle((url) => (url.indexOf('/start') >= 0)
-      ? { status: 202, body: { started: true } } : defaultHandler(url));
+      ? { status: 202, body: { started: true } } : handler(url));
 
     // 切换模式并重新进入 HPO：不得复制控件，也不得丢掉草稿值
     api.window.onTuningModeChange('full');
     api.window.onTuningModeChange('hpo');
-    await api.settle(defaultHandler);
+    await api.settle(handler);
     const afterModeSwitch = {
       sampler: api.$('hpoSampler').value,
       evaluationMode: api.$('hpoEvaluationMode').value,
@@ -3331,8 +3363,9 @@ const SCENARIOS = {
     };
   },
 
-  /* 最终返修 Task 5：GPU 默认来自服务端最终事实；defaults 到达前不得把 cpu
-     当作可提交暂存值；设备是明确选择控件；创建必须等事实加载完成。 */
+  /* 最终返修 Task 5 + F1.2-C P1：GPU 默认来自服务端最终事实；设备是明确选择
+     控件且只列服务端探测到的 GPU 编号（不含 CPU）；defaults 到达前不得有任何
+     可提交暂存值；创建必须等事实加载完成。 */
   async hpo_device_defaults(api) {
     const deviceEl = () => api.$('hpoDevice');
     const read = () => ({
@@ -3350,25 +3383,32 @@ const SCENARIOS = {
     await api.drain();
     // defaults / 快照 / 权重都还没回来：设备没有可提交值，创建按钮必须禁用
     const pending = read();
-    // 立刻点击（快速切换 HPO 后马上操作）：绝不发出一次 CPU 创建请求
+    // 立刻点击（快速切换 HPO 后马上操作）：绝不发出一次创建请求
     api.window.hpoCreateAndStart();
     await api.drain();
     const afterEarlyClick = { createCalls: createCalls(), createDisabled: read().createDisabled };
 
     await api.settle((url) => {
-      if (url.indexOf('/api/hpo/defaults') >= 0) return { status: 200, body: defaultsPayload() };
+      if (url.indexOf('/api/hpo/defaults') >= 0) {
+        const payload = defaultsPayload();
+        // 服务端探测到两张卡：选项必须与探测结果逐一对应
+        payload.devices = { gpus: [0, 1], default: '0' };
+        payload.search.device = '0';
+        payload.formal.device = '0';
+        return { status: 200, body: payload };
+      }
       return defaultHandler(url);
     });
     const gpu = read();
 
-    // 用户在加载完成后主动改选 CPU：后续无关异步响应不得覆盖
-    api.setInput('hpoDevice', 'cpu');
+    // 用户在加载完成后主动改选 GPU 1：后续无关异步响应不得覆盖
+    api.setInput('hpoDevice', '1');
     deviceEl().dispatch('change');
     await api.drain();
     await api.settle(defaultHandler);
     const afterUserChoice = read();
 
-    // 提交值仍是现有合法值（cpu），且创建按钮可用
+    // 提交值就是用户选定的 GPU 编号，且创建按钮可用
     api.window.hpoCreateAndStart();
     await api.drain();
     const createRequest = api.queued('/api/hpo/studies');
@@ -3383,35 +3423,68 @@ const SCENARIOS = {
     };
   },
 
-  /* 无 GPU：允许 CPU 并给出可见、简短的提示；defaults 失败：零创建且不静默用 CPU。 */
-  async hpo_device_fallback(api) {
+  /* F1.2-C P1：设备控件里没有 CPU 这个选项——即使被外部塞进 cpu 也不得提交。 */
+  async hpo_device_rejects_cpu(api) {
+    api.setInput('tuningModeSelect', 'hpo');
+    api.fireDomReady();
+    await api.settle((url) => {
+      if (url.indexOf('/api/hpo/defaults') >= 0) return { status: 200, body: defaultsPayload() };
+      return defaultHandler(url);
+    });
+    const options = (api.$('hpoDevice').options || []).map((o) => o.value);
+    const selected = api.$('hpoDevice').value;
+
+    // 绕过选择器把设备值改成 cpu（等价于伪造/旧草稿）：前端校验必须拦住，
+    // 不允许发出任何创建请求
+    api.setInput('hpoDevice', 'cpu');
+    api.$('hpoDevice').dispatch('change');
+    await api.drain();
+    api.window.hpoCreateAndStart();
+    await api.drain();
+    return {
+      options: options,
+      selected: selected,
+      createCalls: api.requestLog.filter((u) => u === '/api/hpo/studies').length,
+      errorText: api.text('hpoFieldError'),
+      errorHidden: api.$('hpoFieldError').classList.contains('hidden'),
+      deviceExpanded: !!api.$('hpoDraftDetails').open,
+    };
+  },
+
+  /* 无 GPU：没有可提交设备 + 可见提示 + 零创建；defaults 失败同样零创建。 */
+  async hpo_device_no_gpu(api) {
     api.setInput('tuningModeSelect', 'hpo');
     api.fireDomReady();
     await api.settle((url) => {
       if (url.indexOf('/api/hpo/defaults') >= 0) {
         const payload = defaultsPayload();
-        payload.search.device = 'cpu';
-        payload.devices = { gpus: [], default: 'cpu' };
-        payload.device_notice = { code: 'GPU_NOT_AVAILABLE_CPU_FALLBACK',
-          message: '未检测到可用 GPU，已使用 CPU。' };
+        payload.search.device = null;
+        payload.formal.device = null;
+        payload.devices = { gpus: [], default: null };
+        payload.device_notice = { code: 'GPU_NOT_AVAILABLE',
+          message: '未检测到可用的 GPU：本版本只交付 GPU 训练，不提供 CPU 运行模式。' };
         return { status: 200, body: payload };
       }
       return defaultHandler(url);
     });
-    const cpu = {
+    const state = {
       tag: api.$('hpoDevice').tagName,
       value: api.$('hpoDevice').value,
       options: (api.$('hpoDevice').options || []).map((o) => o.value),
       createDisabled: api.$('hpoCreateAndStartBtn').disabled,
       notice: api.text('hpoMainSummary'),
       noticeVisible: api.visible('hpoMainSummary'),
+      bindingNotice: api.text('hpoBindingNotice'),
     };
 
     api.window.hpoCreateAndStart();
     await api.drain();
     const request = api.queued('/api/hpo/studies');
-    const cpuDevice = request ? request.body.execution_config.device : null;
-    return { cpu: cpu, cpuDevice: cpuDevice };
+    return {
+      noGpu: state,
+      createDevice: request ? request.body.execution_config.device : null,
+      createCalls: api.requestLog.filter((u) => u === '/api/hpo/studies').length,
+    };
   },
 
   /* defaults 请求失败：可见可操作的错误 + 零创建，绝不悄悄启用 CPU 创建。 */
@@ -3901,6 +3974,11 @@ const SCENARIOS = {
     api.fireDomReady();
     await api.settle(pageHandler);
 
+    // 上传前先对一个旧权重确认过来源可信：新权重不得继承这次确认
+    api.$('modelExportTrust').checked = true;
+    api.$('modelExportTrust').dispatch('change');
+    await api.drain();
+
     api.$('modelUploadInput').files = [{ name: 'custom.pt' }];
     api.window.uploadModelFile();
     await api.drain();
@@ -3920,6 +3998,8 @@ const SCENARIOS = {
     await api.settle(pageHandler);
     facts.hpoValue = api.$('hpoModelSelect').value;
     facts.trainValue = api.$('trainModelSelect').value;
+    facts.libraryValue = api.$('libraryModelSelect').value;
+    facts.trustAfterUpload = api.$('modelExportTrust').checked;
     facts.status = api.text('modelUploadStatus');
     facts.btnDisabled = api.$('modelUploadBtn').disabled;
     facts.btnLabel = api.$('modelUploadBtn').textContent;
@@ -3934,6 +4014,204 @@ const SCENARIOS = {
     facts.afterFailureValue = api.$('trainModelSelect').value;
     facts.keptValue = kept;
     facts.afterFailureStatus = api.text('modelUploadStatus');
+    return facts;
+  },
+
+  /* F1.2-A：手动导出 ONNX。导出对象只是当前选中的受控权重（model_id），
+     页面没有路径/输出目录输入；FP32 是默认精度，半精度只在服务端实测通过后
+     出现；重复点击只发一次请求，失败只显示稳定错误码，成功后的下载入口来自
+     磁盘事实（而不是那次响应）。 */
+  async onnx_export_ui(api) {
+    const facts = {};
+    const exportGet = (url) => url.indexOf('/api/models/export?') === 0;
+    const exportPost = (url) => url === '/api/models/export';
+    const listGet = (url) => url === '/api/models';
+    const selectLibraryModel = (modelId) => {
+      api.setInput('libraryModelSelect', modelId);
+      api.$('libraryModelSelect').dispatch('change');
+    };
+
+    api.fireDomReady();
+    await api.settle(pageHandler);
+    api.window.onTuningModeChange('hpo');
+    await api.settle(pageHandler);
+    // 切换到独立的“模型库”页：进入时按服务端事实刷新列表，再确认权重
+    api.window.switchPage(5);
+    await api.drain();
+    await api.respond(listGet, 200, modelLibraryPayload());
+    await api.drain();
+
+    // ── 静态结构：唯一的导出控件，导出区内没有任何路径/参数输入 ──
+    const exportBlock = api.$('modelExportBlock');
+    const blockInputs = [];
+    const blockTexts = [];
+    const walkExport = (el) => {
+      for (const child of el.children) {
+        if (child.tagName === 'INPUT') blockInputs.push(child);
+        if (child.tagName === 'TEXTAREA' || child.tagName === 'SELECT') blockInputs.push(child);
+        blockTexts.push(String(child.textContent || ''));
+        walkExport(child);
+      }
+    };
+    walkExport(exportBlock);
+    facts.structure = {
+      exportBlocks: api.all.filter((e) => e.id === 'modelExportBlock').length,
+      exportButtons: api.all.filter((e) => e.id === 'modelExportBtn').length,
+      // 整页仍然只有一个文件控件（上传入口没有被复制）
+      fileInputs: api.all.filter((e) => e.tagName === 'INPUT'
+        && String(e.type).toLowerCase() === 'file').length,
+      // 导出区内唯一的输入控件是“来源可信”勾选框，另有一个精度选择器
+      blockInputs: blockInputs.map((e) => e.id + ':' + String(e.type || e.tagName)),
+      blockText: blockTexts.join(' '),
+      // 上传入口同样只有一份，且不复制出第二组 id
+      uploadBlocks: api.all.filter((e) => e.id === 'modelUploadBlock').length,
+      uploadInputs: api.all.filter((e) => e.id === 'modelUploadInput').length,
+      uploadButtons: api.all.filter((e) => e.id === 'modelUploadBtn').length,
+    };
+    facts.precisionValues = Array.prototype.map.call(
+      api.$('modelExportPrecision').options, (o) => o.value);
+    facts.defaultPrecision = api.$('modelExportPrecision').value;
+    facts.advancedHiddenWhenUnverified =
+      api.$('modelExportAdvanced').classList.contains('hidden');
+    facts.hintWithNoTrust = api.text('modelExportHint');
+    facts.disabledWithNoTrust = api.$('modelExportBtn').disabled;
+
+    // ── 受控权重：未确认来源可信前不可导出 ──
+    selectLibraryModel(MODEL_ID_MANAGED);
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(MODEL_ID_MANAGED));
+    await api.drain();
+    facts.disabledBeforeTrust = api.$('modelExportBtn').disabled;
+    facts.hintBeforeTrust = api.text('modelExportHint');
+    facts.summaryManaged = api.text('libraryModelSummary');
+
+    api.$('modelExportTrust').checked = true;
+    api.$('modelExportTrust').dispatch('change');
+    await api.drain();
+    facts.managedEnabled = api.$('modelExportBtn').disabled === false;
+    facts.managedHint = api.text('modelExportHint');
+
+    // ── 确认绑定当前 model_id：换权重、换回、清空都必须重新确认 ──
+    selectLibraryModel(MODEL_ID_LEGACY);
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(MODEL_ID_LEGACY, {
+      origin: 'legacy', exportable: false }));
+    await api.drain();
+    facts.trustAfterSwitch = api.$('modelExportTrust').checked;
+    facts.legacyDisabled = api.$('modelExportBtn').disabled;
+    facts.legacyHint = api.text('modelExportHint');
+    api.$('modelExportBtn').dispatch('click');
+    await api.drain();
+    facts.legacyRequests = api.pending().filter(exportPost).length;
+
+    selectLibraryModel(MODEL_ID_MANAGED);
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(MODEL_ID_MANAGED));
+    await api.drain();
+    facts.trustAfterSwitchBack = api.$('modelExportTrust').checked;
+    facts.disabledAfterSwitchBack = api.$('modelExportBtn').disabled;
+    facts.hintAfterSwitchBack = api.text('modelExportHint');
+
+    api.$('modelExportTrust').checked = true;
+    api.$('modelExportTrust').dispatch('change');
+    await api.drain();
+    selectLibraryModel('');
+    await api.drain();
+    facts.trustAfterClear = api.$('modelExportTrust').checked;
+    facts.disabledAfterClear = api.$('modelExportBtn').disabled;
+    facts.summaryAfterClear = api.text('libraryModelSummary');
+    facts.requestsWhileNoSelection = api.pending().filter(exportPost).length;
+
+    // 重新选定并确认，继续导出主流程
+    selectLibraryModel(MODEL_ID_MANAGED);
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(MODEL_ID_MANAGED));
+    await api.drain();
+    api.$('modelExportTrust').checked = true;
+    api.$('modelExportTrust').dispatch('change');
+    await api.drain();
+
+    // ── 一次点击 = 一次请求；pending 期间重复点击不产生第二次 ──
+    api.window.exportModelOnnx();
+    await api.drain();
+    const post = api.queued(exportPost);
+    facts.request = post && {
+      method: post.method,
+      body: post.body,
+      hasCsrf: !!post.headers['X-CSRF-Token'],
+      contentType: post.headers['Content-Type'],
+    };
+    facts.pendingLabel = api.$('modelExportBtn').textContent;
+    facts.pendingDisabled = api.$('modelExportBtn').disabled;
+    api.window.exportModelOnnx();
+    await api.drain();
+    facts.requestsWhilePending = api.pending().filter(exportPost).length;
+
+    // 冲突：不静默覆盖，只显示稳定错误码且不给出下载入口
+    await api.respond(exportPost, 409, {
+      error_code: 'MODEL_EXPORT_CONFLICT',
+      error: '该权重已存在同精度的 ONNX 文件，请改名后重新上传权重。' });
+    await api.drain();
+    facts.conflictStatus = api.text('modelExportStatus');
+    facts.conflictDownloadHidden =
+      api.$('modelExportDownload').classList.contains('hidden');
+    facts.conflictButtonEnabled = api.$('modelExportBtn').disabled === false;
+
+    // 成功：状态来自响应，下载入口来自随后的磁盘事实
+    api.window.exportModelOnnx();
+    await api.drain();
+    await api.respond(exportPost, 201, {
+      status: 'exported',
+      export: { model_id: MODEL_ID_MANAGED, precision: 'fp32',
+                name: 'yolov8n.onnx', size_bytes: 12400000,
+                download_url: '/api/models/export/download?model_id=x&precision=fp32' } });
+    await api.drain();
+    facts.successStatus = api.text('modelExportStatus');
+    await api.respond(exportGet, 200, {
+      model_id: MODEL_ID_MANAGED, origin: 'managed', exportable: true,
+      fp16_available: false,
+      exports: { fp32: { model_id: MODEL_ID_MANAGED, precision: 'fp32',
+                         name: 'yolov8n.onnx', size_bytes: 12400000,
+                         download_url: '/api/models/export/download?model_id='
+                           + encodeURIComponent(MODEL_ID_MANAGED) + '&precision=fp32' },
+                 fp16: null } });
+    await api.drain();
+    facts.afterSuccess = {
+      downloadVisible: !api.$('modelExportDownload').classList.contains('hidden'),
+      href: api.$('modelExportDownloadLink').getAttribute('href'),
+      downloadAttr: api.$('modelExportDownloadLink').getAttribute('download'),
+      buttonDisabled: api.$('modelExportBtn').disabled,
+      hint: api.text('modelExportHint'),
+      status: api.text('modelExportStatus'),
+    };
+
+    // 半精度实测通过后才出现：高级选项展开，切到 FP16 后不再沿用 FP32 的下载入口
+    api.$('modelExportTrust').checked = true;
+    api.$('modelExportTrust').dispatch('change');
+    await api.drain();
+    api.window.refreshExportStatus();
+    await api.drain();
+    await api.respond(exportGet, 200, {
+      model_id: MODEL_ID_MANAGED, origin: 'managed', exportable: true,
+      fp16_available: true,
+      exports: { fp32: { model_id: MODEL_ID_MANAGED, precision: 'fp32',
+                         name: 'yolov8n.onnx', size_bytes: 12400000,
+                         download_url: '/api/models/export/download?model_id=m&precision=fp32' },
+                 fp16: null } });
+    await api.drain();
+    facts.verified = {
+      advancedHidden: api.$('modelExportAdvanced').classList.contains('hidden'),
+      buttonEnabled: api.$('modelExportBtn').disabled === false,
+      fp32DownloadVisible:
+        !api.$('modelExportDownload').classList.contains('hidden'),
+    };
+    api.setInput('modelExportPrecision', 'fp16');
+    api.$('modelExportPrecision').dispatch('change');
+    await api.drain();
+    facts.onFp16 = {
+      buttonEnabled: api.$('modelExportBtn').disabled === false,
+      downloadVisible: !api.$('modelExportDownload').classList.contains('hidden'),
+    };
     return facts;
   },
 
@@ -4194,11 +4472,170 @@ const SCENARIOS = {
       converged: converged,
     };
   },
+
+  /* F1.2-A 追加：同名不同内容时服务端自动命名保存（不再要求用户手工改名）。
+     提示必须显示**实际**落盘的文件名，三个选择器仍选中这次上传的 model_id。 */
+  async upload_autoname(api) {
+    const AUTO_ID = 'sha256:' + '9'.repeat(64);
+    const AUTO_NAME = 'best_a1b2c3d4e5f6.pt';
+    const uploadPost = (url) => url.indexOf('/api/models/upload') >= 0;
+    const listGet = (url) => url === '/api/models';
+    const exportGet = (url) => url.indexOf('/api/models/export?') === 0;
+    const autoRow = { model_id: AUTO_ID, name: AUTO_NAME, size_bytes: 7,
+                      sha256: '9'.repeat(64), origin: 'managed',
+                      available: true };
+
+    api.fireDomReady();
+    await api.settle(pageHandler);
+    api.window.switchPage(5);
+    await api.drain();
+    await api.respond(listGet, 200, modelLibraryPayload());
+    await api.drain();
+
+    api.$('modelUploadInput').files = [{ name: 'best.pt' }];
+    api.window.uploadModelFile();
+    await api.drain();
+    await api.respond(uploadPost, 201, { status: 'created', model: autoRow });
+    await api.drain();
+    // 上传成功后刷新列表：新权重以**自动命名**的身份出现在列表里
+    await api.respond(listGet, 200, {
+      models: modelLibraryPayload().models.concat([autoRow]) });
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(AUTO_ID));
+    await api.drain();
+
+    const facts = {
+      autoId: AUTO_ID,
+      autoName: AUTO_NAME,
+      status: api.text('modelUploadStatus'),
+      libraryValue: api.$('libraryModelSelect').value,
+      hpoValue: api.$('hpoModelSelect').value,
+      trainValue: api.$('trainModelSelect').value,
+      libraryTexts: Array.prototype.map.call(api.$('libraryModelSelect').options,
+        (o) => String(o.textContent)),
+    };
+
+    // 同名同内容（未改名）时仍是原来的“已上传/已存在”文案
+    api.$('modelUploadInput').files = [{ name: AUTO_NAME }];
+    api.window.uploadModelFile();
+    await api.drain();
+    await api.respond(uploadPost, 200, { status: 'exists', model: autoRow });
+    await api.drain();
+    await api.respond(listGet, 200, {
+      models: modelLibraryPayload().models.concat([autoRow]) });
+    await api.drain();
+    await api.respond(exportGet, 200, exportStatusPayload(AUTO_ID));
+    await api.drain();
+    facts.unnamedStatus = api.text('modelUploadStatus');
+    return facts;
+  },
+
+  /* F1.2-A 返修 4：顶部导航在“历史记录”之后新增同一排的“模型库”；上传、
+     选择、来源可信确认、ONNX 导出状态与下载都集中在该独立页面，而直接训练与
+     HPO 的初始权重选择器仍留在各自流程里，四种训练模式不受影响。 */
+  async model_library_nav(api) {
+    api.fireDomReady();
+    await api.settle(pageHandler);
+
+    const tabs = api.all.filter((e) => e.classList.contains('tab'));
+    const pages = api.all.filter((e) => e.classList.contains('page'));
+    const texts = tabs.map((t) => String(t.textContent).trim());
+    const at = (el) => api.order.indexOf(el);
+    const inside = (id, ancestorId) => {
+      let node = api.$(id);
+      while (node) {
+        if (node.id === ancestorId) return true;
+        node = node.parentNode;
+      }
+      return false;
+    };
+
+    const facts = {
+      tabCount: tabs.length,
+      tabTexts: texts,
+      pageCount: pages.length,
+      pageIds: pages.map((p) => p.id),
+      // 六个页签在同一个容器里、同一排：switchPage 用同一下标驱动页签与页面
+      oneRow: tabs.every((t) => t.parentNode === tabs[0].parentNode),
+      libraryAfterHistory: at(tabs[texts.indexOf('模型库')])
+        > at(tabs[texts.indexOf('历史记录')]),
+      libraryIsAdjacentToHistory:
+        texts[texts.indexOf('历史记录') + 1] === '模型库',
+      // 四种训练模式的选择器与顺序不变
+      modeValues: Array.prototype.map.call(
+        api.$('tuningModeSelect').options, (o) => o.value),
+    };
+
+    facts.libraryPage = {
+      upload: inside('modelUploadBlock', 'page5'),
+      select: inside('libraryModelSelect', 'page5'),
+      export: inside('modelExportBlock', 'page5'),
+      uploadNotInHpoDraft: !inside('modelUploadBlock', 'hpoCreateDraft'),
+      exportNotInHpoDraft: !inside('modelExportBlock', 'hpoCreateDraft'),
+      // HPO 与直接训练各自的选择器仍然留在各自流程里
+      hpoSelectStillBound: inside('hpoModelSelect', 'tuningForm'),
+      hpoSelectNotOnLibraryPage: !inside('hpoModelSelect', 'page5'),
+      trainSelectPresent: api.$('trainModelSelect') !== null,
+      pageIsNotModeScoped: !api.$('page5').classList.contains('hpo-only')
+        && !api.$('page5').classList.contains('non-hpo-only'),
+    };
+
+    // 模式切换只影响各自的配置区，不得把模型库里的控件一起显隐
+    const displayOf = (id) => String(api.$(id).style.display || '');
+    api.window.onTuningModeChange('hpo');
+    await api.settle(pageHandler);
+    const displayHpo = displayOf('modelExportBlock');
+    const displayUploadHpo = displayOf('modelUploadBlock');
+    api.window.onTuningModeChange('dry_run');
+    await api.settle(pageHandler);
+    facts.displayByMode = {
+      hpo: displayHpo,
+      dryRun: displayOf('modelExportBlock'),
+      uploadHpo: displayUploadHpo,
+      uploadDryRun: displayOf('modelUploadBlock'),
+    };
+
+    // 进入模型库页：刷新列表，页面成为唯一活动页
+    api.window.switchPage(5);
+    await api.drain();
+    await api.respond((url) => url === '/api/models', 200, modelLibraryPayload());
+    await api.drain();
+    facts.activePageIds = pages.filter((p) => p.classList.contains('active'))
+      .map((p) => p.id);
+    facts.libraryValues = Array.prototype.map.call(
+      api.$('libraryModelSelect').options, (o) => o.value);
+    facts.reloadCalls = api.requestLog.filter((u) => u === '/api/models').length;
+    // 模型库页自己的动态文案（选择器占位、来源标签、摘要、上传/导出提示与下载）：
+    // 全部来自服务端按当前语言注入的词条，脚本里不写死任何一种语言。
+    api.$('libraryModelSelect').value = MODEL_ID_MANAGED;
+    api.$('libraryModelSelect').dispatch('change');
+    await api.drain();
+    await api.respond((url) => url.indexOf('/api/models/export?') === 0, 200,
+      exportStatusPayload(MODEL_ID_MANAGED, {
+        exports: { fp32: { model_id: MODEL_ID_MANAGED, precision: 'fp32',
+                           name: 'yolov8n.onnx', size_bytes: 12400000,
+                           download_url: '/api/models/export/download?model_id=x&precision=fp32' },
+                   fp16: null } }));
+    await api.drain();
+    facts.libraryTexts = {
+      placeholder: String(api.$('libraryModelSelect').options[0].textContent),
+      options: Array.prototype.map.call(api.$('libraryModelSelect').options,
+        (o) => String(o.textContent)),
+      summary: api.text('libraryModelSummary'),
+      exportHint: api.text('modelExportHint'),
+      uploadStatus: api.text('modelUploadStatus'),
+      downloadText: String(api.$('modelExportDownloadLink').textContent),
+      uploadButton: String(api.$('modelUploadBtn').textContent),
+      exportButton: String(api.$('modelExportBtn').textContent),
+    };
+    return facts;
+  },
 };
 
 // Scenarios that drive the whole page must be given a *rendered* single_page.html
 // (the training-monitor projections depend on the Jinja context).
 for (const name of ['mode_submission', 'weight_library_ui', 'weight_upload',
+                    'onnx_export_ui', 'model_library_nav', 'upload_autoname',
                     'llm_regions_hidden_in_hpo_mode',
                     'monitor_first_paint', 'monitor_terminal_metrics',
                     'monitor_result_projection', 'monitor_stream_parity',
