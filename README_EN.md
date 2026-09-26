@@ -139,6 +139,26 @@ You may also run:
 python start_server.py
 ```
 
+### Option 3: Docker GPU
+
+For an online host, pull the accepted public image from GitHub Container Registry:
+
+```powershell
+docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.0
+docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.0 auto-tune:local
+docker compose up -d
+```
+
+For a fully offline host, import the separately delivered image archive instead:
+
+```powershell
+docker load -i AutoTuneStudio-Docker-0.2.0-image.tar
+docker tag auto-tune:0.2.0 auto-tune:local
+docker compose up -d
+```
+
+The production Compose configuration requires an NVIDIA GPU and persists configuration, the SQLite index, datasets, results, and controlled weights under the host-mounted `docker-data/` directories.
+
 ## Configuration
 
 Copy the safe configuration template:

@@ -137,7 +137,15 @@ start.bat
 
 ### 方式二：Docker GPU
 
-使用单独交付的镜像归档：
+联网环境推荐直接从公开的 GitHub Container Registry 拉取已验收镜像：
+
+```powershell
+docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.0
+docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.0 auto-tune:local
+docker compose up -d
+```
+
+完全离线环境可使用单独交付的镜像归档：
 
 ```powershell
 docker load -i AutoTuneStudio-Docker-0.2.0-image.tar
