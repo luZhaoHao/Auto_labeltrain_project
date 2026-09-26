@@ -74,6 +74,16 @@ auto_tune/config.yaml
 /.superpowers/sdd/
 /文档所需截图/
 
+# Internal project records stay local. The public repository exposes only the
+# three reviewed DOCX documents listed below.
+/历史文档/
+/AGENTS.md
+/CLAUDE.md
+/docs/*
+!/docs/Auto-Tune后续研发路线与实施评估_研发执行版.docx
+!/docs/Auto-Tune软件安装手册.docx
+!/docs/Auto-Tune软件操作手册.docx
+
 # Environment
 env/
 *.egg

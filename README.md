@@ -6,10 +6,9 @@
 > **最终稳定版本：Auto-Tune Studio `v0.2.0`（2026-09-25）**
 > 本版本已完成 Windows 完全离线安装、Docker NVIDIA GPU 交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
 >
-> - [安装手册（Markdown）](docs/Auto-Tune软件安装手册_20260924.md) · [安装手册（DOCX）](docs/Auto-Tune软件安装手册.docx)
-> - [操作手册（Markdown）](docs/Auto-Tune软件操作手册_20260918.md) · [操作手册（DOCX）](docs/Auto-Tune软件操作手册.docx)
-> - [v0.2.0 发布文件与 SHA-256 清单](docs/release_manifest_0.2.0_20260925.md)
-> - [F1.2 联合验收报告](docs/f1_2_e_joint_acceptance_20260924.md)
+> - [后续研发路线与实施评估（DOCX）](docs/Auto-Tune后续研发路线与实施评估_研发执行版.docx)
+> - [软件安装手册（DOCX）](docs/Auto-Tune软件安装手册.docx)
+> - [软件操作手册（DOCX）](docs/Auto-Tune软件操作手册.docx)
 >
 > Windows 安装包和 Docker 镜像归档体积较大，按发布清单单独交付，不提交 GitHub；本仓库保留可审查源码、测试、构建脚本和用户文档。
 
@@ -134,7 +133,7 @@ install.bat
 start.bat
 ```
 
-安装包包含锁定的私有 Python 3.10 GPU 运行环境和全部依赖，安装过程不访问网络。升级、卸载、数据保留和磁盘要求见[安装手册](docs/Auto-Tune软件安装手册_20260924.md)。
+安装包包含锁定的私有 Python 3.10 GPU 运行环境和全部依赖，安装过程不访问网络。升级、卸载、数据保留和磁盘要求见[安装手册](docs/Auto-Tune软件安装手册.docx)。
 
 ### 方式二：Docker GPU
 
@@ -200,7 +199,7 @@ API Key 不写入 YAML。启动 Studio 后在“AI 服务配置”中保存到 W
 
 ## 操作指南
 
-完整的密钥生成、同机升级、换机、轮换和应急处置说明见 [`docs/操作说明_操作工手册_20260821.md`](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C_20260821.md)。
+完整的启动、配置和日常使用说明见[软件操作手册](docs/Auto-Tune软件操作手册.docx)。
 
 ### 1. 启动界面
 
@@ -353,7 +352,7 @@ auto_tune/
 
 docker/                               # Docker 入口和运行依赖锁
 windows/                              # Windows 离线安装、升级和卸载脚本
-docs/                                 # 用户手册、验收、路线图和发布清单
+docs/                                 # 公开的研发路线、安装手册和操作手册
 Dockerfile / compose.yaml             # Docker GPU 交付入口
 ```
 
@@ -379,12 +378,9 @@ Dockerfile / compose.yaml             # Docker GPU 交付入口
 
 详细内容见：
 
-- [项目路线规划](docs/roadmap_20260814.md)
-- [后续实施计划](docs/implementation_plan_20260814.md)
-- [当前开发交接记录](docs/development_handoff_20260814.md)
-- [软件安装手册](docs/Auto-Tune软件安装手册_20260924.md)
-- [软件操作手册](docs/Auto-Tune软件操作手册_20260918.md)
-- [v0.2.0 发布清单](docs/release_manifest_0.2.0_20260925.md)
+- [后续研发路线与实施评估](docs/Auto-Tune后续研发路线与实施评估_研发执行版.docx)
+- [软件安装手册](docs/Auto-Tune软件安装手册.docx)
+- [软件操作手册](docs/Auto-Tune软件操作手册.docx)
 
 ## GitHub 安全边界
 

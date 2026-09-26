@@ -35,17 +35,25 @@ flowchart LR
 
 These screenshots help operators understand the core workflow. Interface details may evolve between releases.
 
-### Dataset Selection and Quality Report
+### Studio Home
 
-![Dataset selection and quality report](img/%E4%B8%BB%E7%95%8C%E9%9D%A2.png)
+![Auto-Tune Studio home](img/v0.2-01-studio-home.png)
 
-### Training Result Diagnosis
+### FP32 ONNX Export
 
-![Training result diagnosis](img/%E8%BE%93%E5%85%A5%E8%AE%AD%E7%BB%83%E7%BB%93%E6%9E%9C.png)
+![FP32 ONNX export](img/v0.2-02-onnx-export.png)
 
-### Vision-LLM Analysis
+### HPO Ranking
 
-![Vision-LLM analysis](img/%E8%A7%86%E8%A7%89%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%88%86%E6%9E%90.png)
+![HPO ranking](img/v0.2-03-hpo-ranking.png)
+
+### LLM Tuning
+
+![LLM tuning](img/v0.2-04-llm-tuning.png)
+
+### Training History
+
+![Training history](img/v0.2-05-training-history.png)
 
 ## Current Capabilities
 
@@ -316,7 +324,7 @@ auto_tune/
 │   └── templates/single_page.html   # Single-page operator UI
 └── tests/                            # Automated tests
 
-docs/                                # Reviews, roadmap, specifications, and plans
+docs/                                # Public roadmap, installation manual, and operator manual
 start_app.bat                         # Windows launcher
 run_tests.bat                         # Windows test launcher
 environment.yml                       # Conda environment
@@ -344,10 +352,9 @@ Planned stages:
 
 Detailed documents:
 
-- [Project Roadmap (Chinese)](docs/roadmap_20260814.md)
-- [Implementation Plan (Chinese)](docs/implementation_plan_20260814.md)
-- [Current Development Handoff (Chinese)](docs/development_handoff_20260814.md)
-- [Operator Manual (Chinese)](docs/%E6%93%8D%E4%BD%9C%E8%AF%B4%E6%98%8E_%E6%93%8D%E4%BD%9C%E5%B7%A5%E6%89%8B%E5%86%8C.md)
+- [Roadmap and Implementation Assessment (Chinese DOCX)](docs/Auto-Tune%E5%90%8E%E7%BB%AD%E7%A0%94%E5%8F%91%E8%B7%AF%E7%BA%BF%E4%B8%8E%E5%AE%9E%E6%96%BD%E8%AF%84%E4%BC%B0_%E7%A0%94%E5%8F%91%E6%89%A7%E8%A1%8C%E7%89%88.docx)
+- [Installation Manual (Chinese DOCX)](docs/Auto-Tune%E8%BD%AF%E4%BB%B6%E5%AE%89%E8%A3%85%E6%89%8B%E5%86%8C.docx)
+- [Operator Manual (Chinese DOCX)](docs/Auto-Tune%E8%BD%AF%E4%BB%B6%E6%93%8D%E4%BD%9C%E6%89%8B%E5%86%8C.docx)
 
 ## GitHub Safety Boundary
 
