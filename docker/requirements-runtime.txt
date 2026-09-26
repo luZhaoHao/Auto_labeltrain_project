@@ -7,11 +7,9 @@
 #   * the packages the HPO module needs (Optuna and its declared backends).
 #
 # Provenance: pinned from the independently accepted F1.1 environment
-# (environment.yml, Python 3.10), plus the five HPO pins recorded in
-# auto_tune/requirements.txt. The root requirements.txt and the stale
-# auto_tune/requirements.txt are deliberately NOT merged here: their loose
-# bounds and unused entries (gradio, httpx) are not part of the verified
-# runtime.
+# (environment.yml, Python 3.10), plus the accepted HPO and ONNX stacks. The
+# repository-root requirements.txt and environment.yml now mirror these pins
+# for source users; auto_tune/requirements.txt is only a compatibility include.
 #
 # Deliberately absent:
 #   * torch / torchvision — installed from the pinned CUDA 12.1 PyTorch wheel

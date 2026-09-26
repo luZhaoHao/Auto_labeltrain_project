@@ -2,7 +2,12 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-Current release: `v0.1`
+> **Final stable release: Auto-Tune Studio `v0.2.0` (25 September 2026)**
+>
+> Public installation is supported through the accepted Docker GPU image on GHCR or by running this repository from source. The fully offline Windows ZIP is available only for private evaluation from Aika and is not published as a public download.
+
+- [Installation Manual (English DOCX)](docs/Auto-Tune-Installation-Manual.docx)
+- [User Manual (English DOCX)](docs/Auto-Tune-User-Manual.docx)
 
 Auto LabelTrain is a local web tool for YOLO operators. It brings dataset quality checks, YOLO training, result diagnosis, LLM-assisted hyperparameter suggestions, safety guardrails, training audits, and experiment history into one interface.
 
@@ -13,7 +18,7 @@ The current version helps teams answer practical questions:
 - Are LLM-suggested hyperparameters safe, and what command was actually executed?
 - Can manual training and auto-tuning results be compared and traced in one place?
 
-> Verified environment: Windows, Python 3.10, and Ultralytics YOLOv8 detection. Linux, YOLO11/26, additional vision tasks, and model-structure adjustment remain on the roadmap.
+> Verified environment: Windows 10/11 offline evaluation and Docker Desktop Linux Engine with an NVIDIA GPU. The runtime uses Python 3.10, CUDA 12.1, and Ultralytics YOLOv8 detection. CPU training, YOLO11/26, additional vision tasks, and model-structure adjustment are outside this release.
 
 ## Workflow
 
@@ -92,12 +97,10 @@ These screenshots help operators understand the core workflow. Interface details
 
 ## Prerequisites
 
-Recommended setup:
+Runtime requirements:
 
-- Windows 10/11
-- Anaconda or Miniconda
-- Python 3.10
-- NVIDIA GPU with a working CUDA environment (recommended; CPU is supported but slower)
+- Docker Desktop Linux Engine with NVIDIA GPU container support, or a controlled Python 3.10 GPU source environment
+- NVIDIA GPU with a compatible driver; CPU training fallback is not supported
 - A YOLO-format dataset
 - Optional DeepSeek and Qwen-VL API keys
 
@@ -105,41 +108,7 @@ The dataset should include a `data.yaml` file accepted by Ultralytics. A model m
 
 ## Installation
 
-### Option 1: Windows Scripts
-
-From the repository root:
-
-```powershell
-.\setup.bat
-```
-
-After setup:
-
-```powershell
-.\start_app.bat
-```
-
-### Option 2: Conda CLI
-
-```powershell
-conda env create -f environment.yml
-conda activate auto_tune
-python -m auto_tune.main
-```
-
-The default service URL is:
-
-```text
-http://127.0.0.1:8000/
-```
-
-You may also run:
-
-```powershell
-python start_server.py
-```
-
-### Option 3: Docker GPU
+### Option 1: Docker GPU (recommended)
 
 For an online host, pull the accepted public image from GitHub Container Registry:
 
@@ -158,6 +127,38 @@ docker compose up -d
 ```
 
 The production Compose configuration requires an NVIDIA GPU and persists configuration, the SQLite index, datasets, results, and controlled weights under the host-mounted `docker-data/` directories.
+
+### Option 2: Run from Source
+
+Developers may clone this repository and create the complete Conda GPU environment:
+
+```powershell
+conda env create -f environment.yml
+conda activate auto_tune
+python -m auto_tune.main
+```
+
+Python 3.10/venv users may use the commands below. Install CUDA PyTorch from the official CUDA 12.1 wheel index first, then install the locked project dependencies:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1 torchvision==0.20.1
+python -m pip install -r requirements.txt
+python -m auto_tune.main
+```
+
+Both source paths require a compatible NVIDIA GPU. They are developer workflows rather than one-click end-user installers, and must not fall back to CPU training.
+
+### Option 3: Fully Offline Windows ZIP (private evaluation)
+
+The Windows ZIP delivery has passed acceptance testing but is not published as a public download. Contact Aika for the matching package and SHA-256 information when a private offline evaluation on a Windows GPU workstation is required, then follow the English Installation Manual.
+
+The default service URL for every installation method is:
+
+```text
+http://127.0.0.1:8000/
+```
 
 ## Configuration
 

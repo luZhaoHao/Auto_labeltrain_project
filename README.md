@@ -4,13 +4,13 @@
 
 > [!IMPORTANT]
 > **最终稳定版本：Auto-Tune Studio `v0.2.0`（2026-09-25）**
-> 本版本已完成 Windows 完全离线安装、Docker NVIDIA GPU 交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
+> 本版本已完成 Windows 完全离线安装的线下试用验收、Docker NVIDIA GPU 公开交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
 >
 > - [后续研发路线与实施评估（DOCX）](docs/Auto-Tune后续研发路线与实施评估_研发执行版.docx)
 > - [软件安装手册（DOCX）](docs/Auto-Tune软件安装手册.docx)
 > - [软件操作手册（DOCX）](docs/Auto-Tune软件操作手册.docx)
 >
-> Windows 安装包和 Docker 镜像归档体积较大，按发布清单单独交付，不提交 GitHub；本仓库保留可审查源码、测试、构建脚本和用户文档。
+> 官方线上安装方式为从 GHCR 拉取 Docker GPU 镜像，或从本仓库源码运行。Windows 完全离线 ZIP 仅供线下试用，不上传公开仓库；需要时请联系艾卡获取。
 
 Auto LabelTrain 是一个面向 YOLO 操作人员的本地 Web 工具。它把数据集质量检查、YOLO 训练、训练结果诊断、LLM 超参数建议、安全护栏、训练审计和实验历史整合在同一套界面中。
 
@@ -108,9 +108,9 @@ flowchart LR
 
 正式运行要求：
 
-- Windows 10/11 完全离线安装，或可用的 Docker Desktop Linux Engine
+- 推荐使用可用的 Docker Desktop Linux Engine；开发者也可从源码运行
 - NVIDIA GPU 与兼容驱动；本版本训练不支持 CPU 降级
-- Windows 用户不需要预装 Anaconda、Miniconda、Python、CUDA Toolkit、Docker 或 WSL
+- 线下 Windows ZIP 试用包不要求预装 Anaconda、Miniconda、Python、Docker 或 WSL
 - Docker 用户需要 Docker Desktop、NVIDIA 驱动及可用的 GPU 容器运行环境
 - 可访问的 YOLO 格式数据集
 - 可选：DeepSeek API Key、Qwen-VL API Key
@@ -119,23 +119,7 @@ flowchart LR
 
 ## 安装
 
-### 方式一：Windows 完全离线 ZIP
-
-获取并解压 `AutoTuneStudio-Setup-0.2.0.zip`，双击：
-
-```powershell
-install.bat
-```
-
-安装完成后，通过桌面快捷方式或安装目录中的以下入口启动：
-
-```powershell
-start.bat
-```
-
-安装包包含锁定的私有 Python 3.10 GPU 运行环境和全部依赖，安装过程不访问网络。升级、卸载、数据保留和磁盘要求见[安装手册](docs/Auto-Tune软件安装手册.docx)。
-
-### 方式二：Docker GPU
+### 方式一：Docker GPU（官方推荐）
 
 联网环境推荐直接从公开的 GitHub Container Registry 拉取已验收镜像：
 
@@ -161,6 +145,32 @@ docker compose up -d
 ```
 
 Compose 正式启动会申请 NVIDIA GPU，并把配置、SQLite 索引、数据集、训练结果和权重持久化到宿主机 `docker-data/`（可通过环境变量改到其他目录）。
+
+### 方式二：从源码运行
+
+开发者可以克隆本仓库，选择 Conda 一次创建完整 GPU 环境：
+
+```powershell
+conda env create -f environment.yml
+conda activate auto_tune
+python -m auto_tune.main
+```
+
+普通 Python 3.10/venv 用户可以使用以下命令；CUDA PyTorch 必须先从官方 CUDA 12.1 wheel 源安装，随后再安装项目锁定依赖：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1 torchvision==0.20.1
+python -m pip install -r requirements.txt
+python -m auto_tune.main
+```
+
+两种源码方式都要求兼容的 NVIDIA GPU；它们不是面向普通用户的一键安装方式，也不得改为 CPU 训练。
+
+### 方式三：Windows 完全离线 ZIP（线下试用）
+
+Windows ZIP 已完成验收，但不作为公开线上下载包发布。需要在单台 Windows GPU 工作站离线试用时，请联系艾卡获取对应版本的安装包和 SHA-256 校验信息；获取后按[安装手册](docs/Auto-Tune软件安装手册.docx)操作。
 
 服务默认地址：
 

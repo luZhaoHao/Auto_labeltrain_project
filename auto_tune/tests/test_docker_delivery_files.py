@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -17,6 +18,8 @@ DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 ENTRYPOINT = REPO_ROOT / "docker" / "entrypoint.sh"
 COMPOSE = REPO_ROOT / "compose.yaml"
+SOURCE_REQUIREMENTS = REPO_ROOT / "requirements.txt"
+SOURCE_ENVIRONMENT = REPO_ROOT / "environment.yml"
 
 _PIN_PATTERN = re.compile(r"^([A-Za-z0-9._-]+)==([^\s;]+)$")
 # A Windows drive path ("D:\x" / "C:/x") that is not a volume separator such
@@ -123,6 +126,32 @@ def test_runtime_requirements_pins_exact_versions_without_ranges():
     text = RUNTIME_REQUIREMENTS.read_text(encoding="utf-8")
     for forbidden in (">=", "<=", "~=", "!=", ">", "<"):
         assert forbidden not in text, f"runtime file uses a loose constraint {forbidden!r}"
+
+
+# ── Source installation: one accepted dependency contract ───────────────────
+
+
+def test_source_requirements_match_the_accepted_runtime_without_torch():
+    """A source install must not silently lose HPO/ONNX or drift from delivery."""
+    assert _pinned_packages(SOURCE_REQUIREMENTS) == _pinned_packages(RUNTIME_REQUIREMENTS)
+
+
+def test_conda_environment_builds_the_same_runtime_with_cuda_121_pytorch():
+    """The one-file Conda path must be complete and must not resolve CPU torch."""
+    data = yaml.safe_load(SOURCE_ENVIRONMENT.read_text(encoding="utf-8"))
+    dependencies = data["dependencies"]
+    pip_section = next(item["pip"] for item in dependencies if isinstance(item, dict))
+    pip_pins = {}
+    for line in pip_section:
+        match = _PIN_PATTERN.match(line)
+        assert match, f"Conda pip entry is not exactly pinned: {line!r}"
+        pip_pins[match.group(1).lower()] = match.group(2)
+
+    assert "python=3.10" in dependencies
+    assert "pytorch=2.5.1" in dependencies
+    assert "torchvision=0.20.1" in dependencies
+    assert "pytorch-cuda=12.1" in dependencies
+    assert pip_pins == _pinned_packages(RUNTIME_REQUIREMENTS)
 
 
 # ── Task 4: single-image Docker delivery ────────────────────────────────────
