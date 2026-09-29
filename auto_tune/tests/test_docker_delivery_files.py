@@ -17,6 +17,7 @@ RUNTIME_REQUIREMENTS = REPO_ROOT / "docker" / "requirements-runtime.txt"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 ENTRYPOINT = REPO_ROOT / "docker" / "entrypoint.sh"
+CONTAINER_ENTRYPOINT = REPO_ROOT / "auto_tune" / "delivery" / "container_entrypoint.py"
 COMPOSE = REPO_ROOT / "compose.yaml"
 SOURCE_REQUIREMENTS = REPO_ROOT / "requirements.txt"
 SOURCE_ENVIRONMENT = REPO_ROOT / "environment.yml"
@@ -165,6 +166,27 @@ def _dockerfile_lines() -> list[str]:
     ]
 
 
+def _dockerfile_instructions() -> list[str]:
+    """Dockerfile instructions with shell line continuations joined.
+
+    A ``RUN`` that spans several lines is one instruction; the credential
+    directory must be created and owned by it before the image drops to the
+    runtime user, and that is a property of the whole instruction.
+    """
+    instructions: list[str] = []
+    pending = ""
+    for line in _dockerfile_lines():
+        pending = f"{pending} {line}".strip() if pending else line
+        if pending.endswith("\\"):
+            pending = pending[:-1].strip()
+            continue
+        instructions.append(pending)
+        pending = ""
+    if pending:
+        instructions.append(pending)
+    return instructions
+
+
 def test_dockerfile_builds_one_pinned_image_from_an_accepted_base():
     lines = _dockerfile_lines()
     from_lines = [line for line in lines if line.upper().startswith("FROM ")]
@@ -186,13 +208,47 @@ def test_dockerfile_uses_the_controlled_workdir():
     assert "WORKDIR /opt/auto-tune" in DOCKERFILE.read_text(encoding="utf-8")
 
 
-def test_dockerfile_runs_the_container_as_a_non_root_user():
+def test_dockerfile_keeps_the_entrypoint_privileged_for_the_first_start():
+    """The first start must be able to hand a root-owned bind directory to the
+    runtime user, so the image cannot drop to ``studio`` before the entrypoint
+    runs. The drop itself happens inside the entrypoint and is asserted in
+    test_container_entrypoint.py; what must not happen here is the image taking
+    those privileges away first."""
     user_lines = [
         line for line in _dockerfile_lines() if line.upper().startswith("USER ")
     ]
-    assert user_lines, "the image must drop root privileges"
-    user = user_lines[-1].split()[1]
-    assert user not in ("root", "0"), "the runtime user must not be root"
+    assert user_lines, "the image must state which user starts the container"
+    assert all(line.split()[1] in ("root", "0") for line in user_lines), (
+        "a `USER studio` would remove the privileges the entrypoint needs before "
+        "it has initialised the mounted directories")
+
+
+def test_dockerfile_creates_the_runtime_user_as_10001_10001():
+    """The drop target is verified numerically, so the account and its group must
+    exist with exactly those ids instead of whatever useradd would pick."""
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "groupadd --gid 10001 studio" in text
+    assert "useradd" in text
+    assert "--uid 10001" in text
+    assert "--gid 10001" in text
+
+
+def test_dockerfile_never_starts_business_code_as_root():
+    """The image starts as root for one directory-initialisation step only: the
+    Studio is exec'd by the entrypoint, after it has dropped to the runtime user.
+    There is no CMD for anything else to run."""
+    instructions = _dockerfile_instructions()
+
+    assert not [line for line in instructions if line.upper().startswith("CMD ")], \
+        "the Studio is started by the entrypoint, never straight from the image"
+    user_index = next(index for index, line in enumerate(instructions)
+                      if line.upper().startswith("USER "))
+    entry_index = next(index for index, line in enumerate(instructions)
+                       if line.upper().startswith("ENTRYPOINT "))
+    assert instructions[user_index].split()[1] in ("root", "0")
+    assert entry_index == user_index + 1, (
+        "the entrypoint must start with the privileges the initialisation needs")
 
 
 def test_dockerfile_installs_pinned_cuda_torch_wheels_before_the_runtime_file():
@@ -227,8 +283,52 @@ def test_dockerfile_entrypoint_is_the_controlled_script():
 def test_dockerfile_never_copies_or_creates_a_real_configuration():
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "auto_tune/config.yaml" not in text
-    for forbidden in ("api_key", "apikey", "token", "password", "secret"):
-        assert forbidden.lower() not in text.lower()
+    for forbidden in ("api_key", "apikey", "token", "password"):
+        assert forbidden.lower() not in text.lower(), f"Dockerfile leaks {forbidden!r}"
+    # ``secrets`` is the controlled credential *directory* the named volume is
+    # mounted at (see test_dockerfile_creates_the_persisted_credential_directory).
+    # It is a path, never a credential: no other secret-shaped text may appear.
+    for line in text.splitlines():
+        if "secret" in line.lower():
+            assert "/data/secrets" in line, f"Dockerfile leaks a credential: {line!r}"
+
+
+def test_dockerfile_creates_the_persisted_credential_directory_owned_by_the_runtime_user():
+    """The mount point of the credential named volume must exist in the image,
+    owned by the runtime user, before the image drops privileges.
+
+    A fresh named volume is seeded from the image directory: if the directory
+    only existed as root (or did not exist), Docker would leave the mount point
+    root-owned, the start-up preflight would refuse to run and the operator
+    could not save an API key.
+    """
+    instructions = _dockerfile_instructions()
+    user_index = next(
+        index for index, line in enumerate(instructions)
+        if line.upper().startswith("USER ")
+    )
+
+    created = [
+        line for line in instructions[:user_index]
+        if "mkdir -p" in line and "/data/secrets" in line
+        and "chown" in line and "studio:studio" in line
+    ]
+    assert created, (
+        "one privileged instruction must create /data/secrets and own it studio:studio")
+    assert "chown -R studio:studio" in created[0], (
+        "the recursive ownership must cover /data, the parent of /data/secrets")
+
+
+def test_the_image_ships_no_credential_content_into_the_named_volume():
+    """The volume is seeded from /data/secrets: that directory must stay free of
+    credential content, and no instruction may copy a credential file into it."""
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert "credentials.json" not in text
+    copied = [
+        line for line in _dockerfile_instructions()
+        if line.upper().startswith(("COPY ", "ADD ")) and "/data/secrets" in line
+    ]
+    assert copied == [], f"the image must not carry credential content: {copied}"
 
 
 _REQUIRED_DOCKERIGNORE_ENTRIES = (
@@ -300,12 +400,24 @@ def test_dockerignore_excludes_local_env_credential_files(entry):
     assert entry in _excluded_dockerignore_patterns()
 
 
-def _entrypoint_preflight_command() -> str:
-    """The logical preflight command, including shell line continuations."""
+@pytest.mark.parametrize("entry", ["credentials.json", "credentials.json.*"])
+def test_dockerignore_excludes_the_persisted_credential_file(entry):
+    """The key typed into the page lives in ``secrets/`` outside the image; a
+    stray copy in the build context must never be sent to the builder."""
+    assert entry in _excluded_dockerignore_patterns()
+
+
+def _entrypoint_handover_command() -> str:
+    """The single command the shell entrypoint execs (line continuations joined).
+
+    The shell no longer builds the preflight command line: the privileged
+    initialisation, the privilege drop and the preflight moved into one module so
+    they can be tested without a container. The shell only hands over.
+    """
     lines = ENTRYPOINT.read_text(encoding="utf-8").splitlines()
     start = next((index for index, line in enumerate(lines)
-                  if "auto_tune.delivery.preflight" in line), None)
-    assert start is not None, "the entrypoint must run the shared delivery preflight"
+                  if line.strip().startswith("exec ")), None)
+    assert start is not None, "the entrypoint must exec its handover instead of forking"
     command: list[str] = []
     for line in lines[start:]:
         command.append(line.rstrip("\\").strip())
@@ -314,44 +426,83 @@ def _entrypoint_preflight_command() -> str:
     return " ".join(command)
 
 
+def test_entrypoint_hands_over_to_the_container_initialisation_module():
+    assert _entrypoint_handover_command() == \
+        "exec python -m auto_tune.delivery.container_entrypoint"
+
+
 def test_entrypoint_runs_the_shared_delivery_preflight_before_the_studio():
-    text = ENTRYPOINT.read_text(encoding="utf-8")
-    assert text.index("auto_tune.delivery.preflight") < text.index("-m auto_tune.main")
+    """Both steps live in the container module, and the preflight comes first."""
+    text = CONTAINER_ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert text.index("auto_tune.delivery.preflight") < text.index("auto_tune.main")
 
 
 def test_entrypoint_delegates_directory_and_configuration_initialisation():
     """Directory creation, write permission and the configuration bootstrap
     live in ``auto_tune/delivery/preflight.py`` so the Windows delivery can
-    reuse the same rules; the entrypoint only asks for the container subset."""
-    command = _entrypoint_preflight_command()
+    reuse the same rules; the container entrypoint only asks for the container
+    subset, and it asks for it after dropping privileges."""
+    from auto_tune.delivery.container_entrypoint import build_preflight_argv
+
+    command = " ".join(build_preflight_argv())
 
     assert "--require-mounts" in command
     assert "--bootstrap-config" in command
 
 
 def test_entrypoint_requires_the_gpu_instead_of_falling_back_to_cpu():
-    assert "--require-gpu" in _entrypoint_preflight_command()
+    from auto_tune.delivery.container_entrypoint import build_preflight_argv
+
+    assert "--require-gpu" in build_preflight_argv()
 
 
 def test_entrypoint_stops_the_start_when_the_preflight_fails():
     text = ENTRYPOINT.read_text(encoding="utf-8")
     assert "set -e" in text or "set -euo pipefail" in text
+    assert "CONTAINER_PREFLIGHT_FAILED" in CONTAINER_ENTRYPOINT.read_text(encoding="utf-8")
 
 
 def test_entrypoint_exports_the_controlled_configuration_path():
     assert "AUTO_TUNE_CONFIG_PATH" in ENTRYPOINT.read_text(encoding="utf-8")
 
 
-def test_entrypoint_execs_the_studio_so_signals_reach_the_application():
+def test_entrypoint_exports_the_persisted_credential_path():
+    """The container default must be documented in one place, and it must match
+    the path compose mounts, so a bare `docker run` behaves like compose."""
     text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert "AUTO_TUNE_CREDENTIALS_PATH" in text
+    assert "/data/secrets/credentials.json" in text
+
+
+def test_entrypoint_execs_the_studio_so_signals_reach_the_application():
+    """The shell replaces itself, and the module replaces *that* process with the
+    Studio, so the container's PID 1 is the Python process that receives SIGTERM
+    and nothing sits in between to swallow it."""
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+    module = CONTAINER_ENTRYPOINT.read_text(encoding="utf-8")
+
     assert "exec python" in text
-    assert "-m auto_tune.main" in text
+    assert "os.execv" in module
+    assert "Popen" not in module
+    assert "-m auto_tune.main" not in text, (
+        "the Studio is exec'd by the module, not by the shell")
 
 
 def test_entrypoint_never_prints_configuration_or_credential_contents():
+    """The entrypoint exports the credential *path* only.
+
+    The directory name ``secrets`` is part of the documented path, so the check
+    is about printing: no file dump, no shell tracing, no credential variable
+    echoed and no key-shaped or credential-field text anywhere.
+    """
     text = ENTRYPOINT.read_text(encoding="utf-8")
-    for forbidden in ("cat ", "api_key", "token", "password", "secret", "set -x"):
-        assert forbidden not in text, f"entrypoint must not print {forbidden!r}"
+
+    for forbidden in ("cat ", "set -x", "api_key", "apikey", "token", "password", "sk-"):
+        assert forbidden not in text.lower(), f"entrypoint must not print {forbidden!r}"
+    assert 'echo "$AUTO_TUNE_CREDENTIALS_PATH' not in text
+    assert "echo '${AUTO_TUNE_CREDENTIALS_PATH" not in text
 
 
 def _compose() -> dict:
@@ -386,7 +537,7 @@ def test_compose_binds_the_container_to_the_container_interface():
     assert str(environment["AUTO_TUNE_PORT"]) == "8000"
 
 
-def test_compose_mounts_the_six_controlled_host_directories():
+def test_compose_mounts_the_seven_controlled_directories():
     volumes = _compose()["services"]["studio"]["volumes"]
     targets = {str(volume).split(":")[-1] for volume in volumes}
 
@@ -397,7 +548,66 @@ def test_compose_mounts_the_six_controlled_host_directories():
         "/opt/auto-tune/runs",
         "/opt/auto-tune/models/weights",
         "/data/datasets",
+        "/data/secrets",
     }
+
+
+def test_compose_persists_the_credential_directory_in_a_named_volume():
+    """The credential directory must not be a host bind mount.
+
+    On Linux a bind mount whose host directory does not exist yet is created by
+    Docker as root:root, which the unprivileged runtime user cannot write — a
+    first start would be refused. A named volume is seeded once from the image
+    directory, which the Dockerfile creates owned by the runtime user.
+    """
+    compose = _compose()
+    volumes = [str(volume) for volume in compose["services"]["studio"]["volumes"]]
+
+    assert "secrets:/data/secrets" in volumes
+    assert "secrets" in (compose.get("volumes") or {}), (
+        "the named volume must be declared so compose creates and keeps it")
+    assert not any(volume.endswith("/secrets:/data/secrets") for volume in volumes), (
+        "the credential directory is still a host bind mount")
+
+
+def test_the_credential_volume_is_kept_by_down_and_only_removed_explicitly():
+    """``docker compose down`` keeps a declared named volume; only ``down -v``
+    (or ``docker volume rm``) removes it. An ``external`` volume would not be
+    removed by ``down -v``, and a ``local`` driver bound to a host path would
+    bring the root-owned bind directory straight back."""
+    definition = (_compose().get("volumes") or {}).get("secrets") or {}
+
+    assert definition.get("external") in (None, False), (
+        "an external volume is not removed by `down -v`")
+    device = (definition.get("driver_opts") or {}).get("device")
+    assert device is None, f"the volume must not be backed by a host path: {device!r}"
+
+
+def test_only_the_credential_directory_left_the_host_bind_mounts():
+    """The six operator-visible directories keep their host bind mounts; exactly
+    one mount is not a bind."""
+    volumes = [str(volume) for volume in _compose()["services"]["studio"]["volumes"]]
+    mounts = [volume for volume in volumes if not volume.startswith("${")]
+    binds = [volume for volume in volumes if volume.startswith("${")]
+
+    assert mounts == ["secrets:/data/secrets"]
+    assert sorted(volume.split(":")[-1] for volume in binds) == [
+        "/data/config",
+        "/data/datasets",
+        "/opt/auto-tune/detect",
+        "/opt/auto-tune/log",
+        "/opt/auto-tune/models/weights",
+        "/opt/auto-tune/runs",
+    ]
+
+
+def test_compose_points_the_container_at_the_persisted_credential_file():
+    service = _compose()["services"]["studio"]
+
+    assert service["environment"]["AUTO_TUNE_CREDENTIALS_PATH"] == \
+        "/data/secrets/credentials.json"
+    targets = {str(volume).split(":")[-1] for volume in service["volumes"]}
+    assert "/data/secrets" in targets, "the file's directory is the mounted one"
 
 
 # ── F1.2-E: the shared-memory budget the training DataLoaders need ──────────
@@ -485,13 +695,50 @@ def test_compose_mount_targets_match_the_shared_delivery_layout():
 
     paths = resolve_paths(app_root=CONTAINER_APP_ROOT,
                           config_path=Path("/data/config/config.yaml"),
-                          datasets_dir=CONTAINER_DATASETS_DIR)
+                          datasets_dir=CONTAINER_DATASETS_DIR,
+                          credentials_path=Path("/data/secrets/credentials.json"))
     # ``as_posix`` keeps the container paths comparable on any host platform.
     expected = {path.as_posix() for path in paths.persistent_dirs.values()}
     volumes = _compose()["services"]["studio"]["volumes"]
     mounted = {str(volume).split(":")[-1] for volume in volumes}
 
     assert mounted == expected
+    assert expected == {
+        "/data/config",
+        "/data/datasets",
+        "/opt/auto-tune/log",
+        "/opt/auto-tune/detect",
+        "/opt/auto-tune/runs",
+        "/opt/auto-tune/models/weights",
+        "/data/secrets",
+    }
+
+
+def test_compose_keeps_everything_the_first_start_contract_needs():
+    """The first-start permission fix is a change to *how* the container
+    initialises, not to what it is given: the service keeps its GPU reservation,
+    its loopback port, its shared-memory budget, all six host bind mounts and the
+    credential named volume."""
+    service = _compose()["services"]["studio"]
+    volumes = [str(volume) for volume in service["volumes"]]
+    mounts = [volume for volume in volumes if not volume.startswith("${")]
+
+    assert service["deploy"]["resources"]["reservations"]["devices"] == [
+        {"driver": "nvidia", "count": "all", "capabilities": ["gpu"]}
+    ]
+    assert str(service["ports"][0]) == "127.0.0.1:${AUTO_TUNE_PORT:-8000}:8000"
+    assert _require_shm_size_at_least_1gib(service["shm_size"]) >= _GIB
+    assert sorted(volume.split(":")[-1] for volume in volumes) == [
+        "/data/config",
+        "/data/datasets",
+        "/data/secrets",
+        "/opt/auto-tune/detect",
+        "/opt/auto-tune/log",
+        "/opt/auto-tune/models/weights",
+        "/opt/auto-tune/runs",
+    ]
+    assert mounts == ["secrets:/data/secrets"]
+    assert "secrets" in (_compose().get("volumes") or {})
 
 
 def test_compose_keeps_the_gpu_language_out_of_a_cpu_fallback():
@@ -501,8 +748,117 @@ def test_compose_keeps_the_gpu_language_out_of_a_cpu_fallback():
     assert "no gpu" not in text
 
 
+# ── the controlled input browse roots the folder pickers start from ─────────
+
+
+def _declared_browse_roots() -> list[str]:
+    environment = _compose()["services"]["studio"]["environment"]
+    declared = environment["AUTO_TUNE_INPUT_ALLOWED_ROOTS"]
+    return str(declared).split(";")
+
+
+def test_compose_declares_the_input_browse_roots():
+    """Without them the folder pickers list nothing at all in the container:
+    the configuration ships no allowed root, and the container has no drives."""
+    assert _declared_browse_roots() == ["/data/datasets", "/opt/auto-tune/detect"]
+
+
+def test_the_browse_roots_are_the_dataset_share_and_the_detect_directory():
+    """The roots come from the shared delivery layout, not from a second
+    hand-written copy of the container paths. ``detect`` is where
+    ``find_detect_dir()`` really writes every training run; the retired ``runs``
+    mount is deliberately *not* offered as well, which would only hide the
+    mismatch between the browser and the product."""
+    from auto_tune.delivery.preflight import CONTAINER_APP_ROOT, CONTAINER_DATASETS_DIR
+
+    assert _declared_browse_roots() == [
+        CONTAINER_DATASETS_DIR.as_posix(),
+        (CONTAINER_APP_ROOT / "detect").as_posix(),
+    ]
+    from auto_tune.delivery.runtime import CONTAINER_INPUT_ROOTS
+
+    assert CONTAINER_INPUT_ROOTS == tuple(_declared_browse_roots())
+
+
+def test_the_retired_runs_directory_is_not_offered_as_a_second_root():
+    """A browse root that no product flow writes into would mask the real path
+    the training analysis picker has to reach."""
+    from auto_tune.delivery.preflight import CONTAINER_APP_ROOT
+
+    assert (CONTAINER_APP_ROOT / "runs").as_posix() not in _declared_browse_roots()
+
+
+def test_every_browse_root_is_a_mounted_directory():
+    """A root that is not one of the mounts would let the picker walk into the
+    container's own filesystem; widening this must require a new mount."""
+    service = _compose()["services"]["studio"]
+    mounted = {str(volume).split(":")[-1] for volume in service["volumes"]}
+
+    assert _declared_browse_roots(), "the container must declare its roots"
+    for root in _declared_browse_roots():
+        assert root in mounted, f"{root} is browsable but not mounted"
+
+
+@pytest.mark.parametrize("wide", ["/", "/data", "/opt", "/opt/auto-tune"])
+def test_compose_never_offers_a_container_wide_root(wide):
+    assert wide not in _declared_browse_roots()
+
+
+def test_the_declared_start_roots_pass_the_runtimes_own_validation(monkeypatch):
+    """The value the container ships is the value the resolver accepts."""
+    from auto_tune.delivery import runtime
+
+    declared = ";".join(_declared_browse_roots())
+    monkeypatch.setenv(runtime.INPUT_ALLOWED_ROOTS_ENV, declared)
+
+    roots = runtime.resolve_input_allowed_roots()
+
+    assert [root.as_posix() for root in roots] == _declared_browse_roots()
+
+
+def test_entrypoint_defaults_the_input_browse_roots_for_a_bare_container():
+    """``docker run`` without compose must offer the same two directories."""
+    text = ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert "AUTO_TUNE_INPUT_ALLOWED_ROOTS" in text
+    assert "/data/datasets;/opt/auto-tune/detect" in text
+
+
+def test_the_shipped_defaults_are_exactly_the_whitelist_the_code_accepts(monkeypatch):
+    """Compose and the entrypoint cannot drift from the resolver: the value they
+    ship is the value the resolver accepts, character for character."""
+    from auto_tune.delivery import runtime
+
+    declared = ";".join(runtime.CONTAINER_INPUT_ROOTS)
+    entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
+
+    assert _compose()["services"]["studio"]["environment"][
+        "AUTO_TUNE_INPUT_ALLOWED_ROOTS"] == declared
+    assert f'${{AUTO_TUNE_INPUT_ALLOWED_ROOTS:-{declared}}}' in entrypoint
+
+    monkeypatch.setenv(runtime.INPUT_ALLOWED_ROOTS_ENV, declared)
+
+    roots = runtime.resolve_input_allowed_roots()
+
+    assert [root.as_posix() for root in roots] == declared.split(";")
+
+
+def test_the_desktop_delivery_never_sets_the_container_browse_roots():
+    """The Windows start lists the machine's drives: setting the variable there
+    would silently replace that with two container paths."""
+    windows = REPO_ROOT / "windows"
+    for path in sorted(windows.rglob("*")):
+        if path.is_file() and path.suffix.lower() in (".ps1", ".bat", ".psm1", ".json",
+                                                     ".txt"):
+            assert "AUTO_TUNE_INPUT_ALLOWED_ROOTS" not in path.read_text(
+                encoding="utf-8", errors="replace"), path.name
+
+
 def test_compose_contains_no_credential_or_local_absolute_path():
+    """Compose names *where* a credential is persisted, never a credential."""
     text = COMPOSE.read_text(encoding="utf-8")
-    for forbidden in ("api_key", "apikey", "token", "password", "secret"):
-        assert forbidden.lower() not in text.lower()
+    for forbidden in ("api_key", "apikey", "token", "password", "sk-", "your_"):
+        assert forbidden.lower() not in text.lower(), f"compose leaks {forbidden!r}"
     assert not _WINDOWS_ABSOLUTE_PATH.search(text)
+    # the only credential-related text is the persisted location
+    assert "/data/secrets" in text

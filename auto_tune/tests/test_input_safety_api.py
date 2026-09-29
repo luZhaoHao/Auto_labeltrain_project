@@ -12,6 +12,7 @@ from auto_tune.modules.input_safety import (
     InputPolicyInvalidError,
     InputSafetyPolicy,
 )
+from auto_tune.delivery.runtime import INPUT_ALLOWED_ROOTS_ENV
 from auto_tune.ui import app as app_mod
 
 
@@ -130,6 +131,177 @@ def test_browse_error_response_has_no_stacktrace(tmp_path, monkeypatch):
     assert resp.status_code == 403
     assert "Traceback" not in resp.text
     assert 'File "' not in resp.text
+
+
+# ── Task 5b: the container's controlled browse roots ────────────────────────
+
+CONTAINER_ROOTS = "/data/datasets;/opt/auto-tune/detect"
+
+
+def _posix(path) -> str:
+    """A path as the container spells it, on any host platform."""
+    return str(path).replace("\\", "/")
+
+
+def _offered_container_roots() -> list[str]:
+    """The two declared roots as this host can spell them.
+
+    The browser resolves every root before it offers it, so on a Windows
+    development host a container-absolute ``/data/datasets`` becomes
+    ``<drive>:\\data\\datasets``. What the API must not do is offer anything
+    *other* than the two declared roots — or nothing at all. The exact container
+    spelling is pinned by the Docker delivery suites.
+    """
+    return [str(Path(root).resolve(strict=False)) for root in CONTAINER_ROOTS.split(";")]
+
+
+def _input_safety_section(*roots):
+    return {"max_directory_members": 200000,
+            "max_directory_bytes": 536870912000,
+            "allowed_roots": [str(root) for root in roots],
+            "allow_unc_paths": False}
+
+
+def test_the_environment_roots_are_offered_when_the_configuration_has_none(monkeypatch):
+    """This is the container start: the configuration lists no root at all and
+    the two declared directories are the ones the browser offers."""
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section())
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    assert [entry["path"] for entry in entries] == _offered_container_roots()
+    assert all(entry["is_dir"] for entry in entries)
+
+
+def test_the_environment_roots_replace_the_configured_ones(monkeypatch, tmp_path):
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section(configured))
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 200
+    assert [entry["path"] for entry in resp.json()["entries"]] == _offered_container_roots()
+
+
+def test_the_configured_roots_stay_in_force_when_the_environment_is_unset(monkeypatch, tmp_path):
+    """The desktop default is unchanged: no variable, no override."""
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section(configured))
+    monkeypatch.delenv(INPUT_ALLOWED_ROOTS_ENV, raising=False)
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 200
+    assert [entry["path"] for entry in resp.json()["entries"]] == [str(configured.resolve())]
+
+
+def test_a_configured_root_is_unreachable_once_the_environment_replaces_it(monkeypatch, tmp_path):
+    """The override must bound *browsing*, not only the root listing."""
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section(configured))
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    resp = _client().post("/api/browse-folder", json={"path": str(configured)})
+
+    assert resp.status_code == 403
+    assert resp.json()["error_code"] == "INPUT_PATH_NOT_ALLOWED"
+
+
+def test_the_offered_roots_have_no_parent_to_navigate_up_to(monkeypatch):
+    """No client request can walk the browser above a declared root."""
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section())
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+    policy = app_mod._load_input_policy()
+
+    assert policy.allowed_roots, "the environment must really bound the policy"
+    for root in policy.allowed_roots:
+        assert app_mod._browse_parent(root, policy) is None
+
+
+def test_an_invalid_environment_root_is_a_stable_policy_error(monkeypatch):
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section())
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, "relative/datasets")
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 500
+    assert resp.json()["error_code"] == "INPUT_POLICY_INVALID"
+    assert "Traceback" not in resp.text
+    assert "relative/datasets" not in resp.text
+
+
+def test_a_directory_the_delivery_does_not_declare_is_refused_by_the_api(monkeypatch):
+    """The picker cannot be pointed at the container's own directories: the value
+    is refused before any policy is built, with the value never echoed."""
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", _input_safety_section())
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, "/data/datasets;/opt/auto-tune/runs")
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 500
+    assert resp.json()["error_code"] == "INPUT_POLICY_INVALID"
+    assert "/opt/auto-tune/runs" not in resp.text
+
+
+# ── an upgraded install: the authoritative roots win before the policy exists ──
+
+
+def test_an_old_configuration_cannot_block_the_container_start(monkeypatch):
+    """A container is started with the ``config.yaml`` an earlier, Windows
+    install wrote. Its ``allowed_roots`` are host paths the container cannot
+    use, and the container's own value is authoritative: the environment roots
+    must replace them *before* the policy is built, so neither the start nor a
+    browse request fails on a root the override is about to discard."""
+    monkeypatch.setitem(
+        app_mod.APP_CONFIG,
+        "input_safety",
+        _input_safety_section(r"C:\data\datasets", "relative/datasets"),
+    )
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 200
+    assert [entry["path"] for entry in resp.json()["entries"]] == _offered_container_roots()
+
+
+def test_the_other_limits_still_come_from_the_configuration(monkeypatch):
+    """Only the roots are authoritative in the environment; the bounded-scan
+    limits stay the operator's configuration."""
+    section = _input_safety_section()
+    section["max_directory_members"] = 7
+    section["max_directory_bytes"] = 4096
+    section["allow_unc_paths"] = True
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", section)
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    policy = app_mod._load_input_policy()
+
+    assert policy.max_directory_members == 7
+    assert policy.max_directory_bytes == 4096
+    assert policy.allow_unc_paths is True
+    assert [_posix(root) for root in policy.allowed_roots] == CONTAINER_ROOTS.split(";")
+
+
+def test_a_still_invalid_limit_is_still_a_policy_error(monkeypatch):
+    """The override is scoped to the roots: a genuinely invalid limit must keep
+    being refused instead of being silently replaced along with them."""
+    section = _input_safety_section()
+    section["max_directory_members"] = 0
+    monkeypatch.setitem(app_mod.APP_CONFIG, "input_safety", section)
+    monkeypatch.setenv(INPUT_ALLOWED_ROOTS_ENV, CONTAINER_ROOTS)
+
+    resp = _client().post("/api/browse-folder", json={"path": ""})
+
+    assert resp.status_code == 500
+    assert resp.json()["error_code"] == "INPUT_POLICY_INVALID"
 
 
 # ── Task 6: analyze-folder preflight gates ──

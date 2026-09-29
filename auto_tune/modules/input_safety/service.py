@@ -58,15 +58,27 @@ def _parse_allowed_roots(raw: Any) -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def load_input_safety_policy(config: Mapping[str, Any]) -> InputSafetyPolicy:
+def load_input_safety_policy(
+    config: Mapping[str, Any],
+    allowed_roots: tuple[Path, ...] | None = None,
+) -> InputSafetyPolicy:
     """Parse the ``input_safety`` section with strict typing and bounds.
 
     A missing section yields the spec defaults. A present but invalid value is
     a configuration error; it is never silently coerced to an unbounded policy.
+
+    ``allowed_roots`` is the delivery's authoritative root set (the container
+    declares it in the environment). When it is given, the configured
+    ``allowed_roots`` are *replaced*, not merged, and are not even parsed: a
+    configuration an earlier desktop install wrote — host paths, or a value this
+    machine could not use — must not be able to stop the start before the
+    authoritative value has had its say. Every other limit still comes from the
+    configuration and is still validated, so a genuinely invalid limit is still
+    refused rather than quietly lost along with the roots.
     """
     section = (config or {}).get("input_safety")
     if section is None:
-        return InputSafetyPolicy()
+        return InputSafetyPolicy(allowed_roots=tuple(allowed_roots or ()))
     if not isinstance(section, dict):
         raise InputPolicyInvalidError("input_safety 配置必须是映射")
     unknown = set(section) - _ALLOWED_POLICY_FIELDS
@@ -86,14 +98,17 @@ def load_input_safety_policy(config: Mapping[str, Any]) -> InputSafetyPolicy:
         1,
         BYTE_LIMIT_MAX,
     )
-    allowed_roots = _parse_allowed_roots(section.get("allowed_roots"))
+    if allowed_roots is None:
+        roots = _parse_allowed_roots(section.get("allowed_roots"))
+    else:
+        roots = tuple(allowed_roots)
     allow_unc = section.get("allow_unc_paths", False)
     if not isinstance(allow_unc, bool):
         raise InputPolicyInvalidError("allow_unc_paths 必须是布尔值")
     return InputSafetyPolicy(
         max_directory_members=members,
         max_directory_bytes=byte_limit,
-        allowed_roots=allowed_roots,
+        allowed_roots=roots,
         allow_unc_paths=allow_unc,
     )
 

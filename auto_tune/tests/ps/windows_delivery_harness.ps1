@@ -118,6 +118,8 @@ $script:Calls = New-Object System.Collections.ArrayList
 $script:EnvMode = 'ok'
 $script:PreflightMode = 'ok'
 $script:HealthMode = 'ok'
+$script:HealthProbeCalls = 0
+$script:StopperMode = 'ok'
 $script:ProcessAlive = $true
 $script:PortInUse = $false
 $script:RuntimeInstallCalls = 0
@@ -630,8 +632,37 @@ function New-FakeHealthProbe {
     return {
         param($Port, $TimeoutMs)
         Add-Call 'healthz' @{ port = $Port }
+        $script:HealthProbeCalls = $script:HealthProbeCalls + 1
+        if ($script:HealthMode -eq 'fail-then-ok') {
+            # The first probe is the one that asks the *recorded* instance whether
+            # it still answers; every later probe belongs to the fresh launch.
+            return ($script:HealthProbeCalls -gt 1)
+        }
         return ($script:HealthMode -eq 'ok')
     }
+}
+
+function New-FakeProcessStopper {
+    # The boundary a start crosses when it has decided that the process named by
+    # studio.json is alive but no longer a running product.
+    return {
+        param($ProcessId, $StartedAt, $LogFile, $InstallRoot)
+        Add-Call 'stop-process' @{ pid = [int]$ProcessId; startedAt = [string]$StartedAt }
+        if ($script:StopperMode -eq 'fail') { return $false }
+        if ($ProcessId -gt 0) {
+            # the stand-in process really ends, so "it was replaced" is an
+            # observation rather than a claim
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        return $true
+    }
+}
+
+function New-IdentityProbe {
+    # Only the port answer is injected. The PID/started_at question is answered
+    # by the *real* Test-ProcessIdentity, so "an unrelated process that reused
+    # the pid is left alone" is decided by the shipping code.
+    return @{ PortInUse = { param($Port) $false } }
 }
 
 function New-FakeBrowser {
@@ -2683,26 +2714,92 @@ function Invoke-Scenario([string]$Name) {
                 port             = [int]$result.Port
             }
         }
-        'start-health-timeout-existing-instance' {
+        # ── start: a recorded process that lives but no longer answers ──────
+        #
+        # studio.json may describe a process that is alive yet does not serve
+        # /healthz (crashed worker, half-dead port, a machine that was killed).
+        # The record alone is not evidence of a running product, so the start
+        # asks the endpoint; only an identity-matched stale process is stopped,
+        # and the flow then continues as a normal start.
+
+        'start-stale-instance-restarts' {
             $layout = New-Layout
             $null = Invoke-FullInstall -Layout $layout -PackageRoot (Join-Path $WorkRoot 'package')
             $existing = Start-RealIdleProcess
+            $existingStartedAt = $existing.StartTime.ToUniversalTime().ToString('o')
             try {
                 [void](Write-InstallState -StateFile (Join-Path $layout.Logs 'studio.json') -State ([ordered]@{
                         pid        = [int]$existing.Id
-                        started_at = $existing.StartTime.ToUniversalTime().ToString('o')
+                        started_at = $existingStartedAt
                         port       = $layout.Port
                     }))
                 $script:Calls.Clear()
                 $script:BrowserOpens.Clear()
-                $script:ProcessAlive = $true
-                $script:HealthMode = 'fail'
-                $result = Start-Studio -Layout $layout -Probe (New-FakeProbe) `
+                $script:HealthProbeCalls = 0
+                $script:StopperMode = 'ok'
+                $script:HealthMode = 'fail-then-ok'
+                $result = Start-Studio -Layout $layout -Probe (New-IdentityProbe) `
                     -PreflightRunner (New-FakePreflight) -Launcher (New-FakeLauncher) `
                     -HealthProbe (New-FakeHealthProbe) -BrowserOpener (New-FakeBrowser) `
+                    -ProcessStopper (New-FakeProcessStopper) `
+                    -SleepMs 1 -TimeoutSeconds 5
+                Start-Sleep -Milliseconds 300
+                $staleAlive = Test-ProcessStillAlive -ProcessId $existing.Id
+                $stopper = @(Get-CallData 'stop-process')
+                $logPath = Join-Path $layout.Logs 'start.log'
+                $logText = if (Test-Path $logPath) { Get-Content $logPath -Raw -Encoding UTF8 } else { '' }
+                $written = Read-InstallState -StateFile (Join-Path $layout.Logs 'studio.json')
+                return [ordered]@{
+                    ok                 = $result.Ok
+                    alreadyRunning     = $result.AlreadyRunning
+                    errorCode          = $result.ErrorCode
+                    launches           = @(Get-CallData 'launch-service').Count
+                    preflightCalls     = @(Get-CallData 'preflight').Count
+                    healthProbes       = @(Get-CallData 'healthz').Count
+                    browserOpens       = @($script:BrowserOpens).Count
+                    browserUrl         = if (@($script:BrowserOpens).Count -gt 0) { $script:BrowserOpens[0] } else { '' }
+                    stopCalls          = @($stopper).Count
+                    stoppedPid         = if (@($stopper).Count -gt 0) { [int]$stopper[0].pid } else { 0 }
+                    stoppedStartedAt   = if (@($stopper).Count -gt 0) { [string]$stopper[0].startedAt } else { '' }
+                    recordedPid        = [int]$existing.Id
+                    recordedStartedAt  = $existingStartedAt
+                    staleProcessAlive  = $staleAlive
+                    instancePidAfter   = if ($null -ne $written) { [int]$written.pid } else { 0 }
+                    logMentionsStalePid = ($logText -like "*$($existing.Id)*")
+                    logMentionsCode    = ($logText -like '*STALE_INSTANCE*')
+                }
+            } finally {
+                if (Test-ProcessStillAlive -ProcessId $existing.Id) {
+                    Stop-Process -Id $existing.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        'start-stale-instance-restart-unhealthy' {
+            # The cleanup works and the replacement start is attempted, but the
+            # replacement never answers: the existing timeout rule still ends the
+            # launch and withdraws its record.
+            $layout = New-Layout
+            $null = Invoke-FullInstall -Layout $layout -PackageRoot (Join-Path $WorkRoot 'package')
+            $existing = Start-RealIdleProcess
+            $existingStartedAt = $existing.StartTime.ToUniversalTime().ToString('o')
+            try {
+                [void](Write-InstallState -StateFile (Join-Path $layout.Logs 'studio.json') -State ([ordered]@{
+                        pid        = [int]$existing.Id
+                        started_at = $existingStartedAt
+                        port       = $layout.Port
+                    }))
+                $script:Calls.Clear()
+                $script:BrowserOpens.Clear()
+                $script:HealthProbeCalls = 0
+                $script:StopperMode = 'ok'
+                $script:HealthMode = 'fail'
+                $result = Start-Studio -Layout $layout -Probe (New-IdentityProbe) `
+                    -PreflightRunner (New-FakePreflight) -Launcher (New-FakeLauncher) `
+                    -HealthProbe (New-FakeHealthProbe) -BrowserOpener (New-FakeBrowser) `
+                    -ProcessStopper (New-FakeProcessStopper) `
                     -SleepMs 200 -TimeoutSeconds 1
-                Start-Sleep -Milliseconds 500
-                $aliveAfter = Test-ProcessStillAlive -ProcessId $existing.Id
+                Start-Sleep -Milliseconds 300
+                $staleAlive = Test-ProcessStillAlive -ProcessId $existing.Id
             } finally {
                 if (Test-ProcessStillAlive -ProcessId $existing.Id) {
                     Stop-Process -Id $existing.Id -Force -ErrorAction SilentlyContinue
@@ -2711,11 +2808,107 @@ function Invoke-Scenario([string]$Name) {
             return [ordered]@{
                 ok              = $result.Ok
                 alreadyRunning  = $result.AlreadyRunning
-                browserOpens    = @($script:BrowserOpens).Count
+                errorCode       = $result.ErrorCode
+                stopCalls       = @(Get-CallData 'stop-process').Count
                 launches        = @(Get-CallData 'launch-service').Count
                 healthProbes    = @(Get-CallData 'healthz').Count
-                existingAlive   = $aliveAfter
-                instanceKept    = (Test-Path -PathType Leaf (Join-Path $layout.Logs 'studio.json'))
+                browserOpens    = @($script:BrowserOpens).Count
+                staleProcessAlive = $staleAlive
+                instanceExists  = (Test-Path -PathType Leaf (Join-Path $layout.Logs 'studio.json'))
+            }
+        }
+        'start-stale-instance-pid-reused' {
+            # The record names a pid that the operating system handed to an
+            # unrelated process (started_at does not match). Nothing may be
+            # terminated, and the start is an ordinary start.
+            $layout = New-Layout
+            $null = Invoke-FullInstall -Layout $layout -PackageRoot (Join-Path $WorkRoot 'package')
+            $unrelated = Start-RealIdleProcess
+            try {
+                [void](Write-InstallState -StateFile (Join-Path $layout.Logs 'studio.json') -State ([ordered]@{
+                        pid        = [int]$unrelated.Id
+                        started_at = '2001-01-01T00:00:00.0000000Z'
+                        port       = $layout.Port
+                    }))
+                $script:Calls.Clear()
+                $script:BrowserOpens.Clear()
+                $script:HealthProbeCalls = 0
+                $script:HealthMode = 'ok'
+                $result = Start-Studio -Layout $layout -Probe (New-IdentityProbe) `
+                    -PreflightRunner (New-FakePreflight) -Launcher (New-FakeLauncher) `
+                    -HealthProbe (New-FakeHealthProbe) -BrowserOpener (New-FakeBrowser) `
+                    -ProcessStopper (New-FakeProcessStopper) `
+                    -SleepMs 1 -TimeoutSeconds 5
+                Start-Sleep -Milliseconds 300
+                $unrelatedAlive = Test-ProcessStillAlive -ProcessId $unrelated.Id
+            } finally {
+                if (Test-ProcessStillAlive -ProcessId $unrelated.Id) {
+                    Stop-Process -Id $unrelated.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return [ordered]@{
+                ok                 = $result.Ok
+                alreadyRunning     = $result.AlreadyRunning
+                errorCode          = $result.ErrorCode
+                stopCalls          = @(Get-CallData 'stop-process').Count
+                launches           = @(Get-CallData 'launch-service').Count
+                preflightCalls     = @(Get-CallData 'preflight').Count
+                browserOpens       = @($script:BrowserOpens).Count
+                unrelatedAlive     = $unrelatedAlive
+                identityMatched    = (Test-ProcessIdentity -ProcessId ([int]$unrelated.Id) `
+                        -StartedAt '2001-01-01T00:00:00.0000000Z')
+            }
+        }
+        'start-stale-instance-unstoppable' {
+            # Identity matches but the process cannot be ended: starting a second
+            # instance would leave two servers on one port, so the start stops
+            # here with one stable code.
+            $layout = New-Layout
+            $null = Invoke-FullInstall -Layout $layout -PackageRoot (Join-Path $WorkRoot 'package')
+            $existing = Start-RealIdleProcess
+            $existingStartedAt = $existing.StartTime.ToUniversalTime().ToString('o')
+            try {
+                [void](Write-InstallState -StateFile (Join-Path $layout.Logs 'studio.json') -State ([ordered]@{
+                        pid        = [int]$existing.Id
+                        started_at = $existingStartedAt
+                        port       = $layout.Port
+                    }))
+                $script:Calls.Clear()
+                $script:BrowserOpens.Clear()
+                $script:HealthProbeCalls = 0
+                $script:StopperMode = 'fail'
+                $script:HealthMode = 'fail'
+                $result = Start-Studio -Layout $layout -Probe (New-IdentityProbe) `
+                    -PreflightRunner (New-FakePreflight) -Launcher (New-FakeLauncher) `
+                    -HealthProbe (New-FakeHealthProbe) -BrowserOpener (New-FakeBrowser) `
+                    -ProcessStopper (New-FakeProcessStopper) `
+                    -SleepMs 1 -TimeoutSeconds 5
+                Start-Sleep -Milliseconds 300
+                $staleAlive = Test-ProcessStillAlive -ProcessId $existing.Id
+                $logPath = Join-Path $layout.Logs 'start.log'
+                $logText = if (Test-Path $logPath) { Get-Content $logPath -Raw -Encoding UTF8 } else { '' }
+            } finally {
+                if (Test-ProcessStillAlive -ProcessId $existing.Id) {
+                    Stop-Process -Id $existing.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return [ordered]@{
+                ok                   = $result.Ok
+                alreadyRunning       = $result.AlreadyRunning
+                errorCode            = $result.ErrorCode
+                message              = [string]$result.Message
+                stopCalls            = @(Get-CallData 'stop-process').Count
+                launches             = @(Get-CallData 'launch-service').Count
+                preflightCalls       = @(Get-CallData 'preflight').Count
+                healthProbes         = @(Get-CallData 'healthz').Count
+                browserOpens         = @($script:BrowserOpens).Count
+                staleProcessAlive    = $staleAlive
+                instanceKept         = (Test-Path -PathType Leaf (Join-Path $layout.Logs 'studio.json'))
+                messageMentionsLog   = ($result.Message -like '*studio.err.log*')
+                messageHasDrivePath  = ([string]$result.Message -match '[A-Za-z]:\\')
+                messageMentionsPid   = ([string]$result.Message -like "*$($existing.Id)*")
+                logMentionsCode      = ($logText -like '*STALE_INSTANCE_UNSTOPPABLE*')
+                logMentionsPid       = ($logText -like "*$($existing.Id)*")
             }
         }
         'uninstall-removes-launcher-and-shortcut' {

@@ -33,11 +33,25 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
 
-# The Studio runs as an unprivileged user; its writable directories are the
-# mounted ones, created and owned here so a bare container still starts.
-RUN useradd --create-home --uid 10001 --shell /bin/bash studio \
+# The Studio runs as an unprivileged user. The account and its group are created
+# with explicit ids so the runtime user is deterministically 10001:10001: the
+# entrypoint verifies that pair before it drops privileges and refuses to start
+# on any other one.
+#
+# The directories are created and owned here so a bare container still starts.
+# /data/secrets is where compose.yaml mounts the credential named volume: a fresh
+# named volume is seeded from this image directory, so the directory has to exist
+# here owned by the runtime user, otherwise Docker leaves the mount point owned
+# by root, the start-up preflight refuses to run and the operator cannot save an
+# API key. The directory itself carries no credential content.
+#
+# A *host* bind directory that does not exist yet is created by the container
+# engine as root:root before the application ever runs, so the entrypoint fixes
+# those (and only those, and only their own inode) before dropping privileges.
+RUN groupadd --gid 10001 studio \
+    && useradd --create-home --uid 10001 --gid 10001 --shell /bin/bash studio \
     && mkdir -p /opt/auto-tune/log /opt/auto-tune/detect /opt/auto-tune/runs \
-        /opt/auto-tune/models/weights /data/config /data/datasets \
+        /opt/auto-tune/models/weights /data/config /data/datasets /data/secrets \
     && chown -R studio:studio /opt/auto-tune /data
 
 WORKDIR /opt/auto-tune
@@ -60,6 +74,12 @@ RUN chmod +x ./docker/entrypoint.sh
 # Operational probe only: no datasets, models, credentials or training state.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
 
-USER studio
+# The container starts privileged because the first start has to hand the mounted
+# directories to the unprivileged user above; the entrypoint does that, drops to
+# studio (UID/GID 10001), and only then runs the delivery preflight and the
+# Studio. No business code runs as root, and no preparation script is needed
+# before `docker compose up -d`. This must stay the last USER instruction: an
+# earlier `USER studio` would remove the privileges the initialisation needs.
+USER root
 
 ENTRYPOINT ["/opt/auto-tune/docker/entrypoint.sh"]

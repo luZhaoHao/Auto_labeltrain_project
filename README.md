@@ -3,14 +3,14 @@
 [中文](README.md) | [English](README_EN.md)
 
 > [!IMPORTANT]
-> **最终稳定版本：Auto-Tune Studio `v0.2.0`（2026-09-25）**
-> 本版本已完成 Windows 完全离线安装的线下试用验收、Docker NVIDIA GPU 公开交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
+> **最终稳定版本：Auto-Tune Studio `v0.2.1`（2026-09-29）**
+> 本版本已完成 Windows ZIP 线下试用验收、Docker NVIDIA GPU 公开交付、正常训练、HPO、LLM 调优、FP32 ONNX 导出及持久化验收。后续以维护性更新为主。
 >
 > - [后续研发路线与实施评估（DOCX）](docs/Auto-Tune后续研发路线与实施评估_研发执行版.docx)
 > - [软件安装手册（DOCX）](docs/Auto-Tune软件安装手册.docx)
 > - [软件操作手册（DOCX）](docs/Auto-Tune软件操作手册.docx)
 >
-> 官方线上安装方式为从 GHCR 拉取 Docker GPU 镜像，或从本仓库源码运行。Windows 完全离线 ZIP 仅供线下试用，不上传公开仓库；需要时请联系艾卡获取。
+> 官方线上安装方式为从 GHCR 拉取 Docker GPU 镜像，或从本仓库源码运行。Windows ZIP 仅供线下试用，不上传公开仓库；需要时请联系艾卡获取。Windows 与 Docker 首次安装、首次训练需要网络，受限网络请使用 VPN。
 
 Auto LabelTrain 是一个面向 YOLO 操作人员的本地 Web 工具。它把数据集质量检查、YOLO 训练、训练结果诊断、LLM 超参数建议、安全护栏、训练审计和实验历史整合在同一套界面中。
 
@@ -21,7 +21,7 @@ Auto LabelTrain 是一个面向 YOLO 操作人员的本地 Web 工具。它把�
 - LLM 建议的超参数是否安全，实际训练使用了什么命令？
 - 普通训练和自动调优的结果能否在同一处比较和追溯？
 
-> 当前正式验证环境：Windows 10/11 完全离线安装，以及 Docker Desktop Linux Engine + NVIDIA GPU；运行时使用 Python 3.10、CUDA 12.1 和 Ultralytics YOLOv8 detection。YOLO11/26、其他视觉任务和模型结构自调整不在本版本范围内。
+> 当前正式验证环境：Windows 10/11 ZIP 安装，以及 Docker Desktop Linux Engine + NVIDIA GPU；运行时使用 Python 3.10、CUDA 12.1 和 Ultralytics YOLOv8 detection。YOLO11/26、其他视觉任务和模型结构自调整不在本版本范围内。
 
 ## 工作流程
 
@@ -41,7 +41,7 @@ flowchart LR
 
 ## 界面示例
 
-以下截图为 v0.2.0 最终界面演示。更完整的操作步骤和安装截图请查看顶部链接的安装手册与操作手册。
+以下截图为 v0.2 系列最终界面演示。0.2.1 未替换已批准的截图集；更完整的操作步骤和安装截图请查看顶部链接的安装手册与操作手册。
 
 ### Studio 首页
 
@@ -114,6 +114,7 @@ flowchart LR
 - Docker 用户需要 Docker Desktop、NVIDIA 驱动及可用的 GPU 容器运行环境
 - 可访问的 YOLO 格式数据集
 - 可选：DeepSeek API Key、Qwen-VL API Key
+- Windows 和 Docker 首次安装、首次训练需要保持网络畅通；网络受限时连接可用 VPN，以下载首次使用的 Ultralytics 权重。LLM 分析和调优需要持续访问外部 API。
 
 数据集应包含可被 Ultralytics 识别的 `data.yaml`。模型可使用 Ultralytics 模型名，例如 `yolov8n.pt`；首次使用时 Ultralytics 可能需要联网下载权重，也可以配置本地模型路径。
 
@@ -124,24 +125,26 @@ flowchart LR
 联网环境推荐直接从公开的 GitHub Container Registry 拉取已验收镜像：
 
 ```powershell
-docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.0
-docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.0 auto-tune:local
-docker compose up -d
+docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.1
+docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.1 auto-tune:local
+docker compose up -d --no-build
 ```
 
-完全离线环境可使用单独交付的镜像归档：
+无法直接访问 GHCR 的环境可使用单独交付的镜像归档：
 
 ```powershell
-docker load -i AutoTuneStudio-Docker-0.2.0-image.tar
-docker tag auto-tune:0.2.0 auto-tune:local
-docker compose up -d
+docker load -i AutoTuneStudio-Docker-0.2.1-image.tar
+docker tag auto-tune:0.2.1 auto-tune:local
+docker compose up -d --no-build
 ```
+
+镜像归档只提供实际运行镜像；启动还需要 `AutoTuneStudio-Docker-0.2.1-source.zip` 中的 `compose.yaml` 和目录配置。请先解压配置包，再进入能直接看到 `compose.yaml` 的目录执行上述 Compose 命令。只导入镜像后在其他目录运行 `docker compose up` 会提示找不到配置文件。
 
 也可以在源码根目录构建后启动：
 
 ```powershell
 docker build --pull=false -t auto-tune:local .
-docker compose up -d
+docker compose up -d --no-build
 ```
 
 Compose 正式启动会申请 NVIDIA GPU，并把配置、SQLite 索引、数据集、训练结果和权重持久化到宿主机 `docker-data/`（可通过环境变量改到其他目录）。
@@ -168,9 +171,9 @@ python -m auto_tune.main
 
 两种源码方式都要求兼容的 NVIDIA GPU；它们不是面向普通用户的一键安装方式，也不得改为 CPU 训练。
 
-### 方式三：Windows 完全离线 ZIP（线下试用）
+### 方式三：Windows ZIP（线下试用）
 
-Windows ZIP 已完成验收，但不作为公开线上下载包发布。需要在单台 Windows GPU 工作站离线试用时，请联系艾卡获取对应版本的安装包和 SHA-256 校验信息；获取后按[安装手册](docs/Auto-Tune软件安装手册.docx)操作。
+Windows ZIP 已完成验收，但不作为公开线上下载包发布。需要在单台 Windows GPU 工作站试用时，请联系艾卡获取对应版本的安装包和 SHA-256 校验信息；获取后按[安装手册](docs/Auto-Tune软件安装手册.docx)操作。安装依赖已随 ZIP 提供，但首次训练仍可能下载 Ultralytics 检查权重，因此首次使用应联网，网络受限时连接 VPN。
 
 服务默认地址：
 

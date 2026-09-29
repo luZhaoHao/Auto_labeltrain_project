@@ -2,9 +2,9 @@
 
 [中文](README.md) | [English](README_EN.md)
 
-> **Final stable release: Auto-Tune Studio `v0.2.0` (25 September 2026)**
+> **Final stable release: Auto-Tune Studio `v0.2.1` (29 September 2026)**
 >
-> Public installation is supported through the accepted Docker GPU image on GHCR or by running this repository from source. The fully offline Windows ZIP is available only for private evaluation from Aika and is not published as a public download.
+> Public installation is supported through the accepted Docker GPU image on GHCR or by running this repository from source. The Windows ZIP is available only for private evaluation from Aika and is not published as a public download. The first installation and first training run require network access; use a working VPN where direct access is restricted.
 
 - [Installation Manual (English DOCX)](docs/Auto-Tune-Installation-Manual.docx)
 - [User Manual (English DOCX)](docs/Auto-Tune-User-Manual.docx)
@@ -103,6 +103,7 @@ Runtime requirements:
 - NVIDIA GPU with a compatible driver; CPU training fallback is not supported
 - A YOLO-format dataset
 - Optional DeepSeek and Qwen-VL API keys
+- Keep the network available during the first Windows or Docker installation and the first training run. Use a working VPN where direct access is restricted so Ultralytics can download first-use weights. LLM analysis and tuning require continued access to the external API.
 
 The dataset should include a `data.yaml` file accepted by Ultralytics. A model may be specified by an Ultralytics name such as `yolov8n.pt`. Ultralytics may download weights on first use, or you can configure a local model path.
 
@@ -113,18 +114,20 @@ The dataset should include a `data.yaml` file accepted by Ultralytics. A model m
 For an online host, pull the accepted public image from GitHub Container Registry:
 
 ```powershell
-docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.0
-docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.0 auto-tune:local
-docker compose up -d
+docker pull ghcr.io/luzhaohao/auto-tune-studio:0.2.1
+docker tag ghcr.io/luzhaohao/auto-tune-studio:0.2.1 auto-tune:local
+docker compose up -d --no-build
 ```
 
-For a fully offline host, import the separately delivered image archive instead:
+If the host cannot access GHCR directly, import the separately delivered image archive instead:
 
 ```powershell
-docker load -i AutoTuneStudio-Docker-0.2.0-image.tar
-docker tag auto-tune:0.2.0 auto-tune:local
-docker compose up -d
+docker load -i AutoTuneStudio-Docker-0.2.1-image.tar
+docker tag auto-tune:0.2.1 auto-tune:local
+docker compose up -d --no-build
 ```
+
+The image archive contains the runnable image. Startup also needs `compose.yaml` and the directory mappings from `AutoTuneStudio-Docker-0.2.1-source.zip`. Extract that package and run Compose from the directory that directly contains `compose.yaml`; running `docker compose up` in the image-archive directory alone produces a missing-configuration error.
 
 The production Compose configuration requires an NVIDIA GPU and persists configuration, the SQLite index, datasets, results, and controlled weights under the host-mounted `docker-data/` directories.
 
@@ -150,9 +153,9 @@ python -m auto_tune.main
 
 Both source paths require a compatible NVIDIA GPU. They are developer workflows rather than one-click end-user installers, and must not fall back to CPU training.
 
-### Option 3: Fully Offline Windows ZIP (private evaluation)
+### Option 3: Windows ZIP (private evaluation)
 
-The Windows ZIP delivery has passed acceptance testing but is not published as a public download. Contact Aika for the matching package and SHA-256 information when a private offline evaluation on a Windows GPU workstation is required, then follow the English Installation Manual.
+The Windows ZIP delivery has passed acceptance testing but is not published as a public download. Contact Aika for the matching package and SHA-256 information when a private evaluation on a Windows GPU workstation is required, then follow the English Installation Manual. Runtime dependencies are bundled, but the first training run may still download an Ultralytics AMP-check weight, so first use requires network access.
 
 The default service URL for every installation method is:
 

@@ -131,7 +131,7 @@ class ControllableStdout:
 def _make_manual_controller(tmp_path, monkeypatch, rc=0):
     """Build a ManualRunController wired to a controllable fake subprocess.
 
-    The fake ``create_subprocess_exec`` is installed via pytest monkeypatch so
+    The fake ``spawn_training_process`` is installed via pytest monkeypatch so
     it stays in effect while the controller task runs inside ``asyncio.run``.
     """
     import auto_tune.modules.run_state.manual_controller as mc
@@ -155,7 +155,7 @@ def _make_manual_controller(tmp_path, monkeypatch, rc=0):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
     controller = mc.ManualRunController(
         run_state=run_state,
         state_file=state_file,
@@ -407,7 +407,7 @@ def test_manual_http_events_seq_strictly_increasing(tmp_path, monkeypatch):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     app_mod._running_training.clear()
     try:
@@ -644,7 +644,7 @@ def test_run_stream_after_restart_reconciles_interrupted(tmp_path, monkeypatch):
 
 
 def _build_race_controller(tmp_path):
-    """A manual controller with a controllable create_subprocess_exec."""
+    """A manual controller with a controllable spawn_training_process."""
     import auto_tune.modules.run_state.manual_controller as mc
 
     run_state = new_run_state("manual", run_name="race1")
@@ -666,7 +666,7 @@ def _build_race_controller(tmp_path):
 
 def test_manual_stop_before_subprocess_created_skips_creation(tmp_path, monkeypatch):
     """A stop requested before the background task reaches
-    create_subprocess_exec must skip creating any subprocess and end the run
+    spawn_training_process must skip creating any subprocess and end the run
     cancelled/terminal — with no fake STOP_FAILED."""
     import auto_tune.modules.run_state.manual_controller as mc
 
@@ -691,7 +691,7 @@ def test_manual_stop_before_subprocess_created_skips_creation(tmp_path, monkeypa
         created.append(True)
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     async def scenario():
         controller.start()
@@ -711,7 +711,7 @@ def test_manual_stop_before_subprocess_created_skips_creation(tmp_path, monkeypa
 
 
 def test_manual_stop_during_subprocess_creation_race(tmp_path, monkeypatch):
-    """Stop arriving while create_subprocess_exec is in flight must not start
+    """Stop arriving while spawn_training_process is in flight must not start
     training nor report a fake STOP_FAILED: the fresh process is terminated and
     the run ends cancelled/terminal."""
     import auto_tune.modules.run_state.manual_controller as mc
@@ -747,14 +747,14 @@ def test_manual_stop_during_subprocess_creation_race(tmp_path, monkeypatch):
         created.append(proc)
         return proc
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", paused_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", paused_subprocess_exec)
 
     async def scenario():
         task = asyncio.create_task(controller._run())
         deadline = asyncio.get_running_loop().time() + 5
         while not entered.is_set() and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
-        assert entered.is_set(), "create_subprocess_exec never entered"
+        assert entered.is_set(), "spawn_training_process never entered"
         ok = controller.request_stop()  # stop while creation is paused
         released.set()
         await asyncio.wait_for(task, timeout=10)
@@ -794,7 +794,7 @@ def test_manual_stop_too_late_keeps_natural_completion(tmp_path, monkeypatch):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     controller = mc.ManualRunController(
         run_state=run_state, state_file=state_file,
@@ -855,7 +855,7 @@ def test_manual_stop_unapplied_nonzero_exit_is_failed(tmp_path, monkeypatch):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     controller = mc.ManualRunController(
         run_state=run_state, state_file=state_file,
@@ -920,7 +920,7 @@ def test_retained_manual_controller_replays_missed_events_after_completion(tmp_p
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     def fake_finalize(controller, returncode):
         return {
@@ -1108,7 +1108,7 @@ def test_replay_truncated_warning_is_not_terminal(tmp_path, monkeypatch):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
 
     controller = mc.ManualRunController(
         run_state=run_state, state_file=state_file,
@@ -1200,7 +1200,7 @@ def test_http_reconnect_replays_real_events_after_completion(tmp_path, monkeypat
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(mc.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(mc, "spawn_training_process", fake_subprocess_exec)
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "detect"))

@@ -321,6 +321,10 @@ def test_the_module_exposes_the_stable_error_codes():
         "UNSAFE_REMOVAL_TARGET",
         "CONFIRMATION_REQUIRED",
         "HEALTH_CHECK_FAILED",
+        # a recorded process that is alive but no longer answers /healthz
+        "STALE_INSTANCE_DETECTED",
+        "STALE_INSTANCE_CLEARED",
+        "STALE_INSTANCE_UNSTOPPABLE",
         # the offline installation
         "INSTALL_ROOT_INVALID",
         "OFFLINE_BUNDLE_MISSING",
@@ -429,6 +433,15 @@ def test_the_delivery_never_writes_a_credential_into_a_file():
         assert not _API_KEY_LITERAL.search(text), f"{path.name} contains an API key"
 
 
+def test_the_delivery_refuses_to_ship_the_persisted_credential_file():
+    """The container's key file is operator data: the payload whitelist must drop
+    it whatever the manifest says, exactly like the other local-state names."""
+    text = _text(MODULE)
+
+    assert "PayloadDeniedNames" in text
+    assert "credentials.json" in text, "the credential file name is not denied"
+
+
 def _delivery_files() -> list[Path]:
     return (sorted(WINDOWS.glob("*.bat")) + sorted(WINDOWS.glob("*.ps1"))
             + [MODULE, MANIFEST, LOCK])
@@ -494,6 +507,25 @@ def test_the_manifest_declares_the_product_and_the_python():
     assert manifest["product"] == "auto-tune-studio"
     assert manifest["python_version"] == "3.10"
     assert manifest["version"]
+
+
+def test_the_manifest_carries_the_repaired_delivery_version():
+    """The candidate package replaces ``AutoTuneStudio-Setup-0.2.0.zip``: a later
+    version is what tells the installer this is not the same build again."""
+    assert _manifest()["version"] == "0.2.1"
+
+
+def test_the_shipped_package_name_follows_the_manifest_version():
+    """``build_zip.ps1`` names the archive from the manifest when no explicit
+    ``-Version`` is given (the behavioural proof is in test_windows_delivery_zip.py)."""
+    text = _text(WINDOWS / "build_zip.ps1")
+    manifest = _manifest()
+
+    assert "AutoTuneStudio-Setup-{0}.zip" in text
+    assert text.index("$manifest = Get-PackageManifest") < \
+        text.index("AutoTuneStudio-Setup-{0}.zip")
+    assert f"AutoTuneStudio-Setup-{manifest['version']}.zip" == \
+        "AutoTuneStudio-Setup-0.2.1.zip"
 
 
 def test_the_manifest_pins_the_private_runtime_download():

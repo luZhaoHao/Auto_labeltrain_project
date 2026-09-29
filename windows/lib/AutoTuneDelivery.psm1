@@ -24,7 +24,10 @@ $script:ErrorPrefix = 'AUTOTUNE_DELIVERY|'
 $script:TrustedDownloadHosts = @('repo.anaconda.com', 'download.pytorch.org', 'pypi.org', 'files.pythonhosted.org')
 
 # Files that may never ship inside the package, whatever the manifest says.
-$script:PayloadDeniedNames = @('config.yaml', '.env', '.env.local', 'secrets.json')
+# ``credentials.json`` is the container's persisted key file (Linux file
+# backend): it is operator data, and it must never travel in a package.
+$script:PayloadDeniedNames = @('config.yaml', '.env', '.env.local', 'secrets.json',
+    'credentials.json')
 $script:PayloadDeniedSegments = @('__pycache__', '.git', '.pytest_cache', '.mypy_cache',
     'node_modules', 'docker-data', 'build_output', 'staging')
 $script:PayloadDeniedExtensions = @('.pt', '.pth', '.onnx', '.engine', '.db', '.db-wal',
@@ -2806,7 +2809,7 @@ function Get-StudioInstanceRecord {
 }
 
 function Stop-StudioProcess {
-    # Only ever the process this launch started, and only after its identity was
+    # Only ever the process the record names, and only after its identity was
     # re-checked: an unrelated process that happens to reuse the PID is left
     # alone, and so is an instance that was already healthy before the launch.
     param(
@@ -2818,14 +2821,14 @@ function Stop-StudioProcess {
     if ($ProcessId -le 0) { return $false }
     if (-not (Test-ProcessIdentity -ProcessId $ProcessId -StartedAt $StartedAt)) {
         Write-DeliveryLog -LogFile $LogFile -Level 'WARN' -InstallRoot $InstallRoot `
-            -Message '待终止的进程身份与本次启动不一致，已跳过终止。'
+            -Message '待终止的进程身份与记录不一致，已跳过终止。'
         return $false
     }
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
     } catch {
         Write-DeliveryLog -LogFile $LogFile -Level 'WARN' -InstallRoot $InstallRoot `
-            -Message '无法终止本次启动的服务进程，请手动结束该进程。'
+            -Message '无法终止该服务进程，请手动结束该进程。'
         return $false
     }
     return $true
@@ -2881,10 +2884,48 @@ function Start-Studio {
         $instance = Get-StudioInstanceRecord -Layout $Layout -Probe $Probe
         if ($instance.Alive) {
             $url = "http://127.0.0.1:{0}/" -f $port
-            Write-DeliveryLog -LogFile $logFile -InstallRoot $Layout.Root -Message 'Studio 已在运行，只打开浏览器。'
-            Open-StudioBrowser -BrowserOpener $BrowserOpener -Url $url | Out-Null
-            return @{ Ok = $true; AlreadyRunning = $true; ErrorCode = $null; Message = 'Studio 已在运行。'
-                Pid = [int]$instance.Record.pid; InstanceFile = $instance.Path; Port = $port; Url = $url }
+            # The record is a claim about a process, not evidence of a product:
+            # the endpoint itself is asked before an existing instance is called
+            # running. A studio.json whose process was killed, crashed its worker
+            # or lost the port would otherwise be reported as healthy forever.
+            $aliveHealthy = Invoke-HealthProbe -HealthProbe $HealthProbe -Port $port
+            if ($aliveHealthy) {
+                Write-DeliveryLog -LogFile $logFile -InstallRoot $Layout.Root -Message 'Studio 已在运行，只打开浏览器。'
+                Open-StudioBrowser -BrowserOpener $BrowserOpener -Url $url | Out-Null
+                return @{ Ok = $true; AlreadyRunning = $true; ErrorCode = $null; Message = 'Studio 已在运行。'
+                    Pid = [int]$instance.Record.pid; InstanceFile = $instance.Path; Port = $port; Url = $url
+                    Healthy = $true }
+            }
+            # Alive but silent: the instance is repaired, never reported as
+            # running. The PID and started_at are re-checked by the stop itself,
+            # so a pid the system reused for an unrelated process is left alone;
+            # the stale record is withdrawn either way and the start continues.
+            Write-DeliveryLog -LogFile $logFile -Level 'WARN' -InstallRoot $Layout.Root `
+                -Message 'STALE_INSTANCE_DETECTED 记录的 Studio 进程仍存在但健康检查未通过，准备清理后重新启动。'
+            $stalePid = [int]$instance.Record.pid
+            $staleStartedAt = [string]$instance.Record.started_at
+            $stopped = $false
+            if ($null -ne $ProcessStopper) {
+                $stopped = [bool](& $ProcessStopper -ProcessId $stalePid -StartedAt $staleStartedAt `
+                        -LogFile $logFile -InstallRoot $Layout.Root)
+            } else {
+                $stopped = Stop-StudioProcess -ProcessId $stalePid -StartedAt $staleStartedAt `
+                    -LogFile $logFile -InstallRoot $Layout.Root
+            }
+            if (-not $stopped) {
+                # A second server on the same port would be worse than a start
+                # that refuses: the stale process holds the identity the record
+                # names and it could not be ended.
+                Write-DeliveryLog -LogFile $logFile -Level 'ERROR' -InstallRoot $Layout.Root `
+                    -Message 'STALE_INSTANCE_UNSTOPPABLE 无法安全停止失效的 Studio 进程，本次未启动第二个实例。'
+                return @{ Ok = $false; AlreadyRunning = $false; ErrorCode = 'STALE_INSTANCE_UNSTOPPABLE'
+                    Message = '检测到失效的 Studio 进程，且无法安全停止该进程；为避免启动第二个实例，本次启动已取消。请查看 logs\studio.err.log。'
+                    Pid = $stalePid; InstanceFile = $instance.Path; Port = $port; Url = ''
+                    Healthy = $false; Stopped = $false }
+            }
+            Remove-Item -Path $instance.Path -Force -ErrorAction SilentlyContinue
+            Write-DeliveryLog -LogFile $logFile -InstallRoot $Layout.Root `
+                -Message 'STALE_INSTANCE_CLEARED 失效的 Studio 实例已清理，继续正常启动流程。'
         }
 
         $occupied = Invoke-DeliveryProbe -Probe $Probe -Name 'PortInUse' `

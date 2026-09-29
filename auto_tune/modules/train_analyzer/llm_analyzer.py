@@ -3,7 +3,10 @@
 import re
 import requests
 
-from auto_tune.modules.security.credentials import resolve_credential
+from auto_tune.modules.security.credentials import (
+    TEXT_CREDENTIAL_MISSING_MESSAGE,
+    resolve_credential,
+)
 from auto_tune.modules.security.endpoint_policy import (
     DEFAULT_DEEPSEEK_ENDPOINT,
     EndpointPolicyError,
@@ -123,7 +126,7 @@ def call_deepseek(prompt: str, config: dict) -> str:
     llm_cfg = config.get("llm", {})
     api_key = resolve_credential("text")
     if not api_key:
-        raise RuntimeError("DeepSeek API error: credential_missing")
+        raise RuntimeError(TEXT_CREDENTIAL_MISSING_MESSAGE)
     try:
         endpoint = validate_endpoint(
             llm_cfg.get("endpoint", DEFAULT_DEEPSEEK_ENDPOINT),

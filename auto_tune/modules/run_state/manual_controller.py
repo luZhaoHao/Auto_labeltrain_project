@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import subprocess
 
 from .events import EventBroker
 from .models import RunStatePersistenceError
@@ -24,6 +25,132 @@ from auto_tune.modules.agent_engine.training_log import process_training_output_
 from auto_tune.modules.run_state.process_identity import capture_process_identity
 
 DETAIL_PERSIST_THROTTLE = 10
+
+# The bound on one read from the child's merged pipe: the same 128 KiB the
+# asyncio subprocess call used (``limit=1024 * 128``), now applied to the pipe's
+# own ``readline``. A line longer than this is consumed as several bounded
+# pieces instead of being read into memory whole.
+STDOUT_LINE_LIMIT = 1024 * 128
+
+# How long the child gets to exit after ``terminate`` before it is killed, and
+# how long the kill itself is waited for. Both are bounded so a child that
+# ignores signals can never hold the training slot open forever.
+TERMINATE_GRACE_SECONDS = 5.0
+KILL_GRACE_SECONDS = 5.0
+
+# How often a bounded wait re-checks the child's exit code.
+EXIT_POLL_INTERVAL = 0.05
+
+
+class _TrainingStdout:
+    """The child's merged output pipe, read off the event loop."""
+
+    def __init__(self, pipe):
+        self._pipe = pipe
+
+    async def readline(self) -> bytes:
+        return await asyncio.to_thread(self._pipe.readline, STDOUT_LINE_LIMIT)
+
+    @property
+    def closed(self) -> bool:
+        return self._pipe.closed
+
+    def close(self) -> None:
+        """Release the read end; a second call is a no-op."""
+        if not self._pipe.closed:
+            self._pipe.close()
+
+
+class TrainingProcess:
+    """A started training child with the surface the controller awaits.
+
+    ``asyncio``'s own subprocess support is unavailable on the Windows selector
+    loop — the only loop that can serve this product's sockets on Windows — so
+    the child is a plain ``subprocess.Popen`` and its pipe is drained in worker
+    threads. Only what the controller needs is exposed; the handle itself stays
+    private so a blocking call cannot leak onto the loop.
+    """
+
+    def __init__(self, popen):
+        self._popen = popen
+        self.pid = popen.pid
+        self.stdout = _TrainingStdout(popen.stdout)
+
+    @property
+    def returncode(self):
+        """The live exit code, or ``None`` while the child still runs."""
+        return self._popen.poll()
+
+    @property
+    def closed(self) -> bool:
+        """Whether the child's output pipe has been released."""
+        return self.stdout.closed
+
+    def close(self) -> None:
+        """Release the child's output pipe. Idempotent, so every exit path can
+        call it without having to know whether another one already did."""
+        self.stdout.close()
+
+    def terminate(self) -> None:
+        self._popen.terminate()
+
+    def kill(self) -> None:
+        self._popen.kill()
+
+    async def wait(self) -> int:
+        return await asyncio.to_thread(self._popen.wait)
+
+    async def wait_bounded(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the child to end; True when it has.
+
+        Polls the exit code instead of parking a worker thread on ``wait``, so a
+        child that outlives its grace period leaves only a stopped poll behind.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if self.returncode is not None:
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(EXIT_POLL_INTERVAL)
+
+
+async def spawn_training_process(*cmd: str) -> TrainingProcess:
+    """Start one training child: merged stderr, unparsed bytes, real exit code.
+
+    The signature mirrors ``asyncio.create_subprocess_exec`` — an already
+    validated command array, never a shell string — so the call site stays the
+    same shape as the API it replaces. ``Popen`` itself blocks, so it runs in a
+    worker thread: creating a slow child must not freeze the web event loop.
+    """
+    popen = await asyncio.to_thread(
+        subprocess.Popen,
+        list(cmd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return TrainingProcess(popen)
+
+
+async def _await_uninterrupted(coro, cancelled: list):
+    """Wait for ``coro`` to finish even when this task is cancelled again.
+
+    Child creation and cleanup both run as their own task, precisely so that a
+    repeated ``CancelledError`` cannot abandon them half-done: each one is
+    awaited through ``shield`` and every cancellation is recorded in
+    ``cancelled`` while the *same* task is awaited again — the work is never
+    restarted and never dropped. Only the caller re-raises the cancellation,
+    once the task has actually finished.
+    """
+    task = asyncio.ensure_future(coro)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            if task.done():
+                return task.result()
 
 
 class ManualRunController:
@@ -209,13 +336,7 @@ class ManualRunController:
                 self._finish_cancelled_before_start()
                 return
 
-            proc = await asyncio.create_subprocess_exec(
-                *self.cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                limit=1024 * 128,
-            )
-            self._proc = proc
+            proc = await self._spawn_child()
 
             if self._stop_requested:
                 # Stop raced with process creation (already unavoidable):
@@ -316,8 +437,12 @@ class ManualRunController:
                 except Exception:
                     pass
         except asyncio.CancelledError:
+            # The controller task is being cancelled, but the child must not be
+            # abandoned with it. The training slot is released only after this.
+            await self._stop_child()
             raise
         except Exception as exc:
+            await self._stop_child()
             try:
                 self.run_state = with_status_phase(self.run_state, status="failed", phase="terminal")
                 stamped = self.broker.publish({
@@ -333,12 +458,99 @@ class ManualRunController:
             except Exception:
                 pass
         finally:
+            # The read end is released on every exit path, after the child has
+            # been waited for, and before the training slot is handed back.
+            self._close_child_pipe()
             self._mark_done()
             try:
                 self.manager.retain(self.run_id, self)
             except Exception:
                 pass
             self._release_reservation()
+
+    async def _spawn_child(self) -> TrainingProcess:
+        """Create the child so an outer cancellation cannot orphan it.
+
+        ``Popen`` blocks in a worker thread that the event loop cannot stop once
+        it is running, so the spawn is tracked as its own task: cancelling the
+        controller while the child is being created waits for that task to hand
+        the child back instead of returning with ``self._proc`` still ``None``
+        while a brand-new process is born behind it, owned by nobody.
+        """
+        cancelled: list = []
+        proc = await _await_uninterrupted(
+            spawn_training_process(*self.cmd), cancelled)
+        # Adopt the child before anything else can look at the controller, so
+        # every path from here on reaps it instead of dropping it.
+        self._proc = proc
+        if cancelled:
+            raise asyncio.CancelledError
+        return proc
+
+    async def _stop_child(self) -> None:
+        """Leave no live child behind on the paths that skip the read loop.
+
+        The controller task can be cancelled (or hit an unexpected error) at any
+        await point, so the child may still be running with its pipe open. The
+        reap runs as one uninterruptible cleanup: a cancellation arriving while
+        it is under way only delays this coroutine, it never skips the kill and
+        never reaches the ``finally`` block with the child still alive.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        cancelled: list = []
+        await _await_uninterrupted(self._reap_child(proc), cancelled)
+
+    async def _reap_child(self, proc) -> None:
+        """Terminate one child, then kill it and confirm it really exited.
+
+        ``terminate`` gets a bounded grace period; a child that ignores it is
+        killed, and the kill is only accepted once the child has actually
+        exited — a ``False`` from the bounded wait is never ignored, because the
+        training slot must not be handed back while a process may still train.
+        """
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
+        wait_bounded = getattr(proc, "wait_bounded", None)
+        if wait_bounded is None:
+            # A stand-in process (tests) ends as soon as it is told to.
+            await proc.wait()
+            return
+        if await wait_bounded(TERMINATE_GRACE_SECONDS):
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
+        while not await wait_bounded(KILL_GRACE_SECONDS):
+            # ``kill`` cannot be ignored by a real process, so a child still
+            # there after it is killed again rather than left behind alive.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+            except Exception:
+                pass
+
+    def _close_child_pipe(self) -> None:
+        """Release the child's read end; idempotent and safe on every path."""
+        proc = self._proc
+        if proc is None:
+            return
+        close = getattr(proc, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except OSError:
+            pass
 
     def _release_reservation(self) -> None:
         """Free the training slot only after the controller truly finished.

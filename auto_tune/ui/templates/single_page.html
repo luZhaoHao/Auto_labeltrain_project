@@ -430,13 +430,15 @@
 <div style="display:flex; justify-content:space-between; align-items:center; margin:20px 0 12px;">
   <div class="section-title" style="border:none; margin:0; padding:0;">{{ _("AI Service Settings") }}</div>
 </div>
+<div style="font-size:12px; color:var(--text-secondary); margin-bottom:10px;">{{ _("The two keys are independent: DeepSeek alone enables text diagnosis and LLM tuning, Qwen alone enables vision analysis, and normal training or HPO needs no key at all.") }}</div>
 <div class="row">
   {% for purpose, cfg in (ai_config if ai_config is defined else {}).items() %}
   <div class="col" style="flex:1;">
     <div class="card">
-      <div class="card-title">{{ _("Text & Tuning Service") if purpose == 'text' else _("Vision Service") }}</div>
+      <div class="card-title">{{ _("DeepSeek · Text Diagnosis & LLM Tuning") if purpose == 'text' else _("Qwen · Training-Result Vision Analysis") }}</div>
       <div data-ai-purpose="{{ purpose }}">
         <div class="ai-status" data-ai-status style="font-size:12px; margin-bottom:8px;"></div>
+        <div class="ai-missing-warning" data-ai-missing-warning style="display:none; margin-bottom:8px; padding:6px 8px; background:#FEF2F2; border:1px solid #FECACA; border-radius:4px; font-size:12px; color:#B91C1C; font-weight:600;"></div>
         <label class="ai-field" style="display:flex; align-items:center; gap:6px;">
           <input type="checkbox" data-ai-enabled {% if cfg.enabled %}checked{% endif %}>
           <span>{{ _("Enabled") }}</span>
@@ -998,7 +1000,14 @@
         {% elif diag is mapping and diag.get("error") %}
         <div class="callout" style="background:var(--destructive-bg); border:1px solid #FECACA;">
           <div class="callout-label" style="color:var(--destructive);">{{ _("Error") }}</div>
-          <div style="font-size:13px;">{{ diag.error|e }}</div>
+          <div style="font-size:13px;">
+            {% if "credential_missing" in diag.error|string %}
+            {# The stored code names no service and no way out: say both. #}
+            {{ _("No DeepSeek API Key saved yet. Text diagnosis and LLM tuning are unavailable. Save the DeepSeek API Key in AI Service Settings.") }}
+            {% else %}
+            {{ diag.error|e }}
+            {% endif %}
+          </div>
         </div>
         {% endif %}
       {% endfor %}
@@ -1041,7 +1050,7 @@
             <div style="font-size:13px; line-height:1.7; white-space:pre-wrap;">{{ cm.analysis }}</div>
           </div>
           {% elif has_cm_error %}
-          <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">{{ _("Confusion Matrix") }}: {{ cm.error }}</div>
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">{{ _("Confusion Matrix") }}: {% if "credential_missing" in cm.error|string %}{{ _("No Qwen API Key saved yet. Vision analysis is unavailable; turn the vision service off if you do not use it. Save the Qwen API Key in AI Service Settings.") }}{% else %}{{ cm.error|e }}{% endif %}</div>
           {% endif %}
 
           {% if has_ec_analysis %}
@@ -1050,7 +1059,7 @@
             <div style="font-size:13px; line-height:1.7; white-space:pre-wrap;">{{ ec.analysis }}</div>
           </div>
           {% elif has_ec_error %}
-          <div style="font-size:12px; color:var(--text-muted);">{{ _("Error Crop Analysis") }}: {{ ec.error }}</div>
+          <div style="font-size:12px; color:var(--text-muted);">{{ _("Error Crop Analysis") }}: {% if "credential_missing" in ec.error|string %}{{ _("No Qwen API Key saved yet. Vision analysis is unavailable; turn the vision service off if you do not use it. Save the Qwen API Key in AI Service Settings.") }}{% else %}{{ ec.error|e }}{% endif %}</div>
           {% endif %}
         </div>
         {% else %}
@@ -2658,7 +2667,14 @@ var _AI_RESULT_LABELS = {
 var _AI_SOURCE_LABELS = {
   environment: '{{ _("Environment variable") }}',
   windows_credential_manager: '{{ _("Windows Credential Manager") }}',
+  file_credential_store: '{{ _("Container credential file") }}',
   missing: '{{ _("Not configured") }}'
+};
+// Each service stands on its own: DeepSeek feeds text diagnosis and LLM tuning,
+// Qwen feeds vision analysis. A missing key is named, with the way out.
+var _AI_MISSING_KEY_LABELS = {
+  text: '{{ _("No DeepSeek API Key saved yet. Text diagnosis and LLM tuning are unavailable. Save the DeepSeek API Key in AI Service Settings.") }}',
+  vision: '{{ _("No Qwen API Key saved yet. Vision analysis is unavailable; turn the vision service off if you do not use it. Save the Qwen API Key in AI Service Settings.") }}'
 };
 
 function _aiCard(purpose) { return document.querySelector('[data-ai-purpose="' + purpose + '"]'); }
@@ -2695,9 +2711,15 @@ function aiRefreshSettings() {
       _aiField(card, 'endpoint').value = s.endpoint || '';
       _aiField(card, 'private').checked = !!s.allow_private_endpoint;
       var source = _AI_SOURCE_LABELS[s.source] || s.source;
-      var statusText = s.configured ? ('{{ _("Configured") }}: ' + source) : ('{{ _("Not configured") }} (' + source + ')');
+      // Each card reports its own service, independently of the other one.
+      var statusText = '{{ _("Credential") }}: ' +
+        (s.configured ? '{{ _("Configured") }}' : '{{ _("Not configured") }}') + ' · ' + source;
       if (!s.writable) statusText += ' · {{ _("read-only") }}';
       _aiField(card, 'status').textContent = statusText;
+      var missingWarning = _aiField(card, 'missing-warning');
+      var missingCredential = !!s.missing_credential;
+      missingWarning.style.display = missingCredential ? 'block' : 'none';
+      missingWarning.textContent = missingCredential ? _AI_MISSING_KEY_LABELS[purpose] : '';
       var credParts = [];
       if (s.last_test_result) {
         credParts.push('{{ _("Last test") }}: ' + (_AI_RESULT_LABELS[s.last_test_result] || s.last_test_result));
@@ -2740,6 +2762,8 @@ function aiTestConnection(purpose) {
   }).then(function(res){
     if (res.status === 200) {
       _aiMsg(card, '{{ _("Test result") }}: ' + (_AI_RESULT_LABELS[res.body.result] || res.body.result), false);
+    } else if (res.body && res.body.reason === 'credential_missing') {
+      _aiMsg(card, _AI_MISSING_KEY_LABELS[purpose], true);
     } else {
       _aiMsg(card, (res.body && res.body.error) || '{{ _("Test failed") }}', true);
     }
@@ -2760,6 +2784,10 @@ function aiStoreKey(purpose) {
       _aiMsg(card, testBefore ? '{{ _("Key saved (tested)") }}' : '{{ _("Key saved (untested)") }}', false);
       _aiField(card, 'key').value = '';
       aiRefreshSettings();
+    } else if (res.body && res.body.reason === 'credential_test_failed') {
+      // The key was never written: say which step failed, not "save failed".
+      var why = _AI_RESULT_LABELS[res.body.category] || res.body.category || '';
+      _aiMsg(card, '{{ _("Connection test failed") }}: ' + why + ' · {{ _("the previous key was kept") }}', true);
     } else { _aiMsg(card, (res.body && res.body.error) || '{{ _("Save failed") }}', true); }
   });
 }

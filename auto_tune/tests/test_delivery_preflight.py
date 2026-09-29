@@ -17,6 +17,7 @@ from auto_tune.delivery.preflight import (
     CONTAINER_APP_ROOT,
     CONTAINER_DATASETS_DIR,
     DELIVERY_CONFIG_MISSING,
+    DELIVERY_DATASETS_UNREADABLE,
     DELIVERY_DEPENDENCY_MISSING,
     DELIVERY_DIR_NOT_MOUNTED,
     DELIVERY_DIR_NOT_WRITABLE,
@@ -154,6 +155,80 @@ def test_check_writable_passes_for_a_prepared_layout(tmp_path):
     assert check_writable(paths) is None
 
 
+def test_the_dataset_share_is_not_required_to_be_writable(tmp_path):
+    """A dataset folder is an input: the Studio reads it and copies it into its
+    own snapshot, so a share the runtime user can only read is a correct setup.
+    Every other directory is writable in this probe, and the check passes."""
+    paths = _layout(tmp_path)
+    ensure_directories(paths)
+
+    def everything_but_the_dataset_share_is_writable(path, mode):
+        return str(path) != str(paths.datasets_dir)
+
+    assert check_writable(
+        paths, probe=everything_but_the_dataset_share_is_writable) is None
+
+
+def test_the_dataset_share_must_be_readable_and_traversable(tmp_path):
+    paths = _layout(tmp_path)
+    ensure_directories(paths)
+
+    def unreadable(path):
+        return str(path) != str(paths.datasets_dir)
+
+    with pytest.raises(DeliveryError) as excinfo:
+        check_writable(paths, probe=lambda path, mode: True, dataset_probe=unreadable)
+
+    assert excinfo.value.code == DELIVERY_DATASETS_UNREADABLE
+    assert "datasets" in str(excinfo.value)
+
+
+def test_only_the_dataset_share_is_exempt_from_the_write_requirement(tmp_path):
+    """Every other persistent directory keeps the write requirement: the
+    datasets exemption must not quietly relax the ones the Studio writes into."""
+    paths = _layout(tmp_path)
+    ensure_directories(paths)
+    checked: list[str] = []
+
+    def record(path, mode):
+        checked.append(str(path))
+        return True
+
+    check_writable(paths, probe=record, dataset_probe=lambda path: True)
+
+    assert sorted(checked) == sorted(
+        str(directory) for name, directory in paths.persistent_dirs.items()
+        if name != "datasets")
+    assert str(paths.datasets_dir) not in checked
+
+
+def test_a_read_only_dataset_share_boots_the_preflight(tmp_path, monkeypatch, capsys):
+    """End to end: the layout is complete, the dataset share is readable but not
+    writable, and the start still succeeds."""
+    app_root = tmp_path / "app"
+    datasets = tmp_path / "data" / "datasets"
+    template = app_root / "auto_tune" / "config.template.yaml"
+    monkeypatch.setenv("AUTO_TUNE_APP_ROOT", str(app_root))
+    monkeypatch.setenv("AUTO_TUNE_CONFIG_PATH", str(tmp_path / "data" / "config" / "config.yaml"))
+    monkeypatch.setenv("AUTO_TUNE_DATASETS_DIR", str(datasets))
+    monkeypatch.setenv("AUTO_TUNE_TEMPLATE_PATH", str(template))
+    monkeypatch.setattr(preflight, "mount_probe", lambda path: True)
+    shipped_check_writable = preflight.check_writable
+
+    def dataset_share_is_read_only(paths, **kwargs):
+        kwargs["probe"] = lambda path, mode: str(path) != str(datasets)
+        return shipped_check_writable(paths, **kwargs)
+
+    monkeypatch.setattr(preflight, "check_writable", dataset_share_is_read_only)
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(TEMPLATE, encoding="utf-8")
+
+    code = run(["--require-mounts", "--bootstrap-config"])
+
+    assert code == 0
+    assert datasets.is_dir()
+
+
 # ── mount contract: never write into the image layer ────────────────────────
 
 
@@ -196,6 +271,145 @@ def test_check_mounts_ships_with_a_real_mount_probe(tmp_path):
     ensure_directories(paths)
 
     assert preflight.mount_probe is preflight.os.path.ismount
+
+
+# ── the persisted credential directory (Linux/Docker file backend) ──────────
+
+
+CREDENTIALS_PATH = Path("/data/secrets/credentials.json")
+
+
+def _layout_with_credentials(tmp_path, credentials_path=CREDENTIALS_PATH):
+    return resolve_paths(app_root=tmp_path / "app",
+                         config_path=tmp_path / "data" / "config" / "config.yaml",
+                         datasets_dir=tmp_path / "data" / "datasets",
+                         template_path=tmp_path / "config.template.yaml",
+                         credentials_path=credentials_path)
+
+
+def test_a_desktop_layout_has_no_credential_directory(tmp_path, monkeypatch):
+    """Windows keeps the Credential Manager: no plaintext directory is created."""
+    monkeypatch.delenv("AUTO_TUNE_CREDENTIALS_PATH", raising=False)
+    paths = _layout(tmp_path)
+
+    assert paths.credentials_path is None
+    assert paths.credentials_dir is None
+    assert "secrets" not in paths.persistent_dirs
+
+
+def test_a_configured_credential_file_adds_its_directory_to_the_layout(tmp_path):
+    paths = _layout_with_credentials(tmp_path)
+
+    assert paths.credentials_dir == Path("/data/secrets")
+    assert paths.persistent_dirs["secrets"] == Path("/data/secrets")
+
+
+def test_the_credential_path_comes_from_the_controlled_environment(tmp_path, monkeypatch):
+    target = tmp_path / "secrets" / "credentials.json"
+    monkeypatch.setenv("AUTO_TUNE_CREDENTIALS_PATH", str(target))
+
+    paths = resolve_paths(app_root=tmp_path / "app",
+                          config_path=tmp_path / "config.yaml",
+                          datasets_dir=tmp_path / "datasets",
+                          template_path=tmp_path / "template.yaml")
+
+    assert paths.credentials_dir == (tmp_path / "secrets").resolve()
+
+
+def test_a_blank_credential_path_is_treated_as_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTO_TUNE_CREDENTIALS_PATH", "   ")
+
+    paths = resolve_paths(app_root=tmp_path / "app",
+                          config_path=tmp_path / "config.yaml",
+                          datasets_dir=tmp_path / "datasets",
+                          template_path=tmp_path / "template.yaml")
+
+    assert paths.credentials_path is None
+
+
+def test_the_credential_directory_is_created_but_never_the_file(tmp_path):
+    paths = _layout_with_credentials(tmp_path, tmp_path / "data" / "secrets" / "credentials.json")
+
+    ensure_directories(paths)
+
+    assert paths.credentials_dir.is_dir(), "the mount point must exist for the backend"
+    assert not paths.credentials_path.exists(), (
+        "the operator must not have to pre-create a key file")
+
+
+def test_the_credential_directory_must_be_mounted(tmp_path):
+    paths = _layout_with_credentials(tmp_path, tmp_path / "data" / "secrets" / "credentials.json")
+    ensure_directories(paths)
+
+    def probe(path):
+        return not str(path).endswith("secrets")
+
+    with pytest.raises(DeliveryError) as excinfo:
+        check_mounts(paths, probe=probe)
+
+    assert excinfo.value.code == DELIVERY_DIR_NOT_MOUNTED
+    assert "secrets" in str(excinfo.value)
+
+
+def test_the_credential_directory_must_be_writable(tmp_path):
+    paths = _layout_with_credentials(tmp_path, tmp_path / "data" / "secrets" / "credentials.json")
+    ensure_directories(paths)
+
+    def deny(path, mode):
+        return not str(path).endswith("secrets")
+
+    with pytest.raises(DeliveryError) as excinfo:
+        check_writable(paths, probe=deny)
+
+    assert excinfo.value.code == DELIVERY_DIR_NOT_WRITABLE
+    assert "secrets" in str(excinfo.value)
+
+
+def test_a_missing_api_key_never_blocks_the_container_start(tmp_path, monkeypatch, capsys):
+    """A first start has no credential file at all and must still come up."""
+    app_root = tmp_path / "app"
+    config_path = tmp_path / "data" / "config" / "config.yaml"
+    datasets = tmp_path / "data" / "datasets"
+    template = app_root / "auto_tune" / "config.template.yaml"
+    credentials = tmp_path / "data" / "secrets" / "credentials.json"
+    monkeypatch.setenv("AUTO_TUNE_APP_ROOT", str(app_root))
+    monkeypatch.setenv("AUTO_TUNE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("AUTO_TUNE_DATASETS_DIR", str(datasets))
+    monkeypatch.setenv("AUTO_TUNE_TEMPLATE_PATH", str(template))
+    monkeypatch.setenv("AUTO_TUNE_CREDENTIALS_PATH", str(credentials))
+    monkeypatch.setattr(preflight, "mount_probe", lambda path: True)
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(TEMPLATE, encoding="utf-8")
+
+    code = run(["--require-mounts", "--bootstrap-config"])
+
+    assert code == 0
+    assert credentials.parent.is_dir()
+    assert not credentials.exists()
+    captured = capsys.readouterr()
+    assert "secrets" in captured.out, "the directory is reported as part of the layout"
+
+
+def test_the_preflight_never_reads_or_prints_the_credential_file(tmp_path, monkeypatch, capsys):
+    credentials = tmp_path / "data" / "secrets" / "credentials.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text('{"text": "sk-should-never-be-printed"}', encoding="utf-8")
+    app_root = tmp_path / "app"
+    template = app_root / "auto_tune" / "config.template.yaml"
+    monkeypatch.setenv("AUTO_TUNE_APP_ROOT", str(app_root))
+    monkeypatch.setenv("AUTO_TUNE_CONFIG_PATH", str(tmp_path / "data" / "config" / "config.yaml"))
+    monkeypatch.setenv("AUTO_TUNE_DATASETS_DIR", str(tmp_path / "data" / "datasets"))
+    monkeypatch.setenv("AUTO_TUNE_TEMPLATE_PATH", str(template))
+    monkeypatch.setenv("AUTO_TUNE_CREDENTIALS_PATH", str(credentials))
+    monkeypatch.setattr(preflight, "mount_probe", lambda path: True)
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(TEMPLATE, encoding="utf-8")
+
+    assert run(["--require-mounts", "--bootstrap-config"]) == 0
+
+    combined = "".join(capsys.readouterr())
+    assert "sk-should-never-be-printed" not in combined
+    assert "credentials.json" not in combined
 
 
 # ── configuration bootstrap ─────────────────────────────────────────────────

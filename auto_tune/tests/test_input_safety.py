@@ -113,6 +113,60 @@ def test_load_policy_rejects_non_mapping_section():
         load_input_safety_policy({"input_safety": [1, 2, 3]})
 
 
+# ── the delivery's authoritative roots ──
+
+
+def test_an_authoritative_root_set_replaces_the_configured_one():
+    policy = load_input_safety_policy(
+        {"input_safety": {"allowed_roots": ["C:/old-host-path"]}},
+        allowed_roots=(Path("/data/datasets"),),
+    )
+
+    assert [str(root).replace("\\", "/") for root in policy.allowed_roots] == \
+        ["/data/datasets"]
+
+
+def test_an_authoritative_root_set_is_not_parsed_from_the_configuration():
+    """The configured roots are discarded before they are parsed, so a value this
+    machine could not use cannot stop the start that replaces it."""
+    policy = load_input_safety_policy(
+        {"input_safety": {"allowed_roots": ["relative/dir"]}},
+        allowed_roots=(Path("/opt/auto-tune/detect"),),
+    )
+
+    assert len(policy.allowed_roots) == 1
+
+
+def test_an_authoritative_root_set_applies_without_a_configuration_section():
+    policy = load_input_safety_policy(
+        {}, allowed_roots=(Path("/data/datasets"), Path("/opt/auto-tune/detect"))
+    )
+
+    assert len(policy.allowed_roots) == 2
+    assert policy.max_directory_members == DEFAULT_MEMBERS
+
+
+def test_the_other_limits_are_still_validated_with_an_authoritative_root_set():
+    with pytest.raises(InputPolicyInvalidError):
+        load_input_safety_policy(
+            {"input_safety": {"max_directory_members": True}},
+            allowed_roots=(Path("/data/datasets"),),
+        )
+    with pytest.raises(InputPolicyInvalidError):
+        load_input_safety_policy(
+            {"input_safety": {"allow_unc_paths": "yes"}},
+            allowed_roots=(Path("/data/datasets"),),
+        )
+
+
+def test_a_missing_authoritative_root_set_keeps_the_configured_one():
+    policy = load_input_safety_policy(
+        {"input_safety": {"allowed_roots": ["C:/data"]}}, allowed_roots=None
+    )
+
+    assert len(policy.allowed_roots) == 1
+
+
 def test_error_codes_match_spec_contract():
     cases = [
         (InputPolicyInvalidError("x"), "INPUT_POLICY_INVALID", 500),

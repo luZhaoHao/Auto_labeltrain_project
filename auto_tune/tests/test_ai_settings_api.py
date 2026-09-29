@@ -466,3 +466,239 @@ def test_migration_conflicts_with_existing_secure_credential(_isolated_env):
     )
     cfg = yaml.safe_load(_isolated_env["cfg_path"].read_text(encoding="utf-8"))
     assert cfg["llm"].get("api_key") == "legacy-secret"
+
+
+# ── Two independent services: which capability is usable right now ──────────
+#
+# DeepSeek serves text diagnosis and LLM tuning; Qwen serves vision analysis.
+# The two credentials are independent: neither is required for the other, and
+# neither is required for an ordinary training run or an HPO study. When a
+# service is enabled but its key was never saved the page has to say so, with
+# the service name, instead of letting the capability fail later with a bare
+# ``credential_missing``.
+
+
+def _settings(client, purpose):
+    return client.get("/api/ai-settings").json()[purpose]
+
+
+def test_an_enabled_service_without_a_key_reports_the_gap(_isolated_env):
+    body = _settings(_client(), "text")
+
+    assert body["service"] == "deepseek"
+    assert body["enabled"] is True
+    assert body["configured"] is False
+    assert body["missing_credential"] is True
+
+
+def test_each_service_names_its_own_provider(_isolated_env):
+    body = _client().get("/api/ai-settings").json()
+
+    assert body["text"]["service"] == "deepseek"
+    assert body["vision"]["service"] == "qwen"
+
+
+def test_a_saved_key_clears_its_own_gap_only(_isolated_env):
+    client = _client()
+    _isolated_env["store"]["AutoTuneStudio/text/deepseek"] = "text-secret"
+    credentials.invalidate_credential_cache()
+
+    text = _settings(client, "text")
+    vision = _settings(client, "vision")
+
+    assert text["configured"] is True and text["missing_credential"] is False
+    assert vision["configured"] is False and vision["missing_credential"] is True, (
+        "configuring DeepSeek must not claim that vision analysis works")
+
+
+def test_a_disabled_service_is_not_reported_as_a_missing_key(_isolated_env):
+    cfg = yaml.safe_load(_isolated_env["cfg_path"].read_text(encoding="utf-8"))
+    cfg["llm"]["enabled"] = False
+    cfg["vision"]["enabled"] = False
+    _isolated_env["cfg_path"].write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    app_mod.APP_CONFIG = cfg
+
+    body = _client().get("/api/ai-settings").json()
+
+    assert body["text"]["missing_credential"] is False, (
+        "a disabled service is not advertised, so it has no gap to report")
+    assert body["vision"]["missing_credential"] is False
+
+
+def test_testing_a_service_without_a_key_names_that_service(_isolated_env):
+    client = _client()
+
+    resp = client.post("/api/credentials/vision/test", json={}, headers=_auth_headers())
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["reason"] == "credential_missing"
+    assert body["service"] == "qwen"
+    assert "qwen" in resp.text.lower()
+
+
+# ── The settings page contract (zh + en) ────────────────────────────────────
+
+
+def _render_page(lang: str = "zh", **overrides) -> str:
+    from auto_tune.modules.presentation import build_experiment_labels
+    from auto_tune.ui.i18n import make_translator
+
+    translator = make_translator(lang)
+    ai_config = {
+        "text": {"purpose": "text", "enabled": True, "provider": "deepseek",
+                 "model": "deepseek-flash", "endpoint": "", "default_endpoint": "",
+                 "allow_private_endpoint": False, "migration_required": False},
+        "vision": {"purpose": "vision", "enabled": True, "provider": "qwen",
+                   "model": "qwen-vl-plus", "endpoint": "", "default_endpoint": "",
+                   "allow_private_endpoint": False, "migration_required": False},
+    }
+    context = dict(
+        active_page="projects",
+        experiment_history=[],
+        experiment_history_source="sqlite",
+        experiment_index_warning=None,
+        dataset_index=[],
+        tuning_history=[],
+        dataset=None,
+        training=None,
+        project={},
+        latest_suggestion=None,
+        current_args=None,
+        dataset_analyzer_config={},
+        training_config={},
+        llm_analysis=None,
+        vision_analysis=None,
+        latest_dataset=None,
+        ai_config=ai_config,
+        csrf_token="token",
+    )
+    context.update(overrides)
+    return app_mod._jinja_env.get_template("single_page.html").render(
+        _=translator,
+        current_lang=lang,
+        experiment_labels=build_experiment_labels(translator),
+        **context,
+    )
+
+
+_Zh = "zh"
+_En = "en"
+
+_TRAINING_CONTEXT = {
+    "summary": {
+        "total_runs_analyzed": 1,
+        "best_mAP50": 0.4,
+        "best_overall_run": "train1",
+        "average_mAP50": 0.4,
+        "runs_with_issues": 0,
+    },
+    "runs": {},
+    "suggestion": None,
+}
+
+
+@pytest.mark.parametrize(
+    ("lang", "expected"),
+    [
+        (_Zh, "DeepSeek：文本诊断与大模型调参"),
+        (_Zh, "Qwen：训练结果视觉分析"),
+        (_En, "DeepSeek · Text Diagnosis & LLM Tuning"),
+        (_En, "Qwen · Training-Result Vision Analysis"),
+    ],
+)
+def test_the_page_names_each_service_and_its_capability(lang, expected):
+    assert expected in _render_page(lang)
+
+
+@pytest.mark.parametrize(
+    ("lang", "expected"),
+    [
+        (_Zh, "两个 Key 相互独立"),
+        (_Zh, "普通训练与 HPO 不依赖任何 API Key"),
+        (_En, "needs no key at all"),
+    ],
+)
+def test_the_page_states_that_the_two_keys_are_independent(lang, expected):
+    assert expected in _render_page(lang)
+
+
+@pytest.mark.parametrize(
+    ("lang", "expected"),
+    [
+        (_Zh, "尚未保存 DeepSeek API Key，文本诊断与大模型调参不可用"),
+        (_Zh, "请在“AI 服务配置”中保存 DeepSeek API Key"),
+        (_Zh, "尚未保存 Qwen API Key，视觉分析不可用；不使用时可关闭视觉服务"),
+        (_En, "No DeepSeek API Key saved yet"),
+        (_En, "Save the Qwen API Key in AI Service Settings"),
+    ],
+)
+def test_the_page_carries_the_missing_key_warning_for_both_services(lang, expected):
+    assert expected in _render_page(lang)
+
+
+def test_the_missing_key_warning_is_a_prominent_element_wired_to_live_status():
+    page = _render_page(_Zh)
+
+    assert "data-ai-missing-warning" in page, "the warning needs its own element"
+    warning = next(
+        line for line in page.splitlines() if "data-ai-missing-warning" in line
+    )
+    assert "#B91C1C" in warning, "the warning must stand out"
+    assert "missing_credential" in page, "the warning follows the live status"
+    assert "凭据" in page, "each card states its own credential status"
+
+
+def test_each_card_states_its_own_credential_state():
+    page = _render_page(_Zh)
+
+    assert "已配置" in page and "未配置" in page
+    assert "_aiField(card, 'status')" in page
+
+
+def test_a_stored_model_analysis_error_is_projected_to_its_service():
+    """A stored ``credential_missing`` must reach the operator as an actionable
+    sentence naming the service, never as the bare code."""
+    page = _render_page(
+        _Zh,
+        training=_TRAINING_CONTEXT,
+        llm_analysis={"train1": {"error": "DeepSeek API error: credential_missing"}},
+        vision_analysis={
+            "train1": {
+                "confusion_matrix_analysis": {"error": "credential_missing"},
+                "error_crop_analysis": {"error": "credential_missing"},
+            }
+        },
+    )
+
+    assert "DeepSeek API error: credential_missing" not in page
+    assert "尚未保存 DeepSeek API Key，文本诊断与大模型调参不可用" in page
+    assert "尚未保存 Qwen API Key，视觉分析不可用" in page
+    assert "请在“AI 服务配置”中保存 Qwen API Key" in page
+
+
+def test_a_stored_model_analysis_error_is_projected_in_english():
+    page = _render_page(
+        _En,
+        training=_TRAINING_CONTEXT,
+        llm_analysis={"train1": {"error": "DeepSeek API error: credential_missing"}},
+        vision_analysis={
+            "train1": {"confusion_matrix_analysis": {"error": "credential_missing"}}
+        },
+    )
+
+    assert "DeepSeek API error: credential_missing" not in page
+    assert "No DeepSeek API Key saved yet" in page
+    assert "No Qwen API Key saved yet" in page
+
+
+def test_any_other_analysis_error_is_still_shown_verbatim():
+    """Only the credential gap is re-worded; every other failure stays as it was
+    recorded, so a real provider error is never hidden."""
+    page = _render_page(
+        _Zh,
+        training=_TRAINING_CONTEXT,
+        llm_analysis={"train1": {"error": "provider exploded"}},
+    )
+
+    assert "provider exploded" in page

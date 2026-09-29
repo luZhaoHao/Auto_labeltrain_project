@@ -122,7 +122,10 @@ def _patch_app(monkeypatch, tmp_path, source):
         launched.append(list(args))
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
 
     def fake_finalize(run_dir, run_name, source_kind, config, log_dir, training_status,
                       started_at=None, finished_at=None, training_error=None, **kw):

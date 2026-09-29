@@ -38,7 +38,7 @@ def _redirect_log(monkeypatch, tmp_path):
 
 
 def _monkeypatch_subprocess(monkeypatch, tmp_path, lines, returncode=0, pid=99999):
-    """Patch create_subprocess_exec + executor helpers with a fake subprocess."""
+    """Patch spawn_training_process + executor helpers with a fake subprocess."""
     class FakeStdout:
         def __init__(self):
             self._lines = [l.encode("utf-8", errors="replace") + b"\n" for l in lines]
@@ -63,7 +63,10 @@ def _monkeypatch_subprocess(monkeypatch, tmp_path, lines, returncode=0, pid=9999
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "detect"),
@@ -108,7 +111,10 @@ def test_start_persist_failure_rejects_before_subprocess(tmp_path, monkeypatch):
         launched.append(True)
         raise AssertionError("must not create a subprocess")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "detect"),

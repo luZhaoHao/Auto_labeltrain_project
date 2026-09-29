@@ -85,7 +85,10 @@ def _capture_subprocess(monkeypatch, captured, tmp_path):
         captured["cmd"] = list(args)
         return _FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "detect"),
@@ -333,7 +336,10 @@ def test_training_start_blocked_when_snapshot_invalid(tmp_path, monkeypatch):
         called["n"] += 1
         raise AssertionError("training must not launch with an invalid snapshot")
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", never_launch)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        never_launch,
+    )
     resp = client.post("/api/training/start", json={"epochs": 1})
     assert resp.status_code == 400
     assert resp.json()["error_code"] == "SNAPSHOT_VALIDATION_FAILED"

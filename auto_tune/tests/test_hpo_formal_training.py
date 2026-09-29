@@ -178,7 +178,10 @@ def _patch_app(monkeypatch, tmp_path, source, detect_dir=None):
         launched.append(list(args))
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
 
     def fake_finalize(run_dir, run_name, source_kind, config, log_dir, training_status,
                       started_at=None, finished_at=None, training_error=None, **kw):
@@ -1601,3 +1604,21 @@ def test_missing_metadata_runtime_uses_the_active_controller_for_monitoring(
     assert run["runtime_identity_missing"] is False
     assert run["experiment_run_id"] == indexed
     assert run["experiment_identity_reason"] is None
+
+
+# ── 正式训练复用普通训练的执行器与收尾链路（不建立第二套执行器） ──
+
+
+def test_formal_training_reuses_the_ordinary_controller_and_finalizer():
+    """正式训练与普通训练是同一个执行器、同一个收尾回调。
+
+    收尾回调是 Module B 分析、KPI 与统一历史写盘发生的地方；正式训练复用同一个
+    回调（而不是新建一条链路），所以普通训练的分析与历史行为不会与 HPO 分叉。
+    """
+    from auto_tune.modules.run_state.manual_controller import ManualRunController
+    from auto_tune.ui import app as app_mod
+
+    deps = app_mod._hpo_training_deps()
+
+    assert deps.manual_controller_cls is ManualRunController
+    assert deps.finalize_cb is app_mod._manual_finalize_cb

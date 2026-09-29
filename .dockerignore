@@ -17,9 +17,14 @@ auto_tune/config.yaml
 qwen.txt
 *.local.yaml
 
-# Local credential files
+# Local credential files. The container's persisted key file lives in the
+# mounted docker-data/secrets (excluded with the whole tree below); these
+# patterns also catch a stray copy, including the staging file an atomic save
+# leaves behind for the instant before os.replace.
 .env
 .env.*
+credentials.json
+credentials.json.*
 
 # Compose runtime root: config, SQLite index, logs, training dirs and weights
 docker-data

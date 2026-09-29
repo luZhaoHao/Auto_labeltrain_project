@@ -467,8 +467,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
         # AI service settings (S1.3)
         "AI Service Settings": "AI 服务配置",
-        "Text & Tuning Service": "文本与调参服务",
-        "Vision Service": "视觉服务",
+        "DeepSeek · Text Diagnosis & LLM Tuning": "DeepSeek：文本诊断与大模型调参",
+        "Qwen · Training-Result Vision Analysis": "Qwen：训练结果视觉分析",
+        "The two keys are independent: DeepSeek alone enables text diagnosis and LLM tuning, Qwen alone enables vision analysis, and normal training or HPO needs no key at all.":
+            "两个 Key 相互独立：只配置 DeepSeek 即可使用文本诊断与大模型调参，只配置 Qwen 即可使用视觉分析；普通训练与 HPO 不依赖任何 API Key。",
+        "No DeepSeek API Key saved yet. Text diagnosis and LLM tuning are unavailable. Save the DeepSeek API Key in AI Service Settings.":
+            "尚未保存 DeepSeek API Key，文本诊断与大模型调参不可用。请在“AI 服务配置”中保存 DeepSeek API Key。",
+        "No Qwen API Key saved yet. Vision analysis is unavailable; turn the vision service off if you do not use it. Save the Qwen API Key in AI Service Settings.":
+            "尚未保存 Qwen API Key，视觉分析不可用；不使用时可关闭视觉服务。请在“AI 服务配置”中保存 Qwen API Key。",
+        "Credential": "凭据",
         "Provider": "供应商",
         "Model": "模型",
         "Endpoint": "端点",
@@ -486,6 +493,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "read-only": "只读",
         "Environment variable": "环境变量",
         "Windows Credential Manager": "Windows 凭据管理器",
+        "Container credential file": "容器持久凭据文件",
+        "Connection test failed": "连接测试失败",
+        "the previous key was kept": "已保留原有凭据",
+        "No API key saved yet": "尚未保存 API Key",
         "Last test": "最近测试",
         "Authentication failed": "认证失败",
         "Network failed": "网络失败",

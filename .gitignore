@@ -25,6 +25,12 @@ build/
 # F1.2-B Docker bind-mount root (runtime config, logs, detection output, weights)
 /docker-data/
 
+# Runtime credential file (Linux/Docker file backend): the API keys saved from
+# the settings page, plus the staging file an atomic save creates before
+# os.replace. Never committed; Windows keeps its keys in the Credential Manager.
+credentials.json
+credentials.json.*
+
 # SQLite local index + backups (rebuildable query projection; never committed)
 *.db
 *.db-wal

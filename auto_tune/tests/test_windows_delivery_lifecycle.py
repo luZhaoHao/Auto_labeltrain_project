@@ -185,15 +185,109 @@ def test_a_health_check_timeout_never_opens_a_browser(work_root):
     assert facts["browserOpens"] == 0
 
 
-def test_a_health_check_failure_does_not_touch_a_healthy_existing_instance(work_root):
-    facts = _run("start-health-timeout-existing-instance", work_root)
+# ── start: a recorded process that lives but no longer answers ──────────────
+#
+# The presence of studio.json is not evidence of a running product: the record
+# names a process, and only /healthz says whether that process still serves.
+# An instance that is alive but silent is repaired, never reported as running.
 
-    assert facts["ok"] is True
-    assert facts["alreadyRunning"] is True
-    assert facts["launches"] == 0
-    assert facts["existingAlive"] is True, "the instance running before the launch is left alone"
-    assert facts["instanceKept"] is True
+
+def test_a_recorded_process_that_fails_healthz_is_not_reported_as_running(work_root):
+    facts = _run("start-stale-instance-restarts", work_root)
+
+    assert facts["alreadyRunning"] is False, "a silent instance is not a running one"
+    assert facts["healthProbes"] >= 2, "the endpoint was asked before anything was replaced"
+
+
+def test_a_stale_instance_is_only_stopped_when_its_identity_matches(work_root):
+    facts = _run("start-stale-instance-restarts", work_root)
+
+    assert facts["stopCalls"] == 1
+    assert facts["stoppedPid"] == facts["recordedPid"]
+    assert facts["stoppedStartedAt"] == facts["recordedStartedAt"]
+
+
+def test_a_stale_instance_is_replaced_by_a_working_one(work_root):
+    facts = _run("start-stale-instance-restarts", work_root)
+
+    assert facts["ok"] is True, facts["errorCode"]
+    assert facts["launches"] == 1
+    assert facts["preflightCalls"] == 1
+    assert facts["staleProcessAlive"] is False, "the stale process really ended"
+    assert facts["instancePidAfter"] == 4242, "the record now describes the new launch"
     assert facts["browserOpens"] == 1
+    assert facts["browserUrl"].startswith("http://127.0.0.1:8000")
+
+
+def test_a_reused_pid_is_never_terminated(work_root):
+    """The record names a pid the system reused: that process is not ours."""
+    facts = _run("start-stale-instance-pid-reused", work_root)
+
+    assert facts["identityMatched"] is False, "the fixture must really mismatch"
+    assert facts["stopCalls"] == 0, "an unrelated process must never be killed"
+    assert facts["unrelatedAlive"] is True
+    assert facts["ok"] is True, facts["errorCode"]
+    assert facts["launches"] == 1, "the flow continues as an ordinary start"
+
+
+def test_an_unmatched_record_does_not_block_the_normal_start(work_root):
+    facts = _run("start-stale-instance-pid-reused", work_root)
+
+    assert facts["preflightCalls"] == 1
+    assert facts["alreadyRunning"] is False
+    assert facts["browserOpens"] == 1
+
+
+def test_an_unstoppable_stale_instance_never_starts_a_second_server(work_root):
+    facts = _run("start-stale-instance-unstoppable", work_root)
+
+    assert facts["ok"] is False
+    assert facts["errorCode"] == "STALE_INSTANCE_UNSTOPPABLE"
+    assert facts["alreadyRunning"] is False
+    assert facts["stopCalls"] == 1, "the identity-matched process was really attempted"
+    assert facts["launches"] == 0, "no second instance may be started"
+    assert facts["preflightCalls"] == 0
+    assert facts["browserOpens"] == 0
+    assert facts["staleProcessAlive"] is True
+    assert facts["instanceKept"] is True, "the record still describes the live process"
+
+
+def test_the_unstoppable_message_is_stable_and_points_at_the_log(work_root):
+    facts = _run("start-stale-instance-unstoppable", work_root)
+
+    assert facts["messageMentionsLog"] is True
+    assert facts["messageHasDrivePath"] is False, "no absolute path may be shown"
+    assert facts["messageMentionsPid"] is False, "no process identity may be shown"
+
+
+def test_the_stale_instance_log_lines_stay_redacted(work_root):
+    facts = _run("start-stale-instance-unstoppable", work_root)
+
+    assert facts["logMentionsCode"] is True
+    assert facts["logMentionsPid"] is False, "the log must not carry the pid"
+
+
+def test_a_stale_instance_log_line_stays_redacted_when_the_restart_is_attempted(work_root):
+    facts = _run("start-stale-instance-restarts", work_root)
+
+    assert facts["logMentionsCode"] is True
+    assert facts["logMentionsStalePid"] is False
+
+
+def test_a_stale_instance_restart_that_never_answers_is_still_cleaned_up(work_root):
+    """The cleanup happened, the replacement was launched, and the replacement's
+    own health check still decides the outcome."""
+    facts = _run("start-stale-instance-restart-unhealthy", work_root)
+
+    # one stop for the stale instance, one for the replacement that never answered
+    assert facts["stopCalls"] == 2
+    assert facts["staleProcessAlive"] is False
+    assert facts["launches"] == 1
+    assert facts["alreadyRunning"] is False
+    assert facts["ok"] is False
+    assert facts["errorCode"] == "HEALTH_CHECK_FAILED"
+    assert facts["instanceExists"] is False, "the dead replacement leaves no record"
+    assert facts["browserOpens"] == 0
 
 
 # ── upgrade ─────────────────────────────────────────────────────────────────

@@ -10,7 +10,6 @@ from auto_tune.modules import security
 from auto_tune.modules.security import credentials
 from auto_tune.modules.security.credentials import (
     CredentialError,
-    UnsupportedPlatformError,
     delete_credential,
     get_credential_status,
     invalidate_credential_cache,
@@ -21,10 +20,15 @@ from auto_tune.modules.security.credentials import (
 
 
 @pytest.fixture(autouse=True)
-def _no_real_credentials(monkeypatch):
+def _no_real_credentials(monkeypatch, tmp_path):
     """Ensure no test can reach the real Windows Credential API or env store."""
     monkeypatch.delenv("AUTO_TUNE_TEXT_API_KEY", raising=False)
     monkeypatch.delenv("AUTO_TUNE_VISION_API_KEY", raising=False)
+    # The file backend (Linux) is pointed at a controlled directory so a test
+    # that forces the non-Windows path can never touch the container default.
+    monkeypatch.setenv(
+        "AUTO_TUNE_CREDENTIALS_PATH", str(tmp_path / "secrets" / "credentials.json")
+    )
     invalidate_credential_cache()
 
 
@@ -168,16 +172,21 @@ def test_placeholder_is_not_a_configured_credential(monkeypatch):
     assert get_credential_status("vision").configured is False
 
 
-def test_non_windows_read_missing_write_delete_unsupported(monkeypatch):
+def test_non_windows_never_reads_the_windows_store(monkeypatch, tmp_path):
+    """Off Windows the Credential Manager is not consulted at all.
+
+    The writable backend there is the persisted credential file, which the
+    file-backend suite exercises; here only the boundary is asserted: the
+    Windows API answers nothing and the file starts empty.
+    """
     monkeypatch.setattr(credentials, "_is_windows", lambda: False)
     monkeypatch.setattr(credentials, "_read_windows_credential", lambda target: "vault-value")
 
     assert resolve_credential("text") is None
     assert supports_os_credential_store() is False
-    with pytest.raises(UnsupportedPlatformError):
-        store_credential("text", "any")
-    with pytest.raises(UnsupportedPlatformError):
-        delete_credential("text")
+    assert credentials.supports_file_credential_store() is True
+    # nothing was written by reading, and no OS store was touched
+    assert not (tmp_path / "secrets" / "credentials.json").exists()
 
 
 def test_windows_api_failure_propagates_safe_error(monkeypatch):

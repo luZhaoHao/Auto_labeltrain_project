@@ -730,7 +730,10 @@ def test_training_start_failed_writes_failed_terminal(tmp_path, monkeypatch):
     async def fake_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
     monkeypatch.setattr(
         "auto_tune.modules.agent_engine.executor.find_detect_dir",
         lambda: str(tmp_path / "detect"),
@@ -1674,7 +1677,10 @@ def _start_training_stack(tmp_path, monkeypatch):
         started.append(list(args))
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    monkeypatch.setattr(
+        "auto_tune.modules.run_state.manual_controller.spawn_training_process",
+        fake_subprocess_exec,
+    )
 
     def fake_finalize(run_dir, run_name, source, config, log_dir, training_status,
                       started_at=None, finished_at=None, training_error=None, **kw):

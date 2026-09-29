@@ -63,8 +63,10 @@ FORBIDDEN_SENTINELS = {
     "models/weights/exported.onnx": "model",
     "runs/detect/train/args.yaml": "training run",
     "docker-data/config/config.yaml": "container runtime data",
+    "docker-data/secrets/credentials.json": "container credential file",
     "dataset_demo/part_1.jpg": "dataset",
     "secrets.json": "credential file",
+    "credentials.json": "credential file",
     ".pytest_cache/v/cache/nodeids": "test cache",
     "build_output/previous.zip": "previous build output",
     "Dockerfile": "docker delivery",
@@ -130,12 +132,15 @@ def _fixture_repo(root: Path) -> Path:
     return root
 
 
-def _build(repo_root: Path, output_dir: Path, version: str = VERSION) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-File", str(BUILD), "-RepoRoot", str(repo_root),
-         "-OutputDir", str(output_dir), "-Version", version],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+def _build(repo_root: Path, output_dir: Path,
+           version: str | None = VERSION) -> subprocess.CompletedProcess:
+    command = [_POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(BUILD), "-RepoRoot", str(repo_root),
+               "-OutputDir", str(output_dir)]
+    if version is not None:
+        command += ["-Version", version]
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=600)
 
 
 def _package(output_dir: Path, version: str = VERSION) -> Path:
@@ -320,6 +325,28 @@ def test_building_twice_produces_the_same_package(tmp_path):
 
     assert names_before == names_after
     assert not [name for name in names_after if name.startswith("staging")]
+
+
+def test_the_package_name_is_the_packaged_version(tmp_path):
+    """The candidate package name is the manifest version, built for real.
+
+    The version is the only thing that tells the operator (and the installer)
+    which candidate they unzipped, so the archive name must come from the
+    manifest rather than from a hand-typed argument."""
+    root = _fixture_repo(tmp_path / "repo")
+    manifest_path = root / "windows" / "package-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.1"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+
+    result = _build(root, output, version=None)
+
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    assert (output / "AutoTuneStudio-Setup-0.2.1.zip").is_file()
+    assert sorted(path.name for path in output.iterdir()) == [
+        "AutoTuneStudio-Setup-0.2.1.zip"]
 
 
 def test_an_output_directory_inside_the_repository_never_enters_the_zip(tmp_path):

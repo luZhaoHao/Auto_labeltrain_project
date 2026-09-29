@@ -14,6 +14,18 @@
 # the defaults do not fit. Nothing here contains a credential: the container
 # reads the sanitized template from the image on first start only, and refuses
 # to start when a persistent directory is not mounted.
+#
+# API keys typed into the settings page are persisted to the ``secrets`` named
+# volume mounted at /data/secrets (AUTO_TUNE_CREDENTIALS_PATH below), so they
+# survive a container restart, a recreation and an image update. It is a named
+# volume rather than a host bind mount on purpose: a bind mount whose host
+# directory does not exist yet is created by Docker owned by root, and the
+# unprivileged runtime user would neither be able to write it nor get past the
+# start-up preflight. The volume is seeded once from the image directory, which
+# the Dockerfile creates owned by the runtime user, so the first start works on
+# any host. ``docker compose down`` keeps the volume; only ``down -v`` removes
+# it. The file is created on the first save; a start with no key at all is a
+# normal start.
 
 services:
   studio:
@@ -34,6 +46,19 @@ services:
       AUTO_TUNE_CONFIG_PATH: "/data/config/config.yaml"
       AUTO_TUNE_APP_ROOT: "/opt/auto-tune"
       AUTO_TUNE_DATASETS_DIR: "/data/datasets"
+      # Where the credential file backend persists the saved API keys.
+      AUTO_TUNE_CREDENTIALS_PATH: "/data/secrets/credentials.json"
+      # The directories the folder pickers ("training analysis" / "intelligent
+      # analysis") may browse. The configuration inside the container declares no
+      # root of its own and the container has no drives, so without this the
+      # picker lists nothing at all. Both entries are directories already mounted
+      # above — the dataset share the product only reads, and ``detect`` where
+      # ``find_detect_dir()`` really writes every training run. The product
+      # accepts exactly these two and refuses every other container directory
+      # (including ``/data/secrets``, ``/opt/auto-tune/log``, the weight store
+      # and the retired ``runs`` mount), so the picker cannot walk into the
+      # container's own filesystem. No host directory is added to the mounts.
+      AUTO_TUNE_INPUT_ALLOWED_ROOTS: "/data/datasets;/opt/auto-tune/detect"
     volumes:
       - "${AUTO_TUNE_DATA_DIR:-./docker-data}/config:/data/config"
       - "${AUTO_TUNE_DATA_DIR:-./docker-data}/log:/opt/auto-tune/log"
@@ -41,6 +66,7 @@ services:
       - "${AUTO_TUNE_DATA_DIR:-./docker-data}/runs:/opt/auto-tune/runs"
       - "${AUTO_TUNE_DATA_DIR:-./docker-data}/models/weights:/opt/auto-tune/models/weights"
       - "${AUTO_TUNE_DATASETS_DIR:-./docker-data/datasets}:/data/datasets"
+      - "secrets:/data/secrets"
     deploy:
       resources:
         reservations:
@@ -48,3 +74,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+volumes:
+  # Operator credentials, created and owned by the runtime user inside the
+  # image. Kept by `docker compose down`, removed only by `down -v`.
+  secrets:

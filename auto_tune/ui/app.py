@@ -50,7 +50,9 @@ from auto_tune.delivery.runtime import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     PACKAGE_CONFIG_PATH,
+    configure_platform_event_loop,
     resolve_config_path,
+    resolve_input_allowed_roots,
     resolve_server_bind,
 )
 
@@ -87,6 +89,7 @@ from auto_tune.modules.dataset_snapshot.service import (
     validate_dataset_snapshot,
 )
 from auto_tune.modules.input_safety import (
+    InputPolicyInvalidError,
     InputSafetyError,
     InputSafetyPolicy,
     list_safe_subdirectories,
@@ -710,6 +713,16 @@ def _section_for(purpose: str) -> str:
     return "llm" if purpose == "text" else "vision"
 
 
+# The two AI services are independent: DeepSeek serves text diagnosis and LLM
+# tuning, Qwen serves vision analysis of training results. The name is a real
+# value for the page to print, never a translation key.
+_SERVICE_NAMES = {"text": "deepseek", "vision": "qwen"}
+
+
+def _service_name(purpose: str) -> str:
+    return _SERVICE_NAMES.get(purpose, purpose)
+
+
 def _default_endpoint_for(purpose: str) -> str:
     return DEFAULT_DEEPSEEK_ENDPOINT if purpose == "text" else DEFAULT_QWEN_ENDPOINT
 
@@ -813,10 +826,12 @@ async def _safe_json_body(request: Request) -> object:
 def _ai_settings_for(purpose: str) -> dict:
     section = _section_for(purpose)
     cfg_section = (APP_CONFIG.get(section) or {}) if APP_CONFIG else {}
+    enabled = bool(cfg_section.get("enabled", True))
     status = get_credential_status(purpose)
     return {
         "purpose": purpose,
-        "enabled": bool(cfg_section.get("enabled", True)),
+        "service": _service_name(purpose),
+        "enabled": enabled,
         "provider": cfg_section.get("provider", "deepseek" if purpose == "text" else "qwen"),
         "model": cfg_section.get("model", _default_model_for(purpose)),
         "endpoint": cfg_section.get("endpoint", ""),
@@ -825,6 +840,10 @@ def _ai_settings_for(purpose: str) -> dict:
         "configured": status.configured,
         "source": status.source,
         "writable": status.writable,
+        # An enabled service that has no key is the one state the page must
+        # call out: the capability is advertised but cannot run. A disabled
+        # service advertises nothing, so it has no gap to report.
+        "missing_credential": enabled and not status.configured,
         "last_tested_at": status.last_tested_at,
         "last_test_result": status.last_test_result,
         "migration_required": _legacy_key_in_config(purpose) is not None,
@@ -2116,7 +2135,16 @@ async def put_credential(purpose: str, request: Request):
     if test_before_replace:
         category = _probe_connection(purpose, api_key_override=key)
         if category != "success":
-            return JSONResponse({"error": f"credential test failed: {category}"}, status_code=400)
+            # A failed *connection test* is not a failed write: the page must say
+            # so, and the previous credential is left untouched either way.
+            return JSONResponse(
+                {
+                    "error": f"connection test failed: {category}",
+                    "reason": "credential_test_failed",
+                    "category": category,
+                },
+                status_code=400,
+            )
     try:
         store_credential(purpose, key)
     except (CredentialError, UnsupportedPlatformError) as e:
@@ -2163,7 +2191,17 @@ async def test_credential_route(purpose: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=403)
     category = _probe_connection(purpose)
     if category == "credential_missing":
-        return JSONResponse({"error": "no credential configured"}, status_code=400)
+        # Nothing was sent anywhere: the only fact is that no key is saved yet.
+        # The page needs the service name to say which key is missing and where
+        # to add it, instead of reporting a bare ``credential_missing``.
+        return JSONResponse(
+            {
+                "error": "no API key saved yet",
+                "reason": "credential_missing",
+                "service": _service_name(purpose),
+            },
+            status_code=400,
+        )
     set_last_test_result(purpose, category)
     return JSONResponse({"result": category})
 
@@ -2686,8 +2724,21 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 
 def _load_input_policy() -> InputSafetyPolicy:
-    """Load the current input_safety policy from the public config."""
-    return load_input_safety_policy(APP_CONFIG)
+    """Load the current input_safety policy from the public config.
+
+    The container declares the directories it can offer through
+    ``AUTO_TUNE_INPUT_ALLOWED_ROOTS``; when it does, those roots replace the
+    configured ones. The authoritative value is resolved *first* and is passed
+    into the policy load, so a ``config.yaml`` an earlier install wrote — host
+    paths, or a root this machine cannot use — is replaced before it is ever
+    parsed and cannot stop the start. An invalid value on either side is a
+    policy error, never an unbounded (or silently empty) browser.
+    """
+    try:
+        roots = resolve_input_allowed_roots()
+    except ValueError as exc:
+        raise InputPolicyInvalidError(str(exc)) from exc
+    return load_input_safety_policy(APP_CONFIG, allowed_roots=roots)
 
 
 def _input_safety_error_response(exc: InputSafetyError) -> JSONResponse:
@@ -4397,6 +4448,10 @@ async def healthz():
 
 # ── Run ──
 def start_server(host: str | None = None, port: int | None = None):
+    # Chosen before uvicorn builds its loop: the Windows Proactor loop refuses
+    # incoming connections with WinError 10014 on some machines, so the web
+    # start selects the selector loop. A no-op outside Windows.
+    configure_platform_event_loop()
     import uvicorn
     import time
     # Controlled delivery boundary: desktop defaults stay 127.0.0.1:8000,
@@ -4416,8 +4471,13 @@ def start_server(host: str | None = None, port: int | None = None):
         _fh.write(_log)
     print(_log.strip(), flush=True)
     print(f"[Auto-Tune] Dashboard at http://{host}:{port}")
+    # ``loop="none"`` is what makes uvicorn call ``asyncio.new_event_loop()``,
+    # the one call that honours the policy selected above. uvicorn's own
+    # factories build the loop explicitly and would hand Windows a Proactor loop
+    # even with the selector policy set, which is the start that fails every
+    # accept with WinError 10014.
     uvicorn.run(app, host=host, port=port, log_level="info",
-                timeout_keep_alive=30)
+                timeout_keep_alive=30, loop="none")
 
 
 if __name__ == "__main__":

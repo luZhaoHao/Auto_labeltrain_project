@@ -3,10 +3,11 @@
 The Studio writes its configuration, logs, SQLite index, training directories
 and controlled weights into directories that the *operator* provides. This
 module is the one place that decides whether those directories are usable
-before the server starts, so a missing mount, a read-only directory, a missing
-runtime component or an unavailable GPU is reported as one stable code with a
-fixed message instead of surfacing later as a traceback or — worse — being
-silently absorbed by the container's writable layer.
+before the server starts, so a missing mount, an unwritable directory, a dataset
+share the runtime user cannot read, a missing runtime component or an
+unavailable GPU is reported as one stable code with a fixed message instead of
+surfacing later as a traceback or — worse — being silently absorbed by the
+container's writable layer.
 
 Nothing here touches training, HPO, tuning, snapshot or persistence semantics.
 Every check takes an injectable probe so the rules can be exercised without a
@@ -31,6 +32,7 @@ __all__ = [
     "CONTAINER_DATASETS_DIR",
     "CUDA_VERSION",
     "DELIVERY_CONFIG_MISSING",
+    "DELIVERY_DATASETS_UNREADABLE",
     "DELIVERY_DEPENDENCY_MISSING",
     "DELIVERY_DIR_NOT_MOUNTED",
     "DELIVERY_DIR_NOT_WRITABLE",
@@ -61,6 +63,7 @@ __all__ = [
 APP_ROOT_ENV = "AUTO_TUNE_APP_ROOT"
 DATASETS_DIR_ENV = "AUTO_TUNE_DATASETS_DIR"
 TEMPLATE_PATH_ENV = "AUTO_TUNE_TEMPLATE_PATH"
+CREDENTIALS_PATH_ENV = "AUTO_TUNE_CREDENTIALS_PATH"
 
 # The container delivery mounts these exactly (see compose.yaml); the desktop
 # delivery points the same names at its own installation directory.
@@ -72,6 +75,7 @@ _PERSISTENT_SUBDIRECTORIES = ("log", "detect", "runs", "models/weights")
 
 DELIVERY_DIR_NOT_MOUNTED = "DELIVERY_DIR_NOT_MOUNTED"
 DELIVERY_DIR_NOT_WRITABLE = "DELIVERY_DIR_NOT_WRITABLE"
+DELIVERY_DATASETS_UNREADABLE = "DELIVERY_DATASETS_UNREADABLE"
 DELIVERY_CONFIG_MISSING = "DELIVERY_CONFIG_MISSING"
 DELIVERY_TEMPLATE_MISSING = "DELIVERY_TEMPLATE_MISSING"
 DELIVERY_DEPENDENCY_MISSING = "DELIVERY_DEPENDENCY_MISSING"
@@ -122,14 +126,29 @@ class DeliveryPaths:
     config_path: Path
     template_path: Path
     datasets_dir: Path
+    # Only set when the platform persists API keys to a file (the container).
+    credentials_path: Path | None = None
 
     @property
     def config_dir(self) -> Path:
         return self.config_path.parent
 
     @property
+    def credentials_dir(self) -> Path | None:
+        """The directory the credential file lives in, when that backend is used.
+
+        The *file* is allowed to be absent — a first start has no key yet — but
+        its directory must be a real mount, otherwise a key typed into the page
+        would be written into the container's writable layer and lost on the
+        next recreation.
+        """
+        if self.credentials_path is None:
+            return None
+        return self.credentials_path.parent
+
+    @property
     def persistent_dirs(self) -> dict[str, Path]:
-        return {
+        directories = {
             "config": self.config_dir,
             "datasets": self.datasets_dir,
             "log": self.app_root / "log",
@@ -137,6 +156,9 @@ class DeliveryPaths:
             "runs": self.app_root / "runs",
             "models/weights": self.app_root / "models" / "weights",
         }
+        if self.credentials_dir is not None:
+            directories["secrets"] = self.credentials_dir
+        return directories
 
 
 def _from_env(name: str, default: Path) -> Path:
@@ -150,14 +172,32 @@ def _from_env(name: str, default: Path) -> Path:
     return Path(os.path.expanduser(os.path.expandvars(value))).resolve()
 
 
+def _optional_env_path(name: str) -> Path | None:
+    """A path that may legitimately be unset, with a blank value meaning unset.
+
+    An absent variable means "this platform has no credential file": the desktop
+    keeps the OS credential store, and nothing about its layout changes.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(value))).resolve()
+
+
 def resolve_paths(app_root: Path | None = None,
                   config_path: Path | None = None,
                   datasets_dir: Path | None = None,
-                  template_path: Path | None = None) -> DeliveryPaths:
+                  template_path: Path | None = None,
+                  credentials_path: Path | None = None) -> DeliveryPaths:
     """Resolve the delivery layout.
 
     Explicit arguments are used verbatim; anything left unset comes from the
-    controlled environment, and finally the packaged defaults.
+    controlled environment, and finally the packaged defaults. The credential
+    path is the one entry with no default: unset means the platform does not
+    keep a credential file at all.
     """
     package_dir = PACKAGE_CONFIG_PATH.parent
     return DeliveryPaths(
@@ -169,6 +209,8 @@ def resolve_paths(app_root: Path | None = None,
         else _from_env(DATASETS_DIR_ENV, CONTAINER_DATASETS_DIR),
         template_path=template_path if template_path is not None
         else _from_env(TEMPLATE_PATH_ENV, package_dir / "config.template.yaml"),
+        credentials_path=credentials_path if credentials_path is not None
+        else _optional_env_path(CREDENTIALS_PATH_ENV),
     )
 
 
@@ -217,22 +259,42 @@ def ensure_directories(paths: DeliveryPaths) -> list[Path]:
     return created
 
 
-def check_writable(paths: DeliveryPaths, probe=None) -> None:
-    """The runtime user must be able to write every persistent directory."""
+def check_writable(paths: DeliveryPaths, probe=None, dataset_probe=None) -> None:
+    """The runtime user must be able to use every persistent directory.
+
+    Every directory the Studio writes into must be writable. The dataset share is
+    the one exception: it is an *input*. The Studio reads it (and copies it into
+    its own snapshot) and writes nothing into it, so a dataset folder the
+    operator mounted read-only is a correct setup, not a broken one — it only has
+    to be readable and traversable.
+    """
     if probe is None:
         def probe(path, mode):  # noqa: ARG001 - os.access needs the mode
             return os.access(path, os.W_OK)
+    if dataset_probe is None:
+        def dataset_probe(path):
+            return os.access(path, os.R_OK | os.X_OK)
 
+    # The exemption is decided by the path itself, not by the layout's label for
+    # it, so renaming a key can never silently turn the dataset share back into a
+    # directory the start demands to be writable.
     unusable = [
         f"{name} ({directory})"
         for name, directory in paths.persistent_dirs.items()
-        if not probe(directory, os.W_OK)
+        if directory != paths.datasets_dir and not probe(directory, os.W_OK)
     ]
     if unusable:
         raise DeliveryError(
             DELIVERY_DIR_NOT_WRITABLE,
             "以下目录当前运行用户不可写，请检查挂载来源的权限："
             + "、".join(unusable),
+        )
+
+    if not dataset_probe(paths.datasets_dir):
+        raise DeliveryError(
+            DELIVERY_DATASETS_UNREADABLE,
+            f"数据集目录 datasets ({paths.datasets_dir}) 当前运行用户不可读或不可遍历；"
+            "数据集只要求可读，不需要可写，请检查挂载来源的读取权限。",
         )
 
 
